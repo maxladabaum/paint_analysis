@@ -1,0 +1,9 @@
+numpy>=1.24
+h5py>=3.9
+matplotlib>=3.7
+PyYAML>=6.0
+tifffile>=2023.7.10
+scipy>=1.10
+pandas>=2.0,<3
+tqdm>=4.66
+picassosr>=0.10.1
