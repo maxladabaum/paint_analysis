@@ -12,10 +12,22 @@ All histogram analysis is performed after the selected drift correction. If corr
 
 ## Start
 
-Double-click:
+On Windows, double-click:
 
 ```text
 run_paint_gui.bat
+```
+
+On macOS, double-click:
+
+```text
+run_paint_gui.command
+```
+
+If macOS says the file is not executable, open Terminal in this folder once and run:
+
+```bash
+chmod +x run_paint_gui.command
 ```
 
 The launcher creates a local `.venv` and installs dependencies, including `picassosr`.

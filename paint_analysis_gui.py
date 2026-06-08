@@ -26,7 +26,7 @@ from tkinter import filedialog, messagebox, ttk
 
 
 APP_TITLE = "DNA PAINT Picasso-Style ROI Analyzer"
-DEFAULT_DATA_DIR = Path(r"C:\Users\New user\Desktop\LBNL_PAINT")
+DEFAULT_DATA_DIR = Path.home() / "Desktop" / "LBNL_PAINT"
 RECENT_DIR_FILE = Path(__file__).with_name(".paint_recent_dir.txt")
 MAX_RENDER_PIXELS = 30_000_000
 MAP_AXES_RECT = (0.10, 0.12, 0.74, 0.78)
