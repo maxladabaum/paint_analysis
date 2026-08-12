@@ -90,3 +90,143 @@ Linking has its own settings panel. `Exposure`, `Link radius`, and `Max gap` con
 
 - `Run Linking Analysis` plots a 2x2 summary of event length, event length in ms, localizations per event, and photons per event.
 - `Color By Links` draws corrected ROI localizations on the map tab, with multi-localization linked events colored by event ID and single localizations shown in gray.
+
+## Origami Overlay And Site Occupancy
+
+After drift correction, linking, and optional histogram filtering, open the
+`Origami Overlay` tab. The default source
+is `Corrected localizations`; linked events can be preferable when one
+binding event contributes one point instead of allowing repeated blinking to
+dominate a docking site. Run linking with `Whole image`, or with a selected ROI
+that contains all origamis you want to compare, before starting the overlay.
+
+The workflow is deliberately staged so identification can be inspected and
+tuned before alignment:
+
+The four workflow panels remain in one compact row. Every panel has its own
+vertical scrollbar, including mouse-wheel/trackpad scrolling while the pointer
+is over that panel, so settings never reduce the result plot area.
+
+1. Click `Load Source Data` to display the selected corrected or linked points,
+   optionally restricted to the rectangular ROI selected on a map. This preview
+   uses the same Picasso renderer and the current map `Render pixel`, `Render
+   blur`, `Min blur`, and density-limit settings, so corrected localizations
+   have the same visual appearance as the Corrected Map.
+2. Click `Identify Origami`. The app bins the coordinates onto a coarse spatial
+   grid, smooths the density by one bin, ignores bins below `Min density
+   contrast`, and connects nearby dense bins to find candidate centers. It then
+   renders each candidate into a small fixed-size image and aligns those images
+   by rotational cross-correlation plus bounded FFT translation correlation. Two
+   passes build a median population template, and a final image correlation
+   classifies candidates as similar or dissimilar. The expected grid image sets
+   the absolute orientation, but no docking-site clustering is performed during
+   identification. Only points inside the aligned grid-sized footprint plus
+   `Image margin` are retained. A progress bar reports density preparation and
+   each cross-correlation pass. Change the identification
+   settings and click `Identify Origami` repeatedly until the boxes look right.
+   If none pass, the plot and status bar report the minimum, median, and maximum
+   region point counts so the limits can be chosen from the actual data.
+
+`Pick bin` affects only the fast coarse candidate search. `Alignment pixel`
+controls the candidate-image sampling, but each thumbnail is capped at 64 by 64
+pixels; the app automatically coarsens the requested pixel size for a larger
+footprint. This bounds memory and FFT work per candidate, making thousands of
+origamis practical. `Template passes` defaults to 2. More passes may marginally
+improve a heterogeneous dataset but increase runtime linearly.
+
+`Min image correlation` is the normalized similarity to the refined population
+template and defaults to `0.80`. Candidates below it are excluded even when
+their localization counts pass. The preview shows accepted footprints as solid
+colored outlines and rejected candidates as gray dashed outlines; labels report
+correlation, rotation, and point count.
+3. Click `Overlay Origami` to reuse the cached image-aligned coordinates. No
+   rectangle refit or rotational search is repeated. Picasso G5M is run here,
+   per accepted origami, solely to identify docking-site components and compute
+   occupancy statistics. Because a rectangular grid has an unavoidable 180°
+   ambiguity, every physical origami contributes both its selected pose and its
+   180° counterpart at half weight. This makes density, mean counts, occupancy,
+   completeness, galleries, and CSV statistics invariant to arbitrary 180°
+   choices without doubling the reported origami count. Per-site occupancy
+   weights are therefore `0`, `0.5`, or `1` for an individual origami.
+4. Choose a result from the `Plot` menu and click `Render Plot`. The viewer
+   displays one selected result at a time: the cached identified-image-match
+   preview, every individual aligned origami, per-origami Picasso G5M
+   components, aligned density, integrated density per site, mean site counts,
+   site occupancy, or occupied-site completeness. `Integrated density per site`
+   sums the displayed, blurred aligned-density pixels within `Site radius` of
+   every expected position. It includes unmatched source points and provides a
+   direct diagnostic for distinguishing spatial broadening from G5M assignment
+   effects. The individual-origami gallery labels every accepted origami
+   with the same ID used by the CSV export and its source-point count. Each
+   gallery tile is brightness-normalized independently so lower-count origamis
+   remain visible. Both individual gallery views show only the single cached
+   orientation used for that origami's G5M fit, making their tiles directly
+   comparable. Equal-weight 0°/180° duplication is applied only to population
+   density and statistics. Switching between `Identified origami image matches` and the
+   overlay/statistics choices only redraws cached results; it does not rerun
+   identification, image alignment, G5M, or alignment.
+
+Changing the source, active histogram filters, or ROI does not silently replace
+the displayed points; click `Load Source Data` again to refresh them.
+
+For a 3-by-4 design, set rows to `3`, columns to `4`, and enter the actual
+x/y docking-site spacing. `Pick bin size` controls the coarse detection grid.
+`Connect distance` should be large enough to connect occupied bins across one
+origami but smaller than the separation between origamis. During overlay,
+Picasso G5M is run separately on every accepted origami. This is Picasso's
+Gaussian Mixture Modeling with Modifications for Molecular Mapping method; the
+installed Picasso package does not contain a separate algorithm named D5M.
+G5M searches the number of Gaussian components using BIC, initializes with
+KMeans++, enforces component-resolution and minimum-localization checks, and
+constrains component widths with `G5M sigma min/max`. `G5M min locs` is the
+minimum number of localizations per retained component. `G5M BIC patience` is
+the number of consecutive component counts without improvement before the
+search stops. `Site match radius` is the maximum distance from a fitted G5M
+component center to an expected grid position. A site is occupied only when a
+matched G5M component is present. G5M assigns every localization to a retained
+component rather than producing a DBSCAN-style noise class; components outside
+the site-match radius are excluded from occupancy. Site counts are the numbers
+of source points assigned to matched components.
+
+The initial origami settings match the example corrected-localization workflow:
+corrected localizations, selected ROI enabled, 10 nm pick bins, 35 nm connection
+distance, 0.30 minimum density contrast, 500–5,000 points, a 3-by-4 grid with
+20 nm x/y spacing, a 20 nm image margin, 1 nm alignment pixels, two template
+passes, minimum image correlation 0.80, 1–8 nm G5M sigma bounds, 20
+minimum localizations per G5M component, BIC patience 3, 7.5 nm site-match
+radius, and mirrored picks disabled. This produces a 100 × 80 nm analysis
+footprint for the default grid.
+
+`Min density contrast` is normalized from `0` to `1` using the same linear
+automatic contrast convention used for map display (`1` is the bright end of
+the scale). Only bins at or above this value seed origami identification. Raise
+it to suppress sparse background bridges; lower it if dim real origamis vanish.
+The cyan contour in the identification preview shows this cutoff. Original
+coordinates near each dense object—not the binned coordinates—are retained for
+alignment and site counting. A starting value of `0.30` worked well for the
+example corrected-localization ROI; tune it for each dataset's contrast.
+
+All origamis accepted in the identification preview are included in the
+overlay. Alignment RMS and grid-match fraction are reported as quality
+diagnostics and exported to CSV; they do not silently discard visually approved
+origamis. Cross-correlation establishes their shared rotation before any G5M
+site model is evaluated.
+
+Overlay rendering has dedicated controls and does not inherit the map's render
+pixel setting. `Overlay pixel` requests the density-image pixel size,
+`Overlay padding` extends the view beyond the expected outer docking sites, and
+`Overlay blur sigma` applies Gaussian smoothing in nanometers. The display
+range is derived from the configured grid plus padding, so distant background
+points cannot make the overlay coarse. The plot title reports the actual x/y
+pixel size, blur, and number of aligned points inside the displayed range. Site
+statistics still use the aligned coordinates directly and are not changed by
+these display settings. The defaults are 0.5 nm pixels, 20 nm padding, and a
+1 nm Gaussian blur sigma.
+
+`Export Site CSVs` creates one table with per-origami site counts and another
+with site-level means, standard deviations, and occupancy fractions. Because a
+symmetric grid has no intrinsic top-left marker, its absolute 180-degree
+orientation is arbitrary. The template alignment keeps a shared missing-site
+pattern consistent, but assigning that pattern to a physical corner requires a
+fiducial or another asymmetric feature. Enable mirrored picks only if origamis
+can genuinely appear face-up and face-down in the experiment.

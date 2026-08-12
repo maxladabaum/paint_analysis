@@ -9,7 +9,7 @@ import traceback
 import gc
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 import h5py
 import matplotlib
@@ -21,6 +21,17 @@ matplotlib.use("TkAgg")
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg, NavigationToolbar2Tk
 from matplotlib.figure import Figure
 from matplotlib.widgets import RectangleSelector
+
+from origami_analysis import (
+    OrigamiAnalysisResult,
+    OrigamiPickResult,
+    align_picked_origamis,
+    density_map_for_origami_picking,
+    identify_origami_regions,
+    integrate_rendered_density_at_sites,
+    render_aligned_origami_density,
+    render_localization_preview,
+)
 
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
@@ -51,12 +62,17 @@ RECENT_DIR_FILE = APP_STATE_DIR / "recent-data-directory.txt"
 MAX_RENDER_PIXELS = 30_000_000
 MAP_AXES_RECT = (0.10, 0.12, 0.74, 0.78)
 MAP_COLORBAR_RECT = (0.87, 0.18, 0.025, 0.66)
+ORIGAMI_SOURCE_AXES_RECT = (0.14, 0.10, 0.72, 0.72)
+ORIGAMI_SOURCE_COLORBAR_RECT = (0.90, 0.16, 0.02, 0.60)
+ORIGAMI_RESULT_AXES_RECT = (0.14, 0.12, 0.72, 0.68)
+ORIGAMI_RESULT_COLORBAR_RECT = (0.90, 0.18, 0.02, 0.56)
 RAW_MAP_TAB = 0
 CORRECTED_MAP_TAB = 1
 LINKED_MAP_TAB = 2
 FILTERED_MAP_TAB = 3
 HISTOGRAM_TAB = 4
 TEMPORAL_TAB = 5
+ORIGAMI_TAB = 6
 
 
 @dataclass
@@ -333,6 +349,33 @@ class SyncedMapToolbar(NavigationToolbar2Tk):
     def forward(self, *args: Any) -> None:
         super().forward(*args)
         self.app.after_idle(lambda: self.app._sync_map_limits_from(self.axis))
+
+
+class OrigamiToolbar(NavigationToolbar2Tk):
+    """Navigation toolbar with a stable Home view for rebuilt gallery plots."""
+
+    GALLERY_OPTIONS = {"Individual origami gallery", "Individual Picasso G5M sites"}
+
+    def __init__(self, canvas: FigureCanvasTkAgg, window: tk.Widget, app: Any) -> None:
+        self.app = app
+        super().__init__(canvas, window)
+
+    def home(self, *args: Any) -> None:
+        limits = self.app.origami_gallery_home_limits
+        if (
+            self.app.origami_last_rendered_plot_option in self.GALLERY_OPTIONS
+            and limits is not None
+            and self.canvas.figure.axes
+        ):
+            axis = self.canvas.figure.axes[0]
+            axis.set_xlim(*limits[0])
+            axis.set_ylim(*limits[1])
+            # Home becomes the view carried across the two synchronized
+            # galleries until the user zooms or pans again.
+            self.app.origami_gallery_view_limits = limits
+            self.canvas.draw_idle()
+            return
+        super().home(*args)
 
 
 def apply_drift_correction(
@@ -1154,6 +1197,48 @@ class PaintAnalysisApp(tk.Tk):
         self.hist_press_cid: int | None = None
         self.hist_release_cid: int | None = None
         self.temporal_request_id = 0
+        self.origami_result: OrigamiAnalysisResult | None = None
+        self.origami_source_points_nm: np.ndarray | None = None
+        self.origami_source_render_result: dict[str, Any] | None = None
+        self.origami_pick_result: OrigamiPickResult | None = None
+        self.origami_loaded_source_label = ""
+        self.origami_loaded_source_path: Path | None = None
+        self.origami_result_source = ""
+        self.origami_result_source_count = 0
+        self.origami_result_render_settings: dict[str, Any] | None = None
+        self.origami_result_occupancy_threshold = 1
+        self.origami_plot_option = tk.StringVar(value="Individual origami gallery")
+        self.origami_last_rendered_plot_option = ""
+        self.origami_gallery_view_limits: tuple[tuple[float, float], tuple[float, float]] | None = None
+        self.origami_gallery_home_limits: tuple[tuple[float, float], tuple[float, float]] | None = None
+        self.origami_identification_progress = tk.DoubleVar(value=0.0)
+        self.origami_identification_progress_text = tk.StringVar(value="Ready to identify origami")
+        self.origami_identification_running = False
+        self.origami_source = tk.StringVar(value="Corrected localizations")
+        self.origami_use_roi = tk.BooleanVar(value=True)
+        self.origami_pick_bin_nm = tk.DoubleVar(value=10.0)
+        self.origami_connect_distance_nm = tk.DoubleVar(value=35.0)
+        self.origami_min_density_contrast = tk.DoubleVar(value=0.30)
+        self.origami_min_points = tk.IntVar(value=500)
+        self.origami_max_points = tk.IntVar(value=5000)
+        self.origami_rows = tk.IntVar(value=3)
+        self.origami_columns = tk.IntVar(value=4)
+        self.origami_spacing_x_nm = tk.DoubleVar(value=20.0)
+        self.origami_spacing_y_nm = tk.DoubleVar(value=20.0)
+        self.origami_rectangle_margin_nm = tk.DoubleVar(value=20.0)
+        self.origami_min_rectangle_confidence = tk.DoubleVar(value=0.80)
+        self.origami_preview_pixel_nm = tk.DoubleVar(value=1.0)
+        self.origami_alignment_iterations = tk.IntVar(value=2)
+        self.origami_g5m_sigma_min_nm = tk.DoubleVar(value=1.0)
+        self.origami_g5m_sigma_max_nm = tk.DoubleVar(value=8.0)
+        self.origami_g5m_min_locs = tk.IntVar(value=20)
+        self.origami_g5m_bic_patience = tk.IntVar(value=3)
+        self.origami_site_radius_nm = tk.DoubleVar(value=7.5)
+        self.origami_occupancy_threshold = tk.IntVar(value=1)
+        self.origami_overlay_pixel_nm = tk.DoubleVar(value=0.5)
+        self.origami_overlay_padding_nm = tk.DoubleVar(value=20.0)
+        self.origami_overlay_blur_nm = tk.DoubleVar(value=1.0)
+        self.origami_allow_mirror = tk.BooleanVar(value=False)
 
         self._build_ui()
         self.after(100, self._poll_worker)
@@ -1451,6 +1536,186 @@ class PaintAnalysisApp(tk.Tk):
         temporal_toolbar_frame = ttk.Frame(temporal_tab)
         temporal_toolbar_frame.grid(row=2, column=0, sticky="ew")
         NavigationToolbar2Tk(self.temporal_canvas, temporal_toolbar_frame)
+
+        origami_tab = ttk.Frame(self.notebook)
+        origami_tab.columnconfigure(0, weight=1)
+        origami_tab.rowconfigure(1, weight=1)
+        self.notebook.add(origami_tab, text="Origami Overlay")
+
+        origami_controls = ttk.Frame(origami_tab, padding=4)
+        origami_controls.grid(row=0, column=0, sticky="ew", padx=4, pady=(4, 6))
+        origami_controls.configure(height=330)
+        origami_controls.grid_propagate(False)
+        origami_controls.rowconfigure(0, weight=1)
+        for column in range(4):
+            origami_controls.columnconfigure(column, weight=1, uniform="origami_sections")
+
+        def compact_number_row(parent: ttk.Frame, row: int, label: str, variable: tk.Variable) -> None:
+            ttk.Label(parent, text=label).grid(row=row, column=0, sticky="w", pady=2)
+            ttk.Entry(parent, textvariable=variable, width=8).grid(row=row, column=1, sticky="w", padx=(6, 0), pady=2)
+
+        scrollable_origami_sections: list[tuple[tk.Widget, Callable[[tk.Event], None]]] = []
+
+        def scrollable_settings_section(
+            title: str,
+            column: int,
+            padx: tuple[int, int] | int,
+        ) -> tuple[ttk.LabelFrame, ttk.Frame]:
+            section = ttk.LabelFrame(origami_controls, text=title, padding=2)
+            section.grid(row=0, column=column, sticky="nsew", padx=padx)
+            section.columnconfigure(0, weight=1)
+            section.rowconfigure(0, weight=1)
+            canvas = tk.Canvas(
+                section,
+                highlightthickness=0,
+                borderwidth=0,
+                background=ttk.Style().lookup("TFrame", "background") or self.cget("background"),
+            )
+            scrollbar = ttk.Scrollbar(section, orient="vertical", command=canvas.yview)
+            canvas.configure(yscrollcommand=scrollbar.set)
+            canvas.grid(row=0, column=0, sticky="nsew")
+            scrollbar.grid(row=0, column=1, sticky="ns")
+            fields = ttk.Frame(canvas, padding=(4, 2, 4, 6))
+            fields.columnconfigure(1, weight=1)
+            window = canvas.create_window((0, 0), window=fields, anchor="nw")
+            fields.bind(
+                "<Configure>",
+                lambda _event, current=canvas: current.configure(scrollregion=current.bbox("all")),
+            )
+            canvas.bind(
+                "<Configure>",
+                lambda event, current=canvas, item=window: current.itemconfigure(item, width=event.width),
+            )
+
+            def scroll(event: tk.Event, current: tk.Canvas = canvas) -> None:
+                if getattr(event, "num", None) == 4:
+                    units = -1
+                elif getattr(event, "num", None) == 5:
+                    units = 1
+                else:
+                    delta = int(getattr(event, "delta", 0))
+                    units = -1 if delta > 0 else 1 if delta < 0 else 0
+                if units:
+                    current.yview_scroll(units, "units")
+
+            scrollable_origami_sections.append((section, scroll))
+            return section, fields
+
+        source_section, source_fields = scrollable_settings_section("1. Source Data", 0, (0, 3))
+        ttk.Label(source_fields, text="Source").grid(row=0, column=0, sticky="w", pady=2)
+        ttk.Combobox(
+            source_fields,
+            textvariable=self.origami_source,
+            state="readonly",
+            values=("Filtered linked events", "Linked events", "Filtered corrected localizations", "Corrected localizations"),
+            width=20,
+        ).grid(row=0, column=1, sticky="w", padx=(6, 0), pady=2)
+        ttk.Checkbutton(source_fields, text="Use selected ROI", variable=self.origami_use_roi).grid(row=1, column=0, columnspan=2, sticky="w", pady=2)
+        ttk.Label(source_fields, text="Reload after changing source, ROI, or filters.", wraplength=230).grid(row=2, column=0, columnspan=2, sticky="w", pady=(2, 5))
+        ttk.Button(source_fields, text="Load Source Data", command=self.load_origami_source_data).grid(row=3, column=0, columnspan=2, sticky="ew")
+
+        identify_section, identify_fields = scrollable_settings_section("2. Identify Origami", 1, 3)
+
+        compact_number_row(identify_fields, 0, "Pick bin (nm)", self.origami_pick_bin_nm)
+        compact_number_row(identify_fields, 1, "Connect (nm)", self.origami_connect_distance_nm)
+        compact_number_row(identify_fields, 2, "Min density", self.origami_min_density_contrast)
+        ttk.Label(identify_fields, text="Point limits").grid(row=3, column=0, sticky="w", pady=2)
+        point_limits = ttk.Frame(identify_fields)
+        point_limits.grid(row=3, column=1, sticky="w", padx=(6, 0), pady=2)
+        ttk.Entry(point_limits, textvariable=self.origami_min_points, width=6).pack(side="left")
+        ttk.Label(point_limits, text=" to ").pack(side="left")
+        ttk.Entry(point_limits, textvariable=self.origami_max_points, width=6).pack(side="left")
+        ttk.Label(identify_fields, text="Grid rows × cols").grid(row=4, column=0, sticky="w", pady=2)
+        grid_shape = ttk.Frame(identify_fields)
+        grid_shape.grid(row=4, column=1, sticky="w", padx=(6, 0), pady=2)
+        ttk.Entry(grid_shape, textvariable=self.origami_rows, width=5).pack(side="left")
+        ttk.Label(grid_shape, text=" x ").pack(side="left")
+        ttk.Entry(grid_shape, textvariable=self.origami_columns, width=5).pack(side="left")
+        ttk.Label(identify_fields, text="Spacing x/y (nm)").grid(row=5, column=0, sticky="w", pady=2)
+        grid_spacing = ttk.Frame(identify_fields)
+        grid_spacing.grid(row=5, column=1, sticky="w", padx=(6, 0), pady=2)
+        ttk.Entry(grid_spacing, textvariable=self.origami_spacing_x_nm, width=5).pack(side="left")
+        ttk.Label(grid_spacing, text=" / ").pack(side="left")
+        ttk.Entry(grid_spacing, textvariable=self.origami_spacing_y_nm, width=5).pack(side="left")
+        compact_number_row(identify_fields, 6, "Image margin (nm)", self.origami_rectangle_margin_nm)
+        compact_number_row(identify_fields, 7, "Alignment pixel (nm)", self.origami_preview_pixel_nm)
+        compact_number_row(identify_fields, 8, "Template passes", self.origami_alignment_iterations)
+        compact_number_row(identify_fields, 9, "Min image correlation", self.origami_min_rectangle_confidence)
+        self.origami_identify_button = ttk.Button(identify_fields, text="Identify Origami", command=self.identify_origamis)
+        self.origami_identify_button.grid(row=10, column=0, columnspan=2, sticky="ew", pady=(6, 0))
+        ttk.Progressbar(
+            identify_fields,
+            variable=self.origami_identification_progress,
+            maximum=100.0,
+            mode="determinate",
+        ).grid(row=11, column=0, columnspan=2, sticky="ew", pady=(6, 2))
+        ttk.Label(
+            identify_fields,
+            textvariable=self.origami_identification_progress_text,
+            wraplength=230,
+        ).grid(row=12, column=0, columnspan=2, sticky="w")
+
+        overlay_section, overlay_fields = scrollable_settings_section("3. Overlay and Statistics", 2, 3)
+        ttk.Checkbutton(overlay_fields, text="Allow mirrors", variable=self.origami_allow_mirror).grid(row=0, column=0, columnspan=2, sticky="w", pady=2)
+        ttk.Label(overlay_fields, text="G5M σ min/max").grid(row=1, column=0, sticky="w", pady=2)
+        g5m_sigma = ttk.Frame(overlay_fields)
+        g5m_sigma.grid(row=1, column=1, sticky="w", padx=(6, 0), pady=2)
+        ttk.Entry(g5m_sigma, textvariable=self.origami_g5m_sigma_min_nm, width=5).pack(side="left")
+        ttk.Label(g5m_sigma, text=" / ").pack(side="left")
+        ttk.Entry(g5m_sigma, textvariable=self.origami_g5m_sigma_max_nm, width=5).pack(side="left")
+        compact_number_row(overlay_fields, 2, "G5M min locs", self.origami_g5m_min_locs)
+        compact_number_row(overlay_fields, 3, "G5M BIC patience", self.origami_g5m_bic_patience)
+        compact_number_row(overlay_fields, 4, "Site radius (nm)", self.origami_site_radius_nm)
+        compact_number_row(overlay_fields, 5, "Pixel (nm)", self.origami_overlay_pixel_nm)
+        compact_number_row(overlay_fields, 6, "Padding (nm)", self.origami_overlay_padding_nm)
+        compact_number_row(overlay_fields, 7, "Blur σ (nm)", self.origami_overlay_blur_nm)
+        ttk.Button(overlay_fields, text="Overlay Origami", command=self.overlay_origamis).grid(row=8, column=0, columnspan=2, sticky="ew", pady=(4, 0))
+        ttk.Label(overlay_fields, text="Plot").grid(row=9, column=0, sticky="w", pady=(4, 2))
+        ttk.Combobox(
+            overlay_fields,
+            textvariable=self.origami_plot_option,
+            state="readonly",
+            values=(
+                "Identified origami image matches",
+                "Individual origami gallery",
+                "Individual Picasso G5M sites",
+                "Aligned density",
+                "Integrated density per site",
+                "Mean site counts",
+                "Site occupancy",
+                "Occupied-site completeness",
+            ),
+            width=24,
+        ).grid(row=9, column=1, sticky="ew", padx=(6, 0), pady=(4, 2))
+        ttk.Button(overlay_fields, text="Render Plot", command=self.render_origami_plot).grid(
+            row=10, column=0, columnspan=2, sticky="ew", pady=(2, 0)
+        )
+
+        export_section, export_fields = scrollable_settings_section("4. Export Results", 3, (3, 0))
+        ttk.Label(
+            export_fields,
+            text="Exports per-origami counts and site-level occupancy statistics as two CSV files.",
+            wraplength=210,
+        ).grid(row=0, column=0, sticky="nw", pady=(2, 6))
+        ttk.Button(export_fields, text="Export Site CSVs", command=self.export_origami_csvs).grid(row=1, column=0, sticky="ew")
+
+        def bind_panel_scroll(widget: tk.Widget, scroll: Callable[[tk.Event], None]) -> None:
+            widget.bind("<MouseWheel>", scroll)
+            widget.bind("<Button-4>", scroll)
+            widget.bind("<Button-5>", scroll)
+            for child in widget.winfo_children():
+                bind_panel_scroll(child, scroll)
+
+        for scroll_section, scroll_handler in scrollable_origami_sections:
+            bind_panel_scroll(scroll_section, scroll_handler)
+
+        self.origami_figure = Figure(figsize=(8, 6), dpi=100)
+        self.origami_figure.suptitle("1. Load source   2. Identify   3. Overlay   4. Export")
+        self.origami_canvas = FigureCanvasTkAgg(self.origami_figure, master=origami_tab)
+        self.origami_canvas.get_tk_widget().grid(row=1, column=0, sticky="nsew")
+        origami_toolbar_frame = ttk.Frame(origami_tab)
+        origami_toolbar_frame.grid(row=2, column=0, sticky="ew")
+        self.origami_toolbar = OrigamiToolbar(self.origami_canvas, origami_toolbar_frame, self)
 
         ttk.Label(main, textvariable=self.status, anchor="w").grid(row=2, column=0, sticky="ew", pady=(6, 0))
 
@@ -1918,6 +2183,264 @@ class PaintAnalysisApp(tk.Tk):
         }
         self.status.set(f"Generating temporal metric plot for {params['mode']}...")
         self._run_worker(lambda: self._temporal_metric_worker(params))
+
+    def load_origami_source_data(self) -> None:
+        if self.loaded is None or self.corrected_locs is None:
+            messagebox.showinfo("No corrected data", "Load a localization file and apply drift correction first.")
+            return
+        source = self.origami_source.get()
+        if "linked" in source.lower() and self.linked_locs is None:
+            messagebox.showinfo("No linked events", "Run Linking Analysis before using a linked-event origami source.")
+            return
+        if "linked" in source.lower() and self.linked_params != self._current_linked_params():
+            messagebox.showinfo(
+                "Linked events are stale",
+                "The linking settings or scope changed. Run Linking Analysis again before picking origamis.",
+            )
+            return
+        params = {
+            "source": source,
+            "use_roi": bool(self.origami_use_roi.get()),
+            "active_filters": list(self._active_map_filter_items()),
+            "exposure_ms": float(self.exposure_ms.get()),
+            "link_radius_nm": float(self.link_radius_nm.get()),
+            "max_gap_frames": int(self.max_gap_frames.get()),
+            "source_path": self.loaded.path,
+            "render_pixel_nm": float(self.render_disp_px_nm.get()),
+            "render_blur_method": self.render_blur_method.get(),
+            "render_min_blur_width": float(self.min_blur_width.get()),
+            "render_min_density": float(self.render_min_density.get()),
+            "render_max_density": float(self.render_max_density.get()),
+            "render_viewport_nm": (
+                self.roi_nm
+                if bool(self.origami_use_roi.get()) and self.roi_nm is not None
+                else (self._shared_map_viewport_nm() or self._current_map_viewport_nm())
+            ),
+        }
+        self.status.set("Loading selected source points for origami inspection...")
+        self._run_worker(lambda: self._load_origami_source_worker(params))
+
+    def _load_origami_source_worker(self, params: dict[str, Any]) -> tuple[str, Any]:
+        assert self.loaded is not None
+        assert self.corrected_locs is not None
+        pixelsize = float(self.loaded.info[0]["Pixelsize"])
+        source = str(params["source"])
+        if "linked" in source.lower():
+            assert self.linked_locs is not None
+            selected = self.linked_locs.copy()
+            source_note = self.linked_scope_name.lower()
+        else:
+            selected = self.corrected_locs.copy()
+            source_note = "whole corrected image"
+
+        if bool(params["use_roi"]) and self.roi_nm is not None:
+            selected = roi_locs(selected, self.roi_nm, pixelsize)
+            source_note = "selected ROI"
+
+        if source.lower().startswith("filtered") and params["active_filters"]:
+            keep = pd.Series(True, index=selected.index, dtype=bool)
+            for mode, (left, right) in params["active_filters"]:
+                series, _xlabel = localization_series_for_mode(
+                    selected,
+                    mode,
+                    pixelsize,
+                    float(params["exposure_ms"]),
+                    float(params["link_radius_nm"]),
+                    int(params["max_gap_frames"]),
+                )
+                values = series.to_numpy(dtype=float)
+                keep &= np.isfinite(values) & (values >= min(left, right)) & (values <= max(left, right))
+            selected = selected.loc[keep].copy()
+
+        if selected.empty:
+            raise ValueError("The selected source contains no points after ROI and histogram filtering.")
+        points_nm = selected[["x", "y"]].to_numpy(dtype=float) * pixelsize
+        render_result = render_picasso_map(
+            selected,
+            self.loaded.info,
+            float(params["render_pixel_nm"]),
+            str(params["render_blur_method"]),
+            float(params["render_min_blur_width"]),
+            params["render_viewport_nm"],
+        )
+        render_result["min_density"] = float(params["render_min_density"])
+        render_result["max_density"] = float(params["render_max_density"])
+        return "origami_source", {
+            "points_nm": points_nm,
+            "render_result": render_result,
+            "source_label": f"{source} ({source_note})",
+            "source_path": params["source_path"],
+        }
+
+    def identify_origamis(self) -> None:
+        if self.origami_source_points_nm is None or self.origami_loaded_source_path is None:
+            messagebox.showinfo("Source not loaded", "Click Load Source Data before identifying origami.")
+            return
+        try:
+            params = {
+                "pick_bin_size_nm": float(self.origami_pick_bin_nm.get()),
+                "connect_distance_nm": float(self.origami_connect_distance_nm.get()),
+                "density_threshold": float(self.origami_min_density_contrast.get()),
+                "min_candidate_points": int(self.origami_min_points.get()),
+                "max_candidate_points": int(self.origami_max_points.get()),
+                "rows": int(self.origami_rows.get()),
+                "columns": int(self.origami_columns.get()),
+                "spacing_x_nm": float(self.origami_spacing_x_nm.get()),
+                "spacing_y_nm": float(self.origami_spacing_y_nm.get()),
+                "rectangle_margin_nm": float(self.origami_rectangle_margin_nm.get()),
+                "min_rectangle_confidence": float(self.origami_min_rectangle_confidence.get()),
+                "alignment_pixel_nm": float(self.origami_preview_pixel_nm.get()),
+                "alignment_iterations": int(self.origami_alignment_iterations.get()),
+                "source_path": self.origami_loaded_source_path,
+            }
+        except (tk.TclError, ValueError) as exc:
+            messagebox.showerror("Invalid identification settings", str(exc))
+            return
+        if not 0.0 <= params["min_rectangle_confidence"] <= 1.0:
+            messagebox.showerror("Invalid identification settings", "Minimum image correlation must be between 0 and 1.")
+            return
+        if params["alignment_pixel_nm"] <= 0 or params["alignment_iterations"] < 1:
+            messagebox.showerror("Invalid identification settings", "Alignment pixel must be positive and template passes must be at least 1.")
+            return
+        points_nm = self.origami_source_points_nm.copy()
+        self.origami_identification_running = True
+        self.origami_identification_progress.set(0.0)
+        self.origami_identification_progress_text.set(f"Starting with {len(points_nm):,} source points...")
+        self.origami_identify_button.state(["disabled"])
+        self.status.set(f"Identifying whole origami regions in {len(points_nm):,} loaded source points...")
+        self._run_worker(lambda: self._identify_origami_worker(points_nm, params))
+
+    def _identify_origami_worker(self, points_nm: np.ndarray, params: dict[str, Any]) -> tuple[str, Any]:
+        picks = identify_origami_regions(
+            points_nm,
+            pick_bin_size_nm=float(params["pick_bin_size_nm"]),
+            connect_distance_nm=float(params["connect_distance_nm"]),
+            density_threshold=float(params["density_threshold"]),
+            min_candidate_points=int(params["min_candidate_points"]),
+            max_candidate_points=int(params["max_candidate_points"]),
+            rows=int(params["rows"]),
+            columns=int(params["columns"]),
+            spacing_x_nm=float(params["spacing_x_nm"]),
+            spacing_y_nm=float(params["spacing_y_nm"]),
+            rectangle_margin_nm=float(params["rectangle_margin_nm"]),
+            min_rectangle_confidence=float(params["min_rectangle_confidence"]),
+            alignment_pixel_nm=float(params["alignment_pixel_nm"]),
+            alignment_iterations=int(params["alignment_iterations"]),
+            progress_callback=self._origami_identification_worker_progress,
+        )
+        return "origami_picks", {"picks": picks, "source_path": params["source_path"]}
+
+    def _origami_identification_worker_progress(self, percent: float, message: str) -> None:
+        self.worker_queue.put(("origami_identification_progress", (float(percent), str(message))))
+
+    def _finish_origami_identification_progress(self, message: str | None = None) -> None:
+        self.origami_identification_running = False
+        self.origami_identify_button.state(["!disabled"])
+        if message is not None:
+            self.origami_identification_progress_text.set(message)
+
+    def overlay_origamis(self) -> None:
+        picks = self.origami_pick_result
+        if picks is None:
+            messagebox.showinfo("Origami not identified", "Click Identify Origami and inspect the colored boxes first.")
+            return
+        if picks.accepted_count == 0:
+            messagebox.showinfo(
+                "No accepted origami",
+                "No candidates pass both the point and image-correlation limits. Adjust the settings and run Identify Origami again.",
+            )
+            return
+        try:
+            params = {
+                "rows": int(self.origami_rows.get()),
+                "columns": int(self.origami_columns.get()),
+                "spacing_x_nm": float(self.origami_spacing_x_nm.get()),
+                "spacing_y_nm": float(self.origami_spacing_y_nm.get()),
+                "g5m_sigma_min_nm": float(self.origami_g5m_sigma_min_nm.get()),
+                "g5m_sigma_max_nm": float(self.origami_g5m_sigma_max_nm.get()),
+                "g5m_min_locs": int(self.origami_g5m_min_locs.get()),
+                "g5m_bic_patience": int(self.origami_g5m_bic_patience.get()),
+                "site_radius_nm": float(self.origami_site_radius_nm.get()),
+                "occupancy_threshold": 1,
+                "allow_mirror": bool(self.origami_allow_mirror.get()),
+                "overlay_pixel_nm": float(self.origami_overlay_pixel_nm.get()),
+                "overlay_padding_nm": float(self.origami_overlay_padding_nm.get()),
+                "overlay_blur_nm": float(self.origami_overlay_blur_nm.get()),
+                "source_path": self.origami_loaded_source_path,
+                "source_label": self.origami_loaded_source_label,
+                "source_count": len(self.origami_source_points_nm) if self.origami_source_points_nm is not None else 0,
+            }
+        except (tk.TclError, ValueError) as exc:
+            messagebox.showerror("Invalid overlay settings", str(exc))
+            return
+        if (
+            params["g5m_sigma_min_nm"] <= 0
+            or params["g5m_sigma_max_nm"] < params["g5m_sigma_min_nm"]
+            or params["g5m_min_locs"] < 1
+            or params["g5m_bic_patience"] < 1
+            or params["site_radius_nm"] <= 0
+        ):
+            messagebox.showerror(
+                "Invalid overlay settings",
+                "G5M sigma bounds must be positive and ordered; minimum localizations, BIC patience, and site-match radius must be positive.",
+            )
+            return
+        if params["overlay_pixel_nm"] <= 0 or params["overlay_padding_nm"] < 0 or params["overlay_blur_nm"] < 0:
+            messagebox.showerror(
+                "Invalid overlay settings",
+                "Overlay pixel size must be greater than zero; padding and blur cannot be negative.",
+            )
+            return
+        accepted_regions = [region.copy() for region in picks.accepted_aligned_regions]
+        accepted_centers = np.asarray(
+            [np.median(region, axis=0) for region, accepted in zip(picks.regions, picks.accepted_mask) if bool(accepted)],
+            dtype=float,
+        )
+        rejected_count = len(picks.regions) - picks.accepted_count
+        self.status.set(f"Clustering docking sites for {len(accepted_regions)} image-aligned origamis...")
+        self._run_worker(lambda: self._overlay_origami_worker(accepted_regions, accepted_centers, rejected_count, params))
+
+    def _overlay_origami_worker(
+        self,
+        accepted_regions: list[np.ndarray],
+        accepted_centers: np.ndarray,
+        rejected_count: int,
+        params: dict[str, Any],
+    ) -> tuple[str, Any]:
+        result = align_picked_origamis(
+            accepted_regions,
+            rows=int(params["rows"]),
+            columns=int(params["columns"]),
+            spacing_x_nm=float(params["spacing_x_nm"]),
+            spacing_y_nm=float(params["spacing_y_nm"]),
+            site_radius_nm=float(params["site_radius_nm"]),
+            g5m_sigma_min_nm=float(params["g5m_sigma_min_nm"]),
+            g5m_sigma_max_nm=float(params["g5m_sigma_max_nm"]),
+            g5m_min_locs=int(params["g5m_min_locs"]),
+            g5m_max_rounds_without_best_bic=int(params["g5m_bic_patience"]),
+            prealigned=True,
+            source_centers_nm=accepted_centers,
+            allow_mirror=bool(params["allow_mirror"]),
+            initially_rejected_count=rejected_count,
+            progress_callback=self._worker_status,
+        )
+        return "origami", {
+            "result": result,
+            "source": params["source_label"],
+            "source_note": "identified preview",
+            "source_count": int(params["source_count"]),
+            "occupancy_threshold": int(params["occupancy_threshold"]),
+            "render_settings": {
+                "rows": int(params["rows"]),
+                "columns": int(params["columns"]),
+                "spacing_x_nm": float(params["spacing_x_nm"]),
+                "spacing_y_nm": float(params["spacing_y_nm"]),
+                "pixel_size_nm": float(params["overlay_pixel_nm"]),
+                "padding_nm": float(params["overlay_padding_nm"]),
+                "blur_nm": float(params["overlay_blur_nm"]),
+            },
+            "source_path": params["source_path"],
+        }
 
     def _correction_worker(self) -> tuple[str, Any]:
         assert self.loaded is not None
@@ -2530,8 +3053,15 @@ class PaintAnalysisApp(tk.Tk):
                 kind, payload = self.worker_queue.get_nowait()
                 if kind == "status":
                     self.status.set(str(payload))
+                elif kind == "origami_identification_progress":
+                    percent, message = payload
+                    self.origami_identification_progress.set(max(0.0, min(100.0, float(percent))))
+                    self.origami_identification_progress_text.set(str(message))
+                    self.status.set(f"Identify Origami: {float(percent):.0f}% — {message}")
                 elif kind == "error":
                     exc, details = payload
+                    if self.origami_identification_running:
+                        self._finish_origami_identification_progress("Identification stopped because of an error.")
                     self.status.set("Error")
                     self._show_error_indicator(str(exc), str(details))
                     messagebox.showerror("Analysis error", f"{exc}\n\n{details}")
@@ -2550,6 +3080,13 @@ class PaintAnalysisApp(tk.Tk):
                             self.linked_params = None
                             self.linked_source_name = self.linking_source.get()
                             self.linked_scope_name = self.linking_scope.get()
+                            self.origami_result = None
+                            self.origami_result_source = ""
+                            self.origami_source_points_nm = None
+                            self.origami_source_render_result = None
+                            self.origami_pick_result = None
+                            self.origami_loaded_source_label = ""
+                            self.origami_loaded_source_path = None
                             self.drift = result_payload["drift"]
                             self.correction_label = result_payload["label"]
                             self.status.set(f"{self.correction_label} ready. Rendering map with current render settings...")
@@ -2569,6 +3106,13 @@ class PaintAnalysisApp(tk.Tk):
                             self.linked_params = result_payload.get("linked_params")
                             self.linked_source_name = str(result_payload.get("link_source", self.linking_source.get()))
                             self.linked_scope_name = str(result_payload.get("link_scope", self.linking_scope.get()))
+                            self.origami_result = None
+                            self.origami_result_source = ""
+                            self.origami_source_points_nm = None
+                            self.origami_source_render_result = None
+                            self.origami_pick_result = None
+                            self.origami_loaded_source_label = ""
+                            self.origami_loaded_source_path = None
                             self.status.set("Linking analysis complete. Drawing summary plots...")
                             self.update_idletasks()
                             self._plot_linking_summary(result_payload)
@@ -2577,6 +3121,28 @@ class PaintAnalysisApp(tk.Tk):
                         elif result_kind == "temporal":
                             if result_payload.get("request_id") == self.temporal_request_id:
                                 self._plot_temporal_metric(result_payload)
+                        elif result_kind == "origami_source":
+                            if self.loaded is not None and result_payload.get("source_path") == self.loaded.path:
+                                self.origami_source_points_nm = result_payload["points_nm"]
+                                self.origami_source_render_result = dict(result_payload["render_result"])
+                                self.origami_loaded_source_label = str(result_payload["source_label"])
+                                self.origami_loaded_source_path = result_payload["source_path"]
+                                self.origami_pick_result = None
+                                self.origami_result = None
+                                self._plot_origami_source_data()
+                        elif result_kind == "origami_picks":
+                            completed_picks: OrigamiPickResult = result_payload["picks"]
+                            self.origami_identification_progress.set(100.0)
+                            self._finish_origami_identification_progress(
+                                f"Complete: {completed_picks.accepted_count}/{len(completed_picks.regions)} image-matched origamis accepted."
+                            )
+                            if self.loaded is not None and result_payload.get("source_path") == self.loaded.path:
+                                self.origami_pick_result = completed_picks
+                                self.origami_result = None
+                                self._plot_identified_origamis()
+                        elif result_kind == "origami":
+                            if self.loaded is not None and result_payload.get("source_path") == self.loaded.path:
+                                self._plot_origami_analysis(result_payload)
                     except Exception as exc:
                         details = traceback.format_exc()
                         self.status.set("Error")
@@ -2604,6 +3170,13 @@ class PaintAnalysisApp(tk.Tk):
         self.current_xlabel = "value"
         self.current_hist_indices = None
         self.current_hist_mode = None
+        self.origami_result = None
+        self.origami_result_source = ""
+        self.origami_source_points_nm = None
+        self.origami_source_render_result = None
+        self.origami_pick_result = None
+        self.origami_loaded_source_label = ""
+        self.origami_loaded_source_path = None
         self.hist_filter_bounds.clear()
         self.hist_filter_enabled.clear()
         self._refresh_filter_list()
@@ -2693,6 +3266,9 @@ class PaintAnalysisApp(tk.Tk):
         self.temporal_axis.set_ylabel("Metric")
         self.temporal_figure.tight_layout()
         self.temporal_canvas.draw_idle()
+        self.origami_figure.clear()
+        self.origami_figure.suptitle("1. Load source   2. Identify   3. Overlay   4. Export")
+        self.origami_canvas.draw_idle()
         self.notebook.select(RAW_MAP_TAB)
 
     def _update_metadata(self) -> None:
@@ -3180,6 +3756,617 @@ class PaintAnalysisApp(tk.Tk):
         self.temporal_canvas.draw_idle()
         self.notebook.select(TEMPORAL_TAB)
 
+    def _draw_origami_source_density(
+        self,
+        axis: Any,
+        points_nm: np.ndarray,
+        picks: OrigamiPickResult | None = None,
+    ) -> dict[str, object]:
+        cached_render = self.origami_source_render_result
+        if cached_render is not None:
+            raw_image = np.asarray(cached_render["image"], dtype=float)
+            contrast, density_limits = scale_density_like_picasso(
+                raw_image,
+                float(cached_render["min_density"]),
+                float(cached_render["max_density"]),
+            )
+            extent = tuple(float(value) for value in cached_render["extent"])
+            pixel_x = (extent[1] - extent[0]) / max(1, raw_image.shape[1])
+            pixel_y = (extent[3] - extent[2]) / max(1, raw_image.shape[0])
+            preview: dict[str, object] = {
+                "contrast": contrast,
+                "extent": extent,
+                "effective_pixel_x_nm": float(pixel_x),
+                "effective_pixel_y_nm": float(pixel_y),
+                "blur_method": str(cached_render["blur_method"]),
+                "density_limits": density_limits,
+            }
+            colorbar_label = (
+                f"density contrast ({density_limits[0]:.3g}-{density_limits[1]:.3g} locs/render px)"
+            )
+        else:
+            preview = render_localization_preview(
+                points_nm,
+                pixel_size_nm=max(float(self.origami_preview_pixel_nm.get()), 0.1),
+                blur_nm=1.0,
+            )
+            contrast = np.asarray(preview["contrast"], dtype=float)
+            extent = tuple(float(value) for value in preview["extent"])
+            colorbar_label = "density contrast (0–1)"
+        image = axis.imshow(
+            contrast,
+            extent=extent,
+            origin="lower",
+            cmap="magma",
+            interpolation="nearest",
+            aspect="equal",
+            vmin=0.0,
+            vmax=1.0,
+        )
+        axis.set_position(ORIGAMI_SOURCE_AXES_RECT)
+        axis.set_anchor("C")
+        colorbar_axis = self.origami_figure.add_axes(ORIGAMI_SOURCE_COLORBAR_RECT)
+        colorbar = self.origami_figure.colorbar(image, cax=colorbar_axis)
+        colorbar.set_label(colorbar_label)
+        picker_contrast = picks.density_contrast if picks is not None else None
+        if (
+            picks is not None
+            and picker_contrast is not None
+            and picker_contrast.size
+            and np.nanmin(picker_contrast) <= picks.density_threshold <= np.nanmax(picker_contrast)
+        ):
+            x_min, x_max, y_min, y_max = picks.density_extent_nm
+            x_centers = np.linspace(x_min, x_max, picker_contrast.shape[0], endpoint=False) + (x_max - x_min) / (2.0 * picker_contrast.shape[0])
+            y_centers = np.linspace(y_min, y_max, picker_contrast.shape[1], endpoint=False) + (y_max - y_min) / (2.0 * picker_contrast.shape[1])
+            axis.contour(
+                x_centers,
+                y_centers,
+                picker_contrast.T,
+                levels=[picks.density_threshold],
+                colors=["#22d3ee"],
+                linewidths=0.7,
+                alpha=0.75,
+            )
+        axis.set_xlabel("x position (nm)")
+        axis.set_ylabel("y position (nm)")
+        axis.grid(False)
+        return preview
+
+    def _plot_origami_source_data(self) -> None:
+        points = self.origami_source_points_nm
+        if points is None or len(points) == 0:
+            return
+        self.origami_gallery_view_limits = None
+        self.origami_gallery_home_limits = None
+        self.origami_figure.clear()
+        self.origami_figure.set_layout_engine("none")
+        axis = self.origami_figure.add_subplot(111)
+        preview = self._draw_origami_source_density(axis, points)
+        pixel_x = float(preview["effective_pixel_x_nm"])
+        pixel_y = float(preview["effective_pixel_y_nm"])
+        axis.set_title(
+            f"Loaded source data: {self.origami_loaded_source_label}\n"
+            f"{len(points):,} source points; Picasso render pixel {pixel_x:.3g} × {pixel_y:.3g} nm; "
+            f"blur={preview.get('blur_method', 'smooth')}"
+        )
+        self.origami_canvas.draw_idle()
+        self.origami_last_rendered_plot_option = "Loaded source data"
+        self.notebook.select(ORIGAMI_TAB)
+        self.status.set(f"Loaded and displayed {len(points):,} source points. Tune identification settings, then click Identify Origami.")
+
+    def _plot_identified_origamis(self) -> None:
+        points = self.origami_source_points_nm
+        picks = self.origami_pick_result
+        if points is None or picks is None:
+            return
+        if self.origami_result is None:
+            self.origami_gallery_view_limits = None
+            self.origami_gallery_home_limits = None
+        self.origami_plot_option.set("Identified origami image matches")
+        self.origami_figure.clear()
+        self.origami_figure.set_layout_engine("none")
+        axis = self.origami_figure.add_subplot(111)
+        axis.set_anchor("C")
+        preview = self._draw_origami_source_density(axis, points, picks)
+        colors = matplotlib.colormaps.get_cmap("tab20")
+        accepted_indices = np.flatnonzero(picks.accepted_mask)
+        accepted_display_index = 0
+        for region_index in range(len(picks.regions)):
+            accepted = bool(picks.accepted_mask[region_index])
+            if accepted:
+                accepted_display_index += 1
+            corners = picks.rectangle_corners_nm[region_index]
+            color = colors((accepted_display_index - 1) % 20 / 19.0) if accepted else "#9ca3af"
+            rectangle = matplotlib.patches.Polygon(
+                corners,
+                closed=True,
+                fill=False,
+                edgecolor=color,
+                linewidth=1.8 if accepted else 1.2,
+                linestyle="-" if accepted else "--",
+                alpha=1.0 if accepted else 0.8,
+            )
+            axis.add_patch(rectangle)
+            if len(picks.regions) <= 150:
+                label_corner = corners[int(np.argmax(corners[:, 1]))]
+                prefix = f"A{accepted_display_index}" if accepted else f"R{region_index + 1}"
+                annotation = axis.text(
+                    label_corner[0],
+                    label_corner[1],
+                    f"{prefix}: n={picks.point_counts[region_index]:,}; {picks.rectangle_angles_deg[region_index]:.1f}°; "
+                    f"corr={picks.rectangle_confidence[region_index]:.2f}",
+                    color=color,
+                    fontsize=7,
+                    va="bottom",
+                    ha="left",
+                    clip_on=True,
+                )
+                annotation.set_in_layout(False)
+        if len(picks.point_counts):
+            count_summary = (
+                f"region points min/median/max = {int(np.min(picks.point_counts)):,}/"
+                f"{int(np.median(picks.point_counts)):,}/{int(np.max(picks.point_counts)):,}"
+            )
+        else:
+            count_summary = "no connected regions"
+        if len(picks.rectangle_confidence):
+            confidence_summary = (
+                f"image correlation min/median/max = {np.min(picks.rectangle_confidence):.2f}/"
+                f"{np.median(picks.rectangle_confidence):.2f}/{np.max(picks.rectangle_confidence):.2f}"
+            )
+        else:
+            confidence_summary = "no image matches"
+        axis.set_title(
+            f"Identified origami: {picks.accepted_count}/{len(picks.regions)} accepted "
+            f"(image correlation ≥ {float(self.origami_min_rectangle_confidence.get()):g}; solid accepted, dashed rejected)\n"
+            f"{count_summary}; {confidence_summary}\n"
+            f"footprint {picks.rectangle_width_nm:g} × {picks.rectangle_height_nm:g} nm; alignment pixel "
+            f"{picks.alignment_pixel_nm:.3g} nm; display pixel "
+            f"{float(preview['effective_pixel_x_nm']):.3g} × {float(preview['effective_pixel_y_nm']):.3g} nm; "
+            f"pick bin {float(self.origami_pick_bin_nm.get()):g} nm; density ≥ {picks.density_threshold:.3g}"
+        )
+        self.origami_canvas.draw_idle()
+        self.origami_last_rendered_plot_option = "Identified origami image matches"
+        self.notebook.select(ORIGAMI_TAB)
+        if picks.accepted_count:
+            self.status.set(
+                f"Outlined {picks.accepted_count} accepted origamis from {len(picks.regions)} connected regions. "
+                "Solid footprints are accepted; gray dashed footprints are rejected. Tune the settings and rerun Identify Origami, or click Overlay Origami."
+            )
+        else:
+            self.status.set(
+                f"Found {len(picks.regions)} connected regions, but none pass both point and image-correlation limits; "
+                f"{count_summary}; {confidence_summary}. Adjust point limits, minimum confidence, or identification settings and rerun."
+            )
+
+    def _plot_origami_analysis(self, payload: dict[str, Any]) -> None:
+        result: OrigamiAnalysisResult = payload["result"]
+        threshold = int(payload["occupancy_threshold"])
+        self.origami_result = result
+        self.origami_result_source = str(payload["source"])
+        self.origami_result_source_count = int(payload["source_count"])
+        self.origami_result_render_settings = dict(payload["render_settings"])
+        self.origami_result_occupancy_threshold = threshold
+        self.origami_gallery_view_limits = None
+        self.origami_gallery_home_limits = None
+        self.origami_last_rendered_plot_option = ""
+        if self.origami_plot_option.get() == "Identified origami image matches":
+            self.origami_plot_option.set("Individual origami gallery")
+
+        self.render_origami_plot()
+        self.status.set(
+            f"Overlaid all {result.origami_count} identified origamis and assigned "
+            f"{sum(len(sites) for sites in result.cluster_site_indices)} docking-site clusters; median alignment RMS "
+            f"{np.median(result.alignment_rms_nm):.2f} nm and median grid match "
+            f"{100.0 * np.median(result.grid_match_fraction):.1f}%."
+        )
+
+    def render_origami_plot(self) -> None:
+        option = self.origami_plot_option.get()
+        if option == "Identified origami image matches":
+            if self.origami_pick_result is None or self.origami_source_points_nm is None:
+                messagebox.showinfo("No identified origami", "Run Identify Origami before rendering the rectangle preview.")
+                return
+            self._plot_identified_origamis()
+            return
+
+        result = self.origami_result
+        render_settings = self.origami_result_render_settings
+        if result is None or render_settings is None:
+            messagebox.showinfo("No origami overlay", "Run Overlay Origami before rendering a result plot.")
+            return
+
+        gallery_options = {"Individual origami gallery", "Individual Picasso G5M sites"}
+        if self.origami_last_rendered_plot_option in gallery_options and self.origami_figure.axes:
+            previous_axis = self.origami_figure.axes[0]
+            previous_xlim = tuple(float(value) for value in previous_axis.get_xlim())
+            previous_ylim = tuple(float(value) for value in previous_axis.get_ylim())
+            if all(np.isfinite(previous_xlim)) and all(np.isfinite(previous_ylim)):
+                self.origami_gallery_view_limits = (previous_xlim, previous_ylim)
+
+        self.origami_figure.clear()
+        fixed_colorbar_options = {
+            "Aligned density",
+            "Integrated density per site",
+            "Mean site counts",
+            "Site occupancy",
+        }
+        if option in fixed_colorbar_options:
+            self.origami_figure.set_layout_engine("none")
+        else:
+            self.origami_figure.set_layout_engine("constrained", w_pad=6 / 72, h_pad=6 / 72)
+        axis = self.origami_figure.subplots(1, 1)
+        grid = result.grid_points_nm
+
+        if option == "Individual origami gallery":
+            self._plot_individual_origami_gallery(axis, result, render_settings)
+        elif option == "Individual Picasso G5M sites":
+            self._plot_individual_origami_clusters(axis, result, render_settings)
+        elif option == "Aligned density":
+            density_orientations = [
+                orientation
+                for points in result.aligned_points
+                for orientation in (points, -points)
+            ] if result.symmetrized_180 else result.aligned_points
+            overlay_render = render_aligned_origami_density(density_orientations, **render_settings)
+            overlay_image = np.asarray(overlay_render["image"], dtype=float)
+            overlay_extent = tuple(float(value) for value in overlay_render["extent"])
+            image = axis.imshow(
+                overlay_image,
+                extent=overlay_extent,
+                origin="lower",
+                cmap="magma",
+                aspect="equal",
+                interpolation="none",
+            )
+            self._add_centered_origami_result_colorbar(axis, image, "Mean source points / origami / bin")
+            axis.scatter(grid[:, 0], grid[:, 1], s=55, facecolors="none", edgecolors="#22d3ee", linewidths=1.2)
+            effective_x = float(overlay_render["effective_pixel_x_nm"])
+            effective_y = float(overlay_render["effective_pixel_y_nm"])
+            pixel_text = f"{effective_x:.3g} nm/px" if math.isclose(effective_x, effective_y) else f"{effective_x:.3g} × {effective_y:.3g} nm/px"
+            orientation_count = 2 if result.symmetrized_180 else 1
+            symmetry_text = "; 0°/180° equal-weight average" if result.symmetrized_180 else ""
+            axis.set_title(
+                f"Aligned density ({result.origami_count} origamis)\n"
+                f"{pixel_text}; Gaussian σ={float(overlay_render['blur_nm']):.3g} nm; "
+                f"{int(overlay_render['rendered_point_count'] / orientation_count):,}/"
+                f"{int(overlay_render['total_point_count'] / orientation_count):,} physical source points in view"
+                f"{symmetry_text}"
+            )
+            axis.set_xlabel("aligned x (nm)")
+            axis.set_ylabel("aligned y (nm)")
+        elif option == "Integrated density per site":
+            density_orientations = [
+                orientation
+                for points in result.aligned_points
+                for orientation in (points, -points)
+            ] if result.symmetrized_180 else result.aligned_points
+            overlay_render = render_aligned_origami_density(density_orientations, **render_settings)
+            integrated_counts = integrate_rendered_density_at_sites(
+                overlay_render,
+                grid,
+                result.site_match_radius_nm,
+            )
+            values = integrated_counts.reshape(result.rows, result.columns)
+            self._plot_origami_site_heatmap(
+                axis,
+                values,
+                result,
+                "magma",
+                "Mean rendered source points inside site radius",
+                (
+                    f"Integrated aligned density within {result.site_match_radius_nm:g} nm of each site\n"
+                    f"pixel {float(overlay_render['effective_pixel_x_nm']):.3g} × "
+                    f"{float(overlay_render['effective_pixel_y_nm']):.3g} nm; "
+                    f"Gaussian σ={float(overlay_render['blur_nm']):.3g} nm; includes G5M-unmatched points"
+                ),
+            )
+        elif option == "Mean site counts":
+            values = np.mean(result.site_counts, axis=0).reshape(result.rows, result.columns)
+            self._plot_origami_site_heatmap(
+                axis,
+                values,
+                result,
+                "viridis",
+                "Mean source-point count",
+                "Mean count at each expected docking site (0°/180° average)",
+            )
+        elif option == "Site occupancy":
+            values = (100.0 * np.mean(result.site_occupancy, axis=0)).reshape(result.rows, result.columns)
+            self._plot_origami_site_heatmap(
+                axis,
+                values,
+                result,
+                "YlGn",
+                "Occupied origamis (%)",
+                "Site occupancy (0°/180° equal-weight cluster presence)",
+                suffix="%",
+                vmin=0.0,
+                vmax=100.0,
+            )
+        elif option == "Occupied-site completeness":
+            occupied_per_origami = np.sum(result.site_occupancy, axis=1)
+            bin_step = 0.5 if result.symmetrized_180 else 1.0
+            edges = np.arange(-bin_step / 2.0, result.rows * result.columns + bin_step, bin_step)
+            axis.hist(occupied_per_origami, bins=edges, color="#2563eb", edgecolor="white")
+            axis.set_xticks(np.arange(0, result.rows * result.columns + bin_step, bin_step))
+            axis.set_xlabel("occupied sites per origami (0°/180° average)")
+            axis.set_ylabel("origami count")
+            axis.set_title(
+                "Per-origami completeness (accepted docking-site clusters)\n"
+                f"median RMS {np.median(result.alignment_rms_nm):.2f} nm; median grid match "
+                f"{100.0 * np.median(result.grid_match_fraction):.1f}%; {result.rejected_candidate_count} rejected"
+            )
+            axis.grid(True, axis="y", alpha=0.25)
+        else:
+            axis.text(0.5, 0.5, f"Unknown plot option: {option}", ha="center", va="center", transform=axis.transAxes)
+
+        if option in gallery_options:
+            # Capture the complete data limits before restoring a shared zoom.
+            # Matplotlib's toolbar history is reset when this figure is rebuilt,
+            # so OrigamiToolbar.home uses this explicit, stable target.
+            self.origami_gallery_home_limits = (
+                tuple(float(value) for value in axis.get_xlim()),
+                tuple(float(value) for value in axis.get_ylim()),
+            )
+            if self.origami_gallery_view_limits is not None:
+                axis.set_xlim(*self.origami_gallery_view_limits[0])
+                axis.set_ylim(*self.origami_gallery_view_limits[1])
+
+        self.origami_figure.suptitle(
+            f"Origami overlay — {self.origami_result_source}; {self.origami_result_source_count:,} source points",
+            fontsize=12,
+        )
+        self.origami_canvas.draw_idle()
+        self.origami_toolbar.update()
+        self.origami_last_rendered_plot_option = option
+        self.notebook.select(ORIGAMI_TAB)
+        self.status.set(f"Rendered {option.lower()} for {result.origami_count} origamis.")
+
+    def _plot_origami_site_heatmap(
+        self,
+        axis: Any,
+        values: np.ndarray,
+        result: OrigamiAnalysisResult,
+        cmap_name: str,
+        colorbar_label: str,
+        title: str,
+        *,
+        suffix: str = "",
+        vmin: float | None = None,
+        vmax: float | None = None,
+    ) -> None:
+        image = axis.imshow(values, origin="upper", cmap=cmap_name, vmin=vmin, vmax=vmax, aspect="equal")
+        self._add_centered_origami_result_colorbar(axis, image, colorbar_label)
+        axis.set_title(title)
+        axis.set_xlabel("column")
+        axis.set_ylabel("row")
+        axis.set_xticks(np.arange(result.columns), labels=np.arange(1, result.columns + 1))
+        axis.set_yticks(np.arange(result.rows), labels=np.arange(1, result.rows + 1))
+        colormap = matplotlib.colormaps[cmap_name]
+        for row in range(result.rows):
+            for column in range(result.columns):
+                value = float(values[row, column])
+                red, green, blue, _alpha = colormap(image.norm(value))
+                luminance = 0.2126 * red + 0.7152 * green + 0.0722 * blue
+                axis.text(
+                    column,
+                    row,
+                    f"{value:.1f}{suffix}",
+                    ha="center",
+                    va="center",
+                    color="black" if luminance > 0.55 else "white",
+                )
+
+    def _add_centered_origami_result_colorbar(self, axis: Any, image: Any, label: str) -> Any:
+        """Keep a result plot centered while placing its colorbar independently."""
+        axis.set_position(ORIGAMI_RESULT_AXES_RECT)
+        axis.set_anchor("C")
+        colorbar_axis = self.origami_figure.add_axes(ORIGAMI_RESULT_COLORBAR_RECT)
+        colorbar = self.origami_figure.colorbar(image, cax=colorbar_axis)
+        colorbar.set_label(label)
+        return colorbar
+
+    def _plot_individual_origami_gallery(
+        self,
+        axis: Any,
+        result: OrigamiAnalysisResult,
+        render_settings: dict[str, Any],
+    ) -> None:
+        settings = dict(render_settings)
+        field_width_nm, field_height_nm, preview_pixel_nm, tile_width, tile_height, columns, rows, gap = (
+            self._origami_gallery_geometry(result, settings)
+        )
+        settings["pixel_size_nm"] = preview_pixel_nm
+        rendered = [
+            render_aligned_origami_density(
+                [points],
+                **settings,
+            )
+            for points in result.aligned_points
+        ]
+        gallery = np.full((rows * tile_height + (rows - 1) * gap, columns * tile_width + (columns - 1) * gap), np.nan)
+        tile_origins: list[tuple[int, int]] = []
+        for index, tile_render in enumerate(rendered):
+            tile = np.asarray(tile_render["image"], dtype=float)
+            # render_aligned_origami_density stores increasing physical y from
+            # the first row to the last (the convention used with
+            # imshow(origin="lower")).  Gallery rows, including the G5M
+            # gallery below, use screen coordinates with row zero at the top.
+            # Convert the density tile once here so both individual views show
+            # the exact same cached pose instead of opposite y conventions.
+            tile = np.flipud(tile)
+            peak = float(np.nanmax(tile)) if tile.size else 0.0
+            if peak > 0:
+                tile = tile / peak
+            row, column = divmod(index, columns)
+            y0 = row * (tile_height + gap)
+            x0 = column * (tile_width + gap)
+            gallery[y0 : y0 + tile_height, x0 : x0 + tile_width] = tile
+            tile_origins.append((x0, y0))
+
+        colormap = matplotlib.colormaps["magma"].copy()
+        colormap.set_bad("white")
+        axis.imshow(gallery, origin="upper", cmap=colormap, vmin=0.0, vmax=1.0, interpolation="nearest")
+        x_min, x_max, y_min, y_max = (float(value) for value in rendered[0]["extent"])
+        grid_x = (result.grid_points_nm[:, 0] - x_min) * tile_width / (x_max - x_min)
+        grid_y = (y_max - result.grid_points_nm[:, 1]) * tile_height / (y_max - y_min)
+        expected_x: list[float] = []
+        expected_y: list[float] = []
+        for index, ((x0, y0), points) in enumerate(zip(tile_origins, result.aligned_points), start=1):
+            expected_x.extend((x0 + grid_x).tolist())
+            expected_y.extend((y0 + grid_y).tolist())
+            label = axis.text(
+                x0 + 2,
+                y0 + 2,
+                f"#{index}  n={result.source_point_counts[index - 1]:,}",
+                color="white",
+                fontsize=6,
+                va="top",
+                ha="left",
+                clip_on=True,
+                bbox={"facecolor": "black", "alpha": 0.45, "edgecolor": "none", "pad": 0.5},
+            )
+            label.set_clip_path(axis.patch)
+            label.set_in_layout(False)
+        axis.scatter(expected_x, expected_y, s=9, facecolors="none", edgecolors="#22d3ee", linewidths=0.5)
+        axis.set_title(
+            f"Every individual aligned origami ({result.origami_count})\n"
+            "One cached orientation per physical origami—the exact coordinates fitted by G5M; "
+            "tiles are independently brightness-normalized; cyan circles show expected sites"
+        )
+        axis.set_axis_off()
+
+    def _origami_gallery_geometry(
+        self,
+        result: OrigamiAnalysisResult,
+        render_settings: dict[str, Any],
+    ) -> tuple[float, float, float, int, int, int, int, int]:
+        """Return the single shared tile geometry used by both individual views."""
+        width_nm = max(
+            float(render_settings["spacing_x_nm"]),
+            (int(render_settings["columns"]) - 1) * float(render_settings["spacing_x_nm"]),
+        ) + 2.0 * float(render_settings["padding_nm"])
+        height_nm = max(
+            float(render_settings["spacing_y_nm"]),
+            (int(render_settings["rows"]) - 1) * float(render_settings["spacing_y_nm"]),
+        ) + 2.0 * float(render_settings["padding_nm"])
+        preview_pixel_nm = max(
+            float(render_settings["pixel_size_nm"]),
+            width_nm / 100.0,
+            height_nm / 100.0,
+        )
+        tile_width = max(1, int(np.ceil(width_nm / preview_pixel_nm)))
+        tile_height = max(1, int(np.ceil(height_nm / preview_pixel_nm)))
+        columns = max(1, int(np.ceil(np.sqrt(result.origami_count * tile_height / tile_width))))
+        rows = int(np.ceil(result.origami_count / columns))
+        return width_nm, height_nm, preview_pixel_nm, tile_width, tile_height, columns, rows, 3
+
+    def _plot_individual_origami_clusters(
+        self,
+        axis: Any,
+        result: OrigamiAnalysisResult,
+        render_settings: dict[str, Any],
+    ) -> None:
+        settings = dict(render_settings)
+        width_nm, height_nm, _preview_pixel_nm, tile_width, tile_height, columns, rows, gap = (
+            self._origami_gallery_geometry(result, settings)
+        )
+        gallery = np.ones(
+            (rows * tile_height + (rows - 1) * gap, columns * tile_width + (columns - 1) * gap, 3),
+            dtype=float,
+        )
+        x_min, x_max = -width_nm / 2.0, width_nm / 2.0
+        y_min, y_max = -height_nm / 2.0, height_nm / 2.0
+        site_count = result.rows * result.columns
+        site_colors = matplotlib.colormaps["tab20"](np.linspace(0.0, 1.0, max(site_count, 2)))[:, :3]
+        expected_x: list[float] = []
+        expected_y: list[float] = []
+        center_x: list[float] = []
+        center_y: list[float] = []
+        center_colors: list[np.ndarray] = []
+
+        def to_tile_pixels(points: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+            inside = (
+                (points[:, 0] >= x_min)
+                & (points[:, 0] < x_max)
+                & (points[:, 1] >= y_min)
+                & (points[:, 1] < y_max)
+            )
+            x_pixels = np.floor((points[:, 0] - x_min) * tile_width / width_nm).astype(int)
+            y_pixels = np.floor((y_max - points[:, 1]) * tile_height / height_nm).astype(int)
+            return x_pixels, y_pixels, inside
+
+        for index, (points, labels, centers, sites) in enumerate(
+            zip(result.aligned_points, result.cluster_labels, result.cluster_centers_nm, result.cluster_site_indices)
+        ):
+            row, column = divmod(index, columns)
+            y0 = row * (tile_height + gap)
+            x0 = column * (tile_width + gap)
+            tile = np.zeros((tile_height, tile_width, 3), dtype=float)
+            orientations = [(points, centers, sites)]
+            for oriented_points, oriented_centers, oriented_sites in orientations:
+                x_pixels, y_pixels, inside = to_tile_pixels(oriented_points)
+
+                noise = inside & (labels < 0)
+                if np.any(noise):
+                    flat = y_pixels[noise] * tile_width + x_pixels[noise]
+                    density = np.bincount(flat, minlength=tile_height * tile_width).reshape(tile_height, tile_width)
+                    peak = float(np.max(density))
+                    if peak > 0:
+                        tile += (0.09 * np.sqrt(density / peak))[..., None]
+
+                for cluster_label, site_index in enumerate(oriented_sites):
+                    members = inside & (labels == cluster_label)
+                    if not np.any(members):
+                        continue
+                    flat = y_pixels[members] * tile_width + x_pixels[members]
+                    density = np.bincount(flat, minlength=tile_height * tile_width).reshape(tile_height, tile_width)
+                    peak = float(np.max(density))
+                    if peak > 0:
+                        intensity = np.sqrt(density / peak)[..., None]
+                        tile = np.maximum(tile, intensity * site_colors[int(site_index)])
+
+                if len(oriented_centers):
+                    cluster_x, cluster_y, cluster_inside = to_tile_pixels(oriented_centers)
+                    center_x.extend((x0 + cluster_x[cluster_inside]).tolist())
+                    center_y.extend((y0 + cluster_y[cluster_inside]).tolist())
+                    center_colors.extend(site_colors[oriented_sites[cluster_inside]])
+
+            gallery[y0 : y0 + tile_height, x0 : x0 + tile_width] = np.clip(tile, 0.0, 1.0)
+            grid_x, grid_y, _grid_inside = to_tile_pixels(result.grid_points_nm)
+            expected_x.extend((x0 + grid_x).tolist())
+            expected_y.extend((y0 + grid_y).tolist())
+            label = axis.text(
+                x0 + 2,
+                y0 + 2,
+                (
+                    f"#{index + 1}  n={result.source_point_counts[index]:,}; {len(sites)} matched clusters"
+                ),
+                color="white",
+                fontsize=6,
+                va="top",
+                ha="left",
+                clip_on=True,
+                bbox={"facecolor": "black", "alpha": 0.55, "edgecolor": "none", "pad": 0.5},
+            )
+            label.set_clip_path(axis.patch)
+            label.set_in_layout(False)
+
+        axis.imshow(gallery, origin="upper", interpolation="nearest")
+        axis.scatter(expected_x, expected_y, s=8, facecolors="none", edgecolors="#67e8f9", linewidths=0.45)
+        if center_x:
+            axis.scatter(center_x, center_y, s=9, marker="x", c=np.asarray(center_colors), linewidths=0.7)
+        axis.set_title(
+            f"Picasso G5M docking-site components for every individual origami ({result.origami_count})\n"
+            f"G5M σ {result.g5m_sigma_min_nm:g}–{result.g5m_sigma_max_nm:g} nm, "
+            f"minimum {result.g5m_min_locs} locs, BIC patience {result.g5m_max_rounds_without_best_bic}, "
+            f"site match {result.site_match_radius_nm:g} nm\n"
+            "Single cached orientation used for the G5M fit; color = assigned site; "
+            "cyan circle = expected site; × = matched G5M component center"
+        )
+        axis.set_axis_off()
+
     def _plot_filtered_maps(self, result: dict[str, Any]) -> None:
         if self.loaded is None or result.get("source_path") != self.loaded.path:
             return
@@ -3413,6 +4600,69 @@ class PaintAnalysisApp(tk.Tk):
             return
         np.savetxt(path, values, delimiter=",", header=xlabel.replace(",", " "), comments="")
         self.status.set(f"Exported {len(values):,} values to {path}")
+
+    def export_origami_csvs(self) -> None:
+        result = self.origami_result
+        if result is None or result.origami_count == 0:
+            messagebox.showinfo("No origami overlay", "Run Overlay Origami before exporting.")
+            return
+        path_text = filedialog.asksaveasfilename(
+            title="Export per-origami site counts",
+            defaultextension=".csv",
+            filetypes=[("CSV", "*.csv")],
+            initialfile="origami_site_counts.csv",
+        )
+        if not path_text:
+            return
+        path = Path(path_text)
+        per_origami: dict[str, Any] = {
+            "origami_id": np.arange(1, result.origami_count + 1),
+            "center_x_nm": result.centers_nm[:, 0],
+            "center_y_nm": result.centers_nm[:, 1],
+            "source_point_count": result.source_point_counts,
+            "alignment_rms_nm": result.alignment_rms_nm,
+            "grid_match_fraction": result.grid_match_fraction,
+            "accepted_cluster_count": np.asarray([len(sites) for sites in result.cluster_site_indices], dtype=int),
+            "occupied_site_count": np.sum(result.site_occupancy, axis=1),
+            "orientation_averaging": "0_and_180_degrees_equal_weight",
+        }
+        summary_rows: list[dict[str, Any]] = []
+        for site_index, point in enumerate(result.grid_points_nm):
+            row = site_index // result.columns + 1
+            column = site_index % result.columns + 1
+            label = f"site_r{row}_c{column}"
+            counts = result.site_counts[:, site_index]
+            occupancy = result.site_occupancy[:, site_index]
+            per_origami[f"{label}_count"] = counts
+            per_origami[f"{label}_occupancy_weight"] = occupancy
+            summary_rows.append(
+                {
+                    "site": label,
+                    "row": row,
+                    "column": column,
+                    "aligned_x_nm": point[0],
+                    "aligned_y_nm": point[1],
+                    "mean_count": float(np.mean(counts)),
+                    "median_count": float(np.median(counts)),
+                    "standard_deviation": float(np.std(counts, ddof=1)) if len(counts) > 1 else 0.0,
+                    "occupancy_definition": "mean of cluster presence at the 0-degree and 180-degree site counterparts",
+                    "orientation_averaging": "0_and_180_degrees_equal_weight",
+                    "clustering_method": "Picasso G5M",
+                    "g5m_sigma_min_nm": result.g5m_sigma_min_nm,
+                    "g5m_sigma_max_nm": result.g5m_sigma_max_nm,
+                    "g5m_minimum_localizations": result.g5m_min_locs,
+                    "g5m_bic_patience": result.g5m_max_rounds_without_best_bic,
+                    "site_match_radius_nm": result.site_match_radius_nm,
+                    "occupied_origami_count": float(np.sum(occupancy)),
+                    "occupancy_fraction": float(np.mean(occupancy)),
+                }
+            )
+        per_origami_path = path
+        summary_path = path.with_name(f"{path.stem}_site_summary.csv")
+        pd.DataFrame(per_origami).to_csv(per_origami_path, index=False)
+        pd.DataFrame(summary_rows).to_csv(summary_path, index=False)
+        self._remember_file_dialog_dir(path)
+        self.status.set(f"Exported per-origami counts to {per_origami_path.name} and site statistics to {summary_path.name}.")
 
 
 def main() -> None:

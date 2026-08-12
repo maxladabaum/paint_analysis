@@ -4,6 +4,7 @@ matplotlib>=3.7
 PyYAML>=6.0
 tifffile>=2023.7.10
 scipy>=1.10
+scikit-learn>=1.3
 pandas>=2.0,<3
 tqdm>=4.66
 picassosr>=0.10.1
