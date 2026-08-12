@@ -18,8 +18,8 @@ set "PYTHONPYCACHEPREFIX=%APP_HOME%\cache"
 
 call :find_python
 if not defined PYTHON_CMD (
-    echo Python %MIN_PYTHON% or newer was not found.
-    echo Installing Python %BOOTSTRAP_PYTHON% for the current user...
+    echo A compatible Python %MIN_PYTHON% through 3.14 installation was not found.
+    echo Installing Python %BOOTSTRAP_PYTHON% alongside any existing Python versions...
     call :install_python
     if errorlevel 1 goto :python_install_failed
 
@@ -39,10 +39,11 @@ if not exist "%VENV_DIR%\Scripts\python.exe" (
     "%PYTHON_CMD%" %PYTHON_ARGS% -m venv "%VENV_DIR%"
     if errorlevel 1 goto :venv_failed
 ) else (
-    "%VENV_DIR%\Scripts\python.exe" -c "import sys; raise SystemExit(0 if sys.version_info[:2] ^>= (3, 10) else 1)" >nul 2>nul
+    "%VENV_DIR%\Scripts\python.exe" -c "import sys; raise SystemExit(0 if (3, 10) ^<= sys.version_info[:2] ^< (3, 15) else 1)" >nul 2>nul
     if errorlevel 1 (
-        echo Updating the existing Python environment...
-        "%PYTHON_CMD%" %PYTHON_ARGS% -m venv --upgrade "%VENV_DIR%"
+        echo Rebuilding an incompatible application environment...
+        rmdir /s /q "%VENV_DIR%"
+        "%PYTHON_CMD%" %PYTHON_ARGS% -m venv "%VENV_DIR%"
         if errorlevel 1 goto :venv_failed
     )
 )
@@ -75,19 +76,19 @@ exit /b %APP_EXIT%
 :find_python
 set "PYTHON_CMD="
 set "PYTHON_ARGS="
-py -3.12 -c "import sys; raise SystemExit(0 if sys.version_info[:2] ^>= (3, 10) else 1)" >nul 2>nul
+py -3.12 -c "import ensurepip, tkinter, venv, sys; raise SystemExit(0 if sys.version_info[:2] == (3, 12) else 1)" >nul 2>nul
 if not errorlevel 1 (
     set "PYTHON_CMD=py"
     set "PYTHON_ARGS=-3.12"
     exit /b 0
 )
-py -3 -c "import sys; raise SystemExit(0 if sys.version_info[:2] ^>= (3, 10) else 1)" >nul 2>nul
+py -3 -c "import ensurepip, tkinter, venv, sys; raise SystemExit(0 if (3, 10) ^<= sys.version_info[:2] ^< (3, 15) else 1)" >nul 2>nul
 if not errorlevel 1 (
     set "PYTHON_CMD=py"
     set "PYTHON_ARGS=-3"
     exit /b 0
 )
-python -c "import sys; raise SystemExit(0 if sys.version_info[:2] ^>= (3, 10) else 1)" >nul 2>nul
+python -c "import ensurepip, tkinter, venv, sys; raise SystemExit(0 if (3, 10) ^<= sys.version_info[:2] ^< (3, 15) else 1)" >nul 2>nul
 if not errorlevel 1 (
     set "PYTHON_CMD=python"
     exit /b 0
@@ -100,18 +101,11 @@ exit /b 0
 :consider_python
 if defined PYTHON_CMD exit /b 0
 if not exist "%~1" exit /b 0
-"%~1" -c "import sys; raise SystemExit(0 if sys.version_info[:2] ^>= (3, 10) else 1)" >nul 2>nul
+"%~1" -c "import ensurepip, tkinter, venv, sys; raise SystemExit(0 if (3, 10) ^<= sys.version_info[:2] ^< (3, 15) else 1)" >nul 2>nul
 if not errorlevel 1 set "PYTHON_CMD=%~1"
 exit /b 0
 
 :install_python
-where winget >nul 2>nul
-if not errorlevel 1 (
-    winget install --id Python.Python.3.12 --exact --scope user --silent --accept-package-agreements --accept-source-agreements
-    if not errorlevel 1 exit /b 0
-    echo Windows Package Manager could not install Python. Trying the official installer...
-)
-
 set "PYTHON_ARCH="
 if /i "%PROCESSOR_ARCHITECTURE%"=="AMD64" set "PYTHON_ARCH=-amd64"
 if /i "%PROCESSOR_ARCHITEW6432%"=="AMD64" set "PYTHON_ARCH=-amd64"
@@ -131,7 +125,7 @@ if errorlevel 1 (
     exit /b 1
 )
 
-start /wait "" "%PYTHON_INSTALLER%" /quiet InstallAllUsers=0 InstallLauncherAllUsers=0 PrependPath=1 Include_launcher=1 Include_pip=1 Include_test=0 Include_tcltk=1
+start /wait "" "%PYTHON_INSTALLER%" /quiet InstallAllUsers=0 PrependPath=0 Include_launcher=0 Include_pip=1 Include_test=0 Include_tcltk=1
 set "INSTALL_EXIT=%ERRORLEVEL%"
 del /q "%PYTHON_INSTALLER%" >nul 2>nul
 if not "%INSTALL_EXIT%"=="0" exit /b 1
@@ -140,7 +134,8 @@ exit /b 0
 :python_install_failed
 echo.
 echo Python could not be installed automatically.
-echo Check your internet connection, or install Python %MIN_PYTHON% or newer from:
+echo Your existing Python installation has not been changed.
+echo Check your internet connection, or install Python %MIN_PYTHON% through 3.14 from:
 echo https://www.python.org/downloads/windows/
 echo Then run this file again.
 pause
