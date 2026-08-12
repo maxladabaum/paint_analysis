@@ -1,0 +1,34 @@
+# Python-generated files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environments belong outside the repository. Keep these rules as a
+# safety net for environments created manually by an editor or Python tooling.
+.venv/
+venv/
+env/
+.env
+.env.*
+!.env.example
+
+# Local application state and generated analysis data
+.paint_recent_dir.txt
+*.h5
+*.hdf5
+*_locs.yaml
+*.csv
+*.npy
+*.npz
+*.tif
+*.tiff
+/data/
+/output/
+/outputs/
+/results/
+
+# OS and editor metadata
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/

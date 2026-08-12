@@ -3,6 +3,7 @@ from __future__ import annotations
 import math
 import os
 import queue
+import sys
 import threading
 import traceback
 import gc
@@ -27,7 +28,26 @@ from tkinter import filedialog, messagebox, ttk
 
 APP_TITLE = "DNA PAINT Picasso-Style ROI Analyzer"
 DEFAULT_DATA_DIR = Path.home() / "Desktop" / "LBNL_PAINT"
-RECENT_DIR_FILE = Path(__file__).with_name(".paint_recent_dir.txt")
+
+
+def user_state_dir() -> Path:
+    """Return an OS-appropriate directory for machine-specific app state."""
+    override = os.environ.get("PAINT_ANALYSIS_HOME")
+    if override:
+        return Path(override).expanduser()
+    if sys.platform == "win32":
+        local_app_data = os.environ.get("LOCALAPPDATA")
+        base = Path(local_app_data) if local_app_data else Path.home() / "AppData" / "Local"
+        return base / "PaintAnalysis"
+    if sys.platform == "darwin":
+        return Path.home() / "Library" / "Application Support" / "PaintAnalysis"
+    xdg_state_home = os.environ.get("XDG_STATE_HOME")
+    base = Path(xdg_state_home) if xdg_state_home else Path.home() / ".local" / "state"
+    return base / "paint-analysis"
+
+
+APP_STATE_DIR = user_state_dir()
+RECENT_DIR_FILE = APP_STATE_DIR / "recent-data-directory.txt"
 MAX_RENDER_PIXELS = 30_000_000
 MAP_AXES_RECT = (0.10, 0.12, 0.74, 0.78)
 MAP_COLORBAR_RECT = (0.87, 0.18, 0.025, 0.66)
@@ -1631,6 +1651,7 @@ class PaintAnalysisApp(tk.Tk):
 
     def _remember_file_dialog_dir(self, path: Path) -> None:
         try:
+            RECENT_DIR_FILE.parent.mkdir(parents=True, exist_ok=True)
             RECENT_DIR_FILE.write_text(str(path.parent), encoding="utf-8")
         except OSError:
             pass
