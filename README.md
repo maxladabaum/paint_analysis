@@ -66,10 +66,14 @@ picasso.render.render(...)
 Correction methods:
 
 - `none`: use loaded coordinates.
-- `rcc`: call `picasso.postprocess.undrift`.
+- `rcc`: call Picasso RCC directly, optionally after Fourier lattice suppression.
 - `aim`: call `picasso.aim.aim`.
 
-`Segmentation` is frames per drift segment. AIM also uses `AIM intersect (nm)` and `AIM ROI (nm)`.
+`Segmentation` is frames per drift segment. `RCC lattice pitch (nm)` locates the lattice
+directions in the summed Fourier spectrum and removes narrow notches at the fundamental
+frequency and its harmonics before RCC. The default is 700 nm. Filtering affects only the
+temporary correlation images, not the localization coordinates. Set the pitch to `0` to use
+unfiltered Picasso RCC. AIM also uses `AIM intersect (nm)` and `AIM ROI (nm)`.
 
 Drift correction and rendering are separate actions. Changing `Render pixel`, `Render blur`, or `Min blur` and pressing `Render Map` re-renders the current corrected localization table without rerunning RCC/AIM.
 

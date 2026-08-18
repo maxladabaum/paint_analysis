@@ -32,6 +32,7 @@ from origami_analysis import (
     render_aligned_origami_density,
     render_localization_preview,
 )
+from drift_analysis import undrift_rcc_with_lattice_suppression
 
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
@@ -386,6 +387,7 @@ def apply_drift_correction(
     aim_intersect_nm: float,
     aim_roi_nm: float,
     progress_callback: Any | None = None,
+    rcc_lattice_pitch_nm: float = 0.0,
 ) -> tuple[pd.DataFrame, pd.DataFrame | None, str]:
     if method == "none":
         if progress_callback is not None:
@@ -405,7 +407,9 @@ def apply_drift_correction(
     locs_for_picasso["frame"] = locs_for_picasso["frame"].astype(np.uint32)
 
     if method == "rcc":
-        segment_count = int(math.ceil(frames / int(segmentation)))
+        if not np.isfinite(rcc_lattice_pitch_nm) or rcc_lattice_pitch_nm < 0:
+            raise ValueError("RCC lattice pitch must be a finite, non-negative value in nm.")
+        segment_count = int(round(frames / int(segmentation)))
         pair_count = max(1, segment_count * (segment_count - 1) // 2)
 
         def segmentation_progress(index: int) -> None:
@@ -424,15 +428,30 @@ def apply_drift_correction(
 
         if progress_callback is not None:
             progress_callback(f"RCC drift correction started ({segment_count} segments).")
-        drift, corrected_locs = postprocess.undrift(
-            locs_for_picasso,
-            info,
-            int(segmentation),
-            display=False,
-            segmentation_callback=segmentation_progress,
-            rcc_callback=rcc_progress,
-        )
-        return corrected_locs, drift, f"Picasso RCC, segmentation={segmentation} frames"
+        if rcc_lattice_pitch_nm > 0:
+            drift, corrected_locs = undrift_rcc_with_lattice_suppression(
+                locs_for_picasso,
+                info,
+                int(segmentation),
+                float(rcc_lattice_pitch_nm),
+                segmentation_callback=segmentation_progress,
+                rcc_callback=rcc_progress,
+            )
+            label = (
+                f"Picasso RCC, segmentation={segmentation} frames, "
+                f"Fourier lattice notch pitch={rcc_lattice_pitch_nm:g} nm"
+            )
+        else:
+            drift, corrected_locs = postprocess.undrift(
+                locs_for_picasso,
+                info,
+                int(segmentation),
+                display=False,
+                segmentation_callback=segmentation_progress,
+                rcc_callback=rcc_progress,
+            )
+            label = f"Picasso RCC, segmentation={segmentation} frames"
+        return corrected_locs, drift, label
 
     if method == "aim":
         aim_progress = PicassoAimStatusProgress(progress_callback) if progress_callback is not None else None
@@ -1158,6 +1177,7 @@ class PaintAnalysisApp(tk.Tk):
         self.linking_scope = tk.StringVar(value="Selected ROI")
         self.drift_method = tk.StringVar(value="none")
         self.drift_segmentation = tk.IntVar(value=1000)
+        self.rcc_lattice_pitch_nm = tk.DoubleVar(value=700.0)
         self.aim_intersect_nm = tk.DoubleVar(value=20.0)
         self.aim_roi_nm = tk.DoubleVar(value=60.0)
         self.render_disp_px_nm = tk.DoubleVar(value=10.0)
@@ -1300,9 +1320,10 @@ class PaintAnalysisApp(tk.Tk):
         ttk.Label(drift_box, text="Drift method").grid(row=1, column=0, sticky="w", pady=3)
         ttk.Combobox(drift_box, textvariable=self.drift_method, state="readonly", values=("none", "rcc", "aim")).grid(row=1, column=1, sticky="ew", padx=(8, 0), pady=3)
         self._number_row(drift_box, 2, "Segmentation", self.drift_segmentation)
-        self._number_row(drift_box, 3, "AIM intersect (nm)", self.aim_intersect_nm)
-        self._number_row(drift_box, 4, "AIM ROI (nm)", self.aim_roi_nm)
-        ttk.Button(drift_box, text="Apply Drift Correction", command=self.apply_correction).grid(row=5, column=0, columnspan=2, sticky="ew", pady=(8, 0))
+        self._number_row(drift_box, 3, "RCC lattice pitch (nm)", self.rcc_lattice_pitch_nm)
+        self._number_row(drift_box, 4, "AIM intersect (nm)", self.aim_intersect_nm)
+        self._number_row(drift_box, 5, "AIM ROI (nm)", self.aim_roi_nm)
+        ttk.Button(drift_box, text="Apply Drift Correction", command=self.apply_correction).grid(row=6, column=0, columnspan=2, sticky="ew", pady=(8, 0))
 
         render_box = ttk.LabelFrame(sidebar, text="Render Settings", padding=10)
         render_box.grid(row=5, column=0, sticky="ew", pady=(0, 10))
@@ -2452,6 +2473,7 @@ class PaintAnalysisApp(tk.Tk):
             float(self.aim_intersect_nm.get()),
             float(self.aim_roi_nm.get()),
             self._worker_status,
+            float(self.rcc_lattice_pitch_nm.get()),
         )
         return "correction", {"locs": corrected_locs, "drift": drift, "label": label, "source_path": self.loaded.path}
 
