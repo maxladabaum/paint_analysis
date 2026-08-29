@@ -1,4 +1,5 @@
 import unittest
+from unittest import mock
 
 import numpy as np
 
@@ -11,12 +12,34 @@ from origami_analysis import (
     ideal_grid_points,
     identify_origami_regions,
     integrate_rendered_density_at_sites,
+    origami_gallery_indices,
+    origami_gallery_page,
     render_aligned_origami_density,
     render_localization_preview,
 )
 
 
 class OrigamiAnalysisTests(unittest.TestCase):
+    def test_fast_overlay_assigns_sites_without_running_g5m(self) -> None:
+        grid = ideal_grid_points(2, 2, 20.0, 20.0)
+        points = np.vstack([np.repeat(site[None, :], 5, axis=0) for site in grid])
+
+        with mock.patch("origami_analysis.fit_picasso_g5m_components", side_effect=AssertionError("G5M ran")):
+            result = align_picked_origamis(
+                [points],
+                rows=2,
+                columns=2,
+                spacing_x_nm=20.0,
+                spacing_y_nm=20.0,
+                site_radius_nm=5.0,
+                prealigned=True,
+                use_g5m=False,
+            )
+
+        self.assertEqual(result.clustering_method, "Direct nearest-grid assignment")
+        np.testing.assert_allclose(result.site_counts[0], [5.0, 5.0, 5.0, 5.0])
+        np.testing.assert_array_equal(result.cluster_site_indices[0], [0, 1, 2, 3])
+
     def test_integrated_density_per_site_uses_rendered_mean_image(self) -> None:
         grid = ideal_grid_points(1, 2, 10.0, 10.0)
         rendered = render_aligned_origami_density(
@@ -220,6 +243,46 @@ class OrigamiAnalysisTests(unittest.TestCase):
         self.assertAlmostEqual(rendered["effective_pixel_y_nm"], 0.5)
         self.assertEqual(rendered["rendered_point_count"], 2)
         self.assertEqual(rendered["total_point_count"], 3)
+
+    def test_streamed_symmetry_matches_explicit_orientations(self) -> None:
+        points = [np.asarray([[-10.0, 0.0], [5.0, 7.0]]), np.asarray([[12.0, -3.0]])]
+        settings = dict(
+            rows=2,
+            columns=2,
+            spacing_x_nm=20.0,
+            spacing_y_nm=20.0,
+            pixel_size_nm=1.0,
+            padding_nm=10.0,
+            blur_nm=0.0,
+        )
+        streamed = render_aligned_origami_density(points, **settings, symmetrize_180=True, chunk_origamis=1)
+        explicit = render_aligned_origami_density(
+            [orientation for region in points for orientation in (region, -region)],
+            **settings,
+        )
+        np.testing.assert_allclose(streamed["image"], explicit["image"])
+        self.assertEqual(streamed["rendered_point_count"], explicit["rendered_point_count"])
+        self.assertEqual(streamed["total_point_count"], explicit["total_point_count"])
+
+    def test_gallery_filter_sort_and_page_are_stable(self) -> None:
+        grid = ideal_grid_points(1, 2, 20.0, 20.0)
+        regions = [np.repeat(grid, repeats, axis=0) for repeats in (1, 2, 3, 4)]
+        result = align_picked_origamis(
+            regions,
+            rows=1,
+            columns=2,
+            spacing_x_nm=20.0,
+            spacing_y_nm=20.0,
+            site_radius_nm=5.0,
+            prealigned=True,
+            use_g5m=False,
+        )
+        result.grid_match_fraction[:] = [0.9, 0.4, 0.8, 0.7]
+        indices = origami_gallery_indices(result, "Lowest grid match", min_grid_match_fraction=0.5)
+        np.testing.assert_array_equal(indices, [3, 2, 0])
+        page, page_number, page_count = origami_gallery_page(indices, page_number=2, page_size=2)
+        np.testing.assert_array_equal(page, [0])
+        self.assertEqual((page_number, page_count), (2, 2))
 
     def test_overlay_retains_identified_origami_with_low_grid_match(self) -> None:
         rng = np.random.default_rng(13)

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 from typing import Callable
 
@@ -32,6 +33,7 @@ class OrigamiAnalysisResult:
     site_match_radius_nm: float
     rejected_candidate_count: int
     symmetrized_180: bool
+    clustering_method: str = "Picasso G5M"
 
     @property
     def origami_count(self) -> int:
@@ -98,14 +100,18 @@ def render_aligned_origami_density(
     padding_nm: float,
     blur_nm: float,
     max_pixels: int = 4_000_000,
+    symmetrize_180: bool = False,
+    chunk_origamis: int = 256,
 ) -> dict[str, object]:
-    """Render aligned points over a grid-defined field at a known resolution."""
+    """Render aligned points with bounded working memory at a known resolution."""
     if not aligned_points:
         raise ValueError("No aligned origami points are available to render.")
     if pixel_size_nm <= 0:
         raise ValueError("Overlay pixel size must be greater than zero.")
     if padding_nm < 0 or blur_nm < 0:
         raise ValueError("Overlay padding and blur cannot be negative.")
+    if chunk_origamis < 1:
+        raise ValueError("Render chunk size must be at least one origami.")
     grid_width_nm = max(spacing_x_nm, (columns - 1) * spacing_x_nm)
     grid_height_nm = max(spacing_y_nm, (rows - 1) * spacing_y_nm)
     width_nm = grid_width_nm + 2.0 * padding_nm
@@ -119,35 +125,112 @@ def render_aligned_origami_density(
     effective_x_nm = width_nm / x_bins
     effective_y_nm = height_nm / y_bins
     extent = (-width_nm / 2.0, width_nm / 2.0, -height_nm / 2.0, height_nm / 2.0)
-    points = np.vstack(aligned_points)
-    density, _x_edges, _y_edges = np.histogram2d(
-        points[:, 0],
-        points[:, 1],
-        bins=(x_bins, y_bins),
-        range=((extent[0], extent[1]), (extent[2], extent[3])),
-    )
-    density /= len(aligned_points)
+    density = np.zeros((x_bins, y_bins), dtype=float)
+    rendered_point_count = 0
+    total_point_count = 0
+    orientation_count = 2 if symmetrize_180 else 1
+    for start in range(0, len(aligned_points), chunk_origamis):
+        chunk = np.vstack(aligned_points[start : start + chunk_origamis])
+        orientations = (chunk, -chunk) if symmetrize_180 else (chunk,)
+        for points in orientations:
+            chunk_density, _x_edges, _y_edges = np.histogram2d(
+                points[:, 0],
+                points[:, 1],
+                bins=(x_bins, y_bins),
+                range=((extent[0], extent[1]), (extent[2], extent[3])),
+            )
+            density += chunk_density
+            in_view = (
+                (points[:, 0] >= extent[0])
+                & (points[:, 0] <= extent[1])
+                & (points[:, 1] >= extent[2])
+                & (points[:, 1] <= extent[3])
+            )
+            rendered_point_count += int(np.count_nonzero(in_view))
+            total_point_count += int(len(points))
+    density /= len(aligned_points) * orientation_count
     if blur_nm > 0:
         density = gaussian_filter(
             density,
             sigma=(blur_nm / effective_x_nm, blur_nm / effective_y_nm),
             mode="constant",
         )
-    in_view = (
-        (points[:, 0] >= extent[0])
-        & (points[:, 0] <= extent[1])
-        & (points[:, 1] >= extent[2])
-        & (points[:, 1] <= extent[3])
-    )
     return {
         "image": density.T,
         "extent": extent,
         "effective_pixel_x_nm": float(effective_x_nm),
         "effective_pixel_y_nm": float(effective_y_nm),
-        "rendered_point_count": int(np.count_nonzero(in_view)),
-        "total_point_count": int(len(points)),
+        "rendered_point_count": rendered_point_count,
+        "total_point_count": total_point_count,
         "blur_nm": float(blur_nm),
     }
+
+
+def origami_gallery_indices(
+    result: OrigamiAnalysisResult,
+    sort_mode: str = "Origami ID",
+    min_grid_match_fraction: float = 0.0,
+    max_alignment_rms_nm: float = math.inf,
+) -> np.ndarray:
+    """Return stable result indices for a filtered, quality-sorted gallery."""
+    if not 0.0 <= min_grid_match_fraction <= 1.0:
+        raise ValueError("Minimum grid-match fraction must be between zero and one.")
+    if max_alignment_rms_nm <= 0:
+        raise ValueError("Maximum alignment RMS must be positive.")
+    indices = np.flatnonzero(
+        (result.grid_match_fraction >= min_grid_match_fraction)
+        & (result.alignment_rms_nm <= max_alignment_rms_nm)
+    )
+    if sort_mode == "Origami ID":
+        order = indices
+    elif sort_mode == "Source position":
+        local_order = np.lexsort((result.centers_nm[indices, 0], result.centers_nm[indices, 1]))
+        order = indices[local_order]
+    elif sort_mode == "Most localizations":
+        order = indices[np.argsort(-result.source_point_counts[indices], kind="stable")]
+    elif sort_mode == "Highest alignment RMS":
+        order = indices[np.argsort(-result.alignment_rms_nm[indices], kind="stable")]
+    elif sort_mode == "Lowest grid match":
+        order = indices[np.argsort(result.grid_match_fraction[indices], kind="stable")]
+    elif sort_mode == "Fewest occupied sites":
+        occupied = np.sum(result.site_occupancy[indices], axis=1)
+        order = indices[np.argsort(occupied, kind="stable")]
+    elif sort_mode == "QC sample":
+        if not len(indices):
+            order = indices
+        else:
+            occupied = np.sum(result.site_occupancy[indices], axis=1)
+            rankings = (
+                indices,
+                indices[np.argsort(result.source_point_counts[indices], kind="stable")],
+                indices[np.argsort(result.alignment_rms_nm[indices], kind="stable")],
+                indices[np.argsort(result.grid_match_fraction[indices], kind="stable")],
+                indices[np.argsort(occupied, kind="stable")],
+            )
+            sample_positions = np.linspace(0, len(indices) - 1, min(32, len(indices)), dtype=int)
+            representative: list[int] = []
+            seen: set[int] = set()
+            for position in sample_positions:
+                for ranking in rankings:
+                    candidate = int(ranking[position])
+                    if candidate not in seen:
+                        representative.append(candidate)
+                        seen.add(candidate)
+            order = np.asarray(representative, dtype=int)
+    else:
+        raise ValueError(f"Unknown origami gallery sort: {sort_mode}")
+    return np.asarray(order, dtype=int)
+
+
+def origami_gallery_page(indices: np.ndarray, page_number: int, page_size: int) -> tuple[np.ndarray, int, int]:
+    """Return one one-based gallery page plus normalized page metadata."""
+    if page_size < 1:
+        raise ValueError("Gallery page size must be at least one.")
+    indices = np.asarray(indices, dtype=int)
+    page_count = max(1, int(np.ceil(len(indices) / page_size)))
+    normalized_page = min(max(1, int(page_number)), page_count)
+    start = (normalized_page - 1) * page_size
+    return indices[start : start + page_size], normalized_page, page_count
 
 
 def integrate_rendered_density_at_sites(
@@ -953,15 +1036,16 @@ def align_picked_origamis(
     source_centers_nm: np.ndarray | None = None,
     allow_mirror: bool = False,
     initially_rejected_count: int = 0,
+    use_g5m: bool = True,
     progress_callback: Callable[[str], None] | None = None,
 ) -> OrigamiAnalysisResult:
     if not picked_regions:
         raise ValueError("No identified origamis are available. Adjust the identification settings and run Identify Origami again.")
     if site_radius_nm <= 0:
         raise ValueError("Site radius must be greater than zero.")
-    if g5m_sigma_min_nm <= 0 or g5m_sigma_max_nm < g5m_sigma_min_nm:
+    if use_g5m and (g5m_sigma_min_nm <= 0 or g5m_sigma_max_nm < g5m_sigma_min_nm):
         raise ValueError("G5M sigma bounds must be positive and ordered minimum to maximum.")
-    if g5m_min_locs < 1 or g5m_max_rounds_without_best_bic < 1:
+    if use_g5m and (g5m_min_locs < 1 or g5m_max_rounds_without_best_bic < 1):
         raise ValueError("G5M minimum localizations and BIC patience must be at least 1.")
 
     grid = ideal_grid_points(rows, columns, spacing_x_nm, spacing_y_nm)
@@ -987,7 +1071,7 @@ def align_picked_origamis(
             if allow_mirror:
                 mirrored = region * np.asarray([-1.0, 1.0])
                 aligned_candidates.append((mirrored, mirrored))
-        else:
+        elif use_g5m:
             _g5m_labels, cluster_centers = fit_picasso_g5m_components(
                 region,
                 min_locs=g5m_min_locs,
@@ -1000,6 +1084,11 @@ def align_picked_origamis(
                 aligned_candidates = _pca_aligned_candidates(region, alignment_points, grid, allow_mirror)
             else:
                 aligned_candidates = _rectangle_aligned_candidates(region, alignment_points, rectangle_corners, allow_mirror)
+        else:
+            if rectangle_corners is None:
+                aligned_candidates = _pca_aligned_candidates(region, region, grid, allow_mirror)
+            else:
+                aligned_candidates = _rectangle_aligned_candidates(region, region, rectangle_corners, allow_mirror)
         for candidate, candidate_alignment in aligned_candidates:
             refined = candidate if prealigned else _refine_rotation_to_grid(candidate, candidate_alignment, grid, site_radius_nm)
             choices.append(_fit_translation_and_sites(refined, grid, site_radius_nm))
@@ -1023,15 +1112,31 @@ def align_picked_origamis(
             chosen = max(eligible, key=choice_score)
         aligned, counts, rms = chosen
         match_fraction = float(np.sum(counts) / len(aligned))
-        raw_cluster_counts, cluster_labels, cluster_centers, cluster_sites = cluster_aligned_origami_sites(
-            aligned,
-            grid,
-            g5m_sigma_min_nm=g5m_sigma_min_nm,
-            g5m_sigma_max_nm=g5m_sigma_max_nm,
-            g5m_min_locs=g5m_min_locs,
-            g5m_max_rounds_without_best_bic=g5m_max_rounds_without_best_bic,
-            site_match_radius_nm=site_radius_nm,
-        )
+        if use_g5m:
+            raw_cluster_counts, cluster_labels, cluster_centers, cluster_sites = cluster_aligned_origami_sites(
+                aligned,
+                grid,
+                g5m_sigma_min_nm=g5m_sigma_min_nm,
+                g5m_sigma_max_nm=g5m_sigma_max_nm,
+                g5m_min_locs=g5m_min_locs,
+                g5m_max_rounds_without_best_bic=g5m_max_rounds_without_best_bic,
+                site_match_radius_nm=site_radius_nm,
+            )
+        else:
+            distances, nearest_sites = cKDTree(grid).query(aligned, k=1)
+            matched = distances <= site_radius_nm
+            cluster_sites = np.unique(nearest_sites[matched]).astype(int)
+            cluster_labels = np.full(len(aligned), -1, dtype=int)
+            cluster_centers_rows: list[np.ndarray] = []
+            raw_cluster_counts = np.zeros(len(grid), dtype=int)
+            for cluster_label, site_index in enumerate(cluster_sites):
+                members = matched & (nearest_sites == site_index)
+                cluster_labels[members] = cluster_label
+                raw_cluster_counts[site_index] = int(np.count_nonzero(members))
+                cluster_centers_rows.append(np.mean(aligned[members], axis=0))
+            cluster_centers = (
+                np.vstack(cluster_centers_rows) if cluster_centers_rows else np.empty((0, 2), dtype=float)
+            )
         # A rectangular grid is invariant under 180-degree rotation. Give the
         # selected pose and its 180-degree counterpart equal statistical weight
         # so brightness or missing sites cannot impose an arbitrary direction.
@@ -1056,7 +1161,8 @@ def align_picked_origamis(
         )
         running_pattern = cluster_counts.astype(float) if running_pattern is None else running_pattern + cluster_counts
         if progress_callback and (index == len(candidates) or index % max(1, len(candidates) // 20) == 0):
-            progress_callback(f"Origami analysis: Picasso G5M docking-site clustering {index}/{len(candidates)} candidates...")
+            stage = "Picasso G5M docking-site clustering" if use_g5m else "fast grid-site assignment"
+            progress_callback(f"Origami analysis: {stage} {index}/{len(candidates)} candidates...")
 
     return OrigamiAnalysisResult(
         aligned_points=[row[0] for row in accepted_rows],
@@ -1079,6 +1185,7 @@ def align_picked_origamis(
         site_match_radius_nm=float(site_radius_nm),
         rejected_candidate_count=rejected,
         symmetrized_180=True,
+        clustering_method="Picasso G5M" if use_g5m else "Direct nearest-grid assignment",
     )
 
 

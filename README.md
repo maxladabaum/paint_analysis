@@ -158,6 +158,16 @@ that contains all origamis you want to compare, before starting the overlay.
 The workflow is deliberately staged so identification can be inspected and
 tuned before alignment:
 
+The overlay stage is also split for performance. `Build Fast Overlay (no G5M)`
+uses the image-aligned origamis and assigns localizations directly to their
+nearest expected grid site. This is sufficient for the combined aligned-density
+image and provides immediate approximate site-count and occupancy statistics.
+`Refine Current Overlay with G5M` is optional and runs Picasso model-selection
+clustering on each already aligned origami when component-level G5M statistics
+or diagnostics are required. Whole-image tiled analysis stops at the fast
+overlay by default, so G5M is never an unavoidable part of validating or
+processing a large field.
+
 For fields too large to identify in one pass, select a representative ROI,
 enable `Use selected ROI`, load the source, and run `Identify Origami` until the
 accepted footprints look correct. `Analyze Whole Image as ROI Tiles` then uses
@@ -206,10 +216,12 @@ template and defaults to `0.80`. Candidates below it are excluded even when
 their localization counts pass. The preview shows accepted footprints as solid
 colored outlines and rejected candidates as gray dashed outlines; labels report
 correlation, rotation, and point count.
-3. Click `Overlay Origami` to reuse the cached image-aligned coordinates. No
-   rectangle refit or rotational search is repeated. Picasso G5M is run here,
-   per accepted origami, solely to identify docking-site components and compute
-   occupancy statistics. Because a rectangular grid has an unavoidable 180°
+3. Click `Build Fast Overlay (no G5M)` to reuse the cached image-aligned
+   coordinates. No rectangle refit or rotational search is repeated. Points
+   within `Site radius` are assigned directly to their nearest expected site.
+   Optionally click `Refine Current Overlay with G5M` afterward to replace those
+   direct assignments with per-origami Picasso G5M components. Because a
+   rectangular grid has an unavoidable 180°
    ambiguity, every physical origami contributes both its selected pose and its
    180° counterpart at half weight. This makes density, mean counts, occupancy,
    completeness, galleries, and CSV statistics invariant to arbitrary 180°
@@ -217,8 +229,8 @@ correlation, rotation, and point count.
    weights are therefore `0`, `0.5`, or `1` for an individual origami.
 4. Choose a result from the `Plot` menu and click `Render Plot`. The viewer
    displays one selected result at a time: the cached identified-image-match
-   preview, every individual aligned origami, per-origami Picasso G5M
-   components, aligned density, integrated density per site, mean site counts,
+   preview, paged individual aligned origamis, per-origami site assignments,
+   a selected-origami detail view, aligned density, integrated density per site, mean site counts,
    site occupancy, or occupied-site completeness. `Integrated density per site`
    sums the displayed, blurred aligned-density pixels within `Site radius` of
    every expected position. It includes unmatched source points and provides a
@@ -227,11 +239,30 @@ correlation, rotation, and point count.
    with the same ID used by the CSV export and its source-point count. Each
    gallery tile is brightness-normalized independently so lower-count origamis
    remain visible. Both individual gallery views show only the single cached
-   orientation used for that origami's G5M fit, making their tiles directly
+   orientation used for that origami's assignment, making their tiles directly
    comparable. Equal-weight 0°/180° duplication is applied only to population
    density and statistics. Switching between `Identified origami image matches` and the
    overlay/statistics choices only redraws cached results; it does not rerun
    identification, image alignment, G5M, or alignment.
+
+For large populations, the individual and site-assignment galleries render only
+the current page (64 origamis by default) instead of allocating one enormous
+mosaic. Page sizes of 25, 64, 100, and 256 are available. Galleries can be
+sorted by source position, localization count, alignment RMS, grid match, or
+occupied-site count and filtered by minimum grid-match percentage and maximum
+alignment RMS. `QC sample` deterministically selects representative values
+across all of those quality distributions. Click a tile for a full-resolution
+single-origami detail view, then use `Back to Gallery` to return.
+`Export Paged Gallery PDF` writes the current gallery type, sort, and quality
+selection one page at a time, avoiding a full-population mosaic in memory.
+
+Gallery filtering never changes population statistics or CSV exports. Aligned
+density uses all accepted origamis with bounded-memory chunked accumulation and
+is cached for reuse by `Integrated density per site`. Mean counts, occupancy,
+and completeness likewise use the complete accepted population. On the
+identified-footprint preview, at most 500 visible outlines are drawn at once;
+zooming or panning dynamically replaces them with footprints in the current
+view and enables labels when 100 or fewer are visible.
 
 Changing the source, active histogram filters, or ROI does not silently replace
 the displayed points; click `Load Source Data` again to refresh them.
