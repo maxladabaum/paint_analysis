@@ -40,6 +40,7 @@ from tkinter import filedialog, messagebox, ttk
 
 APP_TITLE = "DNA PAINT Picasso-Style ROI Analyzer"
 DEFAULT_DATA_DIR = Path.home() / "Desktop" / "LBNL_PAINT"
+DEFAULT_PIXEL_SIZE_NM = 130.0
 
 
 def user_state_dir() -> Path:
@@ -61,6 +62,11 @@ def user_state_dir() -> Path:
 APP_STATE_DIR = user_state_dir()
 RECENT_DIR_FILE = APP_STATE_DIR / "recent-data-directory.txt"
 MAX_RENDER_PIXELS = 30_000_000
+MIN_DYNAMIC_RENDER_PIXEL_NM = 1.0
+DYNAMIC_RENDER_DEBOUNCE_MS = 350
+AUTO_DENSITY_HISTOGRAM_BINS = 512
+AUTO_DENSITY_SATURATION_FRACTION = 0.001
+AUTO_DENSITY_HIGHLIGHT_LEVEL = 0.98
 MAP_AXES_RECT = (0.10, 0.12, 0.74, 0.78)
 MAP_COLORBAR_RECT = (0.87, 0.18, 0.025, 0.66)
 ORIGAMI_SOURCE_AXES_RECT = (0.14, 0.10, 0.72, 0.72)
@@ -74,6 +80,29 @@ FILTERED_MAP_TAB = 3
 HISTOGRAM_TAB = 4
 TEMPORAL_TAB = 5
 ORIGAMI_TAB = 6
+
+
+def optimal_dynamic_render_pixel_nm(
+    viewport_nm: tuple[float, float, float, float],
+    display_width_px: float,
+    display_height_px: float,
+    minimum_pixel_nm: float = MIN_DYNAMIC_RENDER_PIXEL_NM,
+) -> float:
+    """Choose one render pixel per displayed plot pixel, bounded by a physical floor."""
+    x0, x1, y0, y1 = viewport_nm
+    width_nm = abs(float(x1) - float(x0))
+    height_nm = abs(float(y1) - float(y0))
+    if width_nm <= 0 or height_nm <= 0:
+        raise ValueError("Dynamic render viewport must have positive width and height.")
+    if display_width_px <= 0 or display_height_px <= 0:
+        raise ValueError("Dynamic render display dimensions must be positive.")
+    if minimum_pixel_nm <= 0:
+        raise ValueError("Minimum dynamic render pixel size must be positive.")
+    return max(
+        float(minimum_pixel_nm),
+        width_nm / float(display_width_px),
+        height_nm / float(display_height_px),
+    )
 
 
 @dataclass
@@ -120,30 +149,327 @@ def picasso_info_from_metadata(metadata: dict[str, Any], locs: pd.DataFrame) -> 
     frames = int(metadata.get("Frames") or (np.nanmax(locs["frame"]) + 1))
     width = int(metadata.get("Width") or math.ceil(float(np.nanmax(locs["x"]) + 1)))
     height = int(metadata.get("Height") or math.ceil(float(np.nanmax(locs["y"]) + 1)))
-    pixelsize = float(metadata.get("Pixelsize") or 130.0)
+    pixelsize = float(metadata.get("Pixelsize") or DEFAULT_PIXEL_SIZE_NM)
     return [{"Frames": frames, "Width": width, "Height": height, "Pixelsize": pixelsize}]
 
 
-def read_locs_hdf5(path: Path) -> LoadedData:
-    with h5py.File(path, "r") as h5:
-        dataset = find_locs_dataset(h5)
-        raw = dataset[()]
+def finalize_loaded_locs(path: Path, locs: pd.DataFrame, metadata: dict[str, Any]) -> LoadedData:
+    missing = {"frame", "x", "y"}.difference(locs.columns)
+    if missing:
+        raise ValueError(f"Localization file is missing required field(s): {', '.join(sorted(missing))}.")
 
-    data: dict[str, np.ndarray] = {}
-    for name in raw.dtype.names or ():
-        values = np.asarray(raw[name])
-        if np.issubdtype(values.dtype, np.number):
-            data[name] = values.astype(float, copy=False)
-
-    locs = pd.DataFrame(data)
-    locs = locs[np.isfinite(locs["frame"]) & np.isfinite(locs["x"]) & np.isfinite(locs["y"])].copy()
+    for column in locs.columns:
+        locs[column] = pd.to_numeric(locs[column], errors="coerce")
+    finite_rows = np.isfinite(locs["frame"]) & np.isfinite(locs["x"]) & np.isfinite(locs["y"])
+    if not bool(finite_rows.all()):
+        locs = locs.loc[finite_rows].copy()
+    if locs.empty:
+        raise ValueError("No finite localizations with frame, x, and y values were found.")
+    if (locs["frame"] < 0).any():
+        raise ValueError("Localization frame numbers must be non-negative.")
     locs["frame"] = locs["frame"].astype(np.uint32)
 
-    metadata = read_yaml_metadata(path)
     metadata["Localization count"] = int(len(locs))
     metadata["Fields"] = ", ".join(locs.columns)
     info = picasso_info_from_metadata(metadata, locs)
     return LoadedData(path=path, locs=locs, info=info, metadata=metadata)
+
+
+def emit_load_progress(
+    callback: Callable[[float, str], None] | None,
+    percent: float,
+    message: str,
+) -> None:
+    if callback is not None:
+        callback(max(0.0, min(100.0, float(percent))), str(message))
+
+
+def read_locs_hdf5(
+    path: Path,
+    progress_callback: Callable[[float, str], None] | None = None,
+) -> LoadedData:
+    with h5py.File(path, "r") as h5:
+        dataset = find_locs_dataset(h5)
+        if dataset.ndim != 1:
+            raise ValueError("Localization HDF5 dataset must be one-dimensional.")
+        numeric_names = [
+            name
+            for name in dataset.dtype.names or ()
+            if np.issubdtype(dataset.dtype.fields[name][0], np.number)
+        ]
+        row_count = int(dataset.shape[0])
+        data = {name: np.empty(row_count, dtype=float) for name in numeric_names}
+        chunk_size = 500_000
+        emit_load_progress(progress_callback, 2.0, f"Reading {row_count:,} HDF5 localizations...")
+        for start in range(0, row_count, chunk_size):
+            end = min(row_count, start + chunk_size)
+            raw = dataset[start:end]
+            for name in numeric_names:
+                data[name][start:end] = np.asarray(raw[name], dtype=float)
+            emit_load_progress(
+                progress_callback,
+                5.0 + 88.0 * end / max(1, row_count),
+                f"Reading HDF5 localizations: {end:,}/{row_count:,}",
+            )
+
+    metadata = read_yaml_metadata(path)
+    metadata["Source format"] = "HDF5"
+    return finalize_loaded_locs(path, pd.DataFrame(data), metadata)
+
+
+def normalized_csv_column(name: str) -> str:
+    return "".join(character for character in name.casefold() if character.isalnum())
+
+
+CSV_COLUMN_ALIASES: dict[str, tuple[str, bool]] = {
+    "frame": ("frame", False),
+    "frameindex": ("frame", False),
+    "x": ("x", False),
+    "xnm": ("x", True),
+    "y": ("y", False),
+    "ynm": ("y", True),
+    "z": ("z", False),
+    "znm": ("z", True),
+    "photons": ("photons", False),
+    "intensityphotons": ("photons", False),
+    "sx": ("sx", False),
+    "sigmaxnm": ("sx", True),
+    "sy": ("sy", False),
+    "sigmaynm": ("sy", True),
+    "bg": ("bg", False),
+    "backgroundphotonsnm2": ("bg", False),
+    "lpx": ("lpx", False),
+    "lpxnm": ("lpx", True),
+    "lpy": ("lpy", False),
+    "lpynm": ("lpy", True),
+    "localizationprecisionnm": ("precision_nm", False),
+    "channelindex": ("channel", False),
+}
+
+
+def count_csv_data_rows(
+    path: Path,
+    progress_callback: Callable[[float, str], None] | None = None,
+) -> int:
+    file_size = max(1, path.stat().st_size)
+    bytes_read = 0
+    line_count = 0
+    final_byte = b""
+    with path.open("rb") as handle:
+        while block := handle.read(8 * 1024 * 1024):
+            bytes_read += len(block)
+            line_count += block.count(b"\n")
+            final_byte = block[-1:]
+            emit_load_progress(
+                progress_callback,
+                10.0 * bytes_read / file_size,
+                f"Scanning CSV: {100.0 * bytes_read / file_size:.0f}%",
+            )
+    if bytes_read and final_byte != b"\n":
+        line_count += 1
+    return max(0, line_count - 1)
+
+
+def read_locs_csv(
+    path: Path,
+    progress_callback: Callable[[float, str], None] | None = None,
+) -> LoadedData:
+    header = pd.read_csv(path, nrows=0)
+    selected: dict[str, tuple[str, bool]] = {}
+    mapped_targets: set[str] = set()
+    for source_name in header.columns:
+        mapped = CSV_COLUMN_ALIASES.get(normalized_csv_column(str(source_name)))
+        if mapped is not None and mapped[0] not in mapped_targets:
+            selected[str(source_name)] = mapped
+            mapped_targets.add(mapped[0])
+
+    required = {"frame", "x", "y"}
+    missing = required.difference(mapped_targets)
+    if missing:
+        raise ValueError(
+            "CSV localization file is missing required column(s): "
+            f"{', '.join(sorted(missing))}. Expected frame/frameIndex, x/x (nm), and y/y (nm)."
+        )
+
+    metadata = read_yaml_metadata(path)
+    pixelsize = float(metadata.get("Pixelsize") or DEFAULT_PIXEL_SIZE_NM)
+    if not np.isfinite(pixelsize) or pixelsize <= 0:
+        raise ValueError("Pixelsize metadata must be a positive finite number.")
+    metadata["Pixelsize"] = pixelsize
+
+    row_count = count_csv_data_rows(path, progress_callback)
+    # Preallocation keeps loading memory close to the final table size while
+    # allowing determinate progress for multi-million-row CSV exports.
+    arrays = {mapped[0]: np.empty(row_count, dtype=np.float32) for mapped in selected.values()}
+    converted: list[str] = []
+    for source_name, (_target_name, is_nm) in selected.items():
+        if is_nm:
+            converted.append(source_name)
+
+    loaded_rows = 0
+    reader = pd.read_csv(
+        path,
+        usecols=list(selected),
+        dtype={name: np.float32 for name in selected},
+        chunksize=500_000,
+    )
+    for chunk in reader:
+        end = loaded_rows + len(chunk)
+        if end > row_count:
+            grow_by = max(end - row_count, max(1, row_count // 10))
+            for target_name, values in arrays.items():
+                arrays[target_name] = np.resize(values, row_count + grow_by)
+            row_count += grow_by
+        for source_name, (target_name, is_nm) in selected.items():
+            values = chunk[source_name].to_numpy(dtype=np.float32, copy=False)
+            if is_nm:
+                values = values / np.float32(pixelsize)
+            arrays[target_name][loaded_rows:end] = values
+        loaded_rows = end
+        emit_load_progress(
+            progress_callback,
+            10.0 + 83.0 * loaded_rows / max(1, row_count),
+            f"Loading CSV localizations: {loaded_rows:,}/{row_count:,}",
+        )
+
+    locs = pd.DataFrame(
+        {target_name: values[:loaded_rows] for target_name, values in arrays.items()},
+        copy=False,
+    )
+
+    metadata["Source format"] = "CSV"
+    metadata["CSV columns"] = ", ".join(str(column) for column in header.columns)
+    if converted:
+        metadata["CSV nm-to-pixel conversion"] = f"{pixelsize:g} nm/pixel ({', '.join(converted)})"
+    return finalize_loaded_locs(path, locs, metadata)
+
+
+def read_locs(
+    path: Path,
+    progress_callback: Callable[[float, str], None] | None = None,
+) -> LoadedData:
+    emit_load_progress(progress_callback, 0.0, f"Opening {path.name}...")
+    suffix = path.suffix.casefold()
+    if suffix == ".csv":
+        loaded = read_locs_csv(path, progress_callback)
+    elif suffix in {".h5", ".hdf5"}:
+        loaded = read_locs_hdf5(path, progress_callback)
+    else:
+        raise ValueError("Unsupported localization file type. Choose a .csv, .h5, or .hdf5 file.")
+    emit_load_progress(progress_callback, 100.0, f"Loaded {len(loaded.locs):,} localizations.")
+    return loaded
+
+
+DRIFT_COLUMN_ALIASES: dict[str, tuple[str, bool]] = {
+    "frame": ("frame", False),
+    "frameindex": ("frame", False),
+    "x": ("x", False),
+    "driftx": ("x", False),
+    "xdrift": ("x", False),
+    "xnm": ("x", True),
+    "driftxnm": ("x", True),
+    "xdriftpixel": ("x", False),
+    "xdriftpixels": ("x", False),
+    "xdriftnm": ("x", True),
+    "y": ("y", False),
+    "drifty": ("y", False),
+    "ydrift": ("y", False),
+    "ynm": ("y", True),
+    "driftynm": ("y", True),
+    "ydriftpixel": ("y", False),
+    "ydriftpixels": ("y", False),
+    "ydriftnm": ("y", True),
+    "z": ("z", False),
+    "driftz": ("z", False),
+    "zdrift": ("z", False),
+    "znm": ("z", True),
+    "driftznm": ("z", True),
+    "zdriftpixel": ("z", False),
+    "zdriftpixels": ("z", False),
+    "zdriftnm": ("z", True),
+}
+
+
+def read_drift_csv(path: Path, frame_count: int, pixel_size_nm: float) -> pd.DataFrame:
+    if frame_count < 1:
+        raise ValueError("Localization metadata must contain at least one frame.")
+    if not np.isfinite(pixel_size_nm) or pixel_size_nm <= 0:
+        raise ValueError("Pixel size must be a positive finite number.")
+
+    header = pd.read_csv(path, nrows=0)
+    selected: dict[str, tuple[str, bool]] = {}
+    mapped_targets: set[str] = set()
+    for source_name in header.columns:
+        mapped = DRIFT_COLUMN_ALIASES.get(normalized_csv_column(str(source_name)))
+        if mapped is not None and mapped[0] not in mapped_targets:
+            selected[str(source_name)] = mapped
+            mapped_targets.add(mapped[0])
+
+    missing_columns = {"frame", "x", "y"}.difference(mapped_targets)
+    if missing_columns:
+        raise ValueError(
+            "Drift CSV is missing required column(s): "
+            f"{', '.join(sorted(missing_columns))}. Expected Frame and x/y drift columns."
+        )
+
+    drift = pd.read_csv(path, usecols=list(selected)).rename(
+        columns={name: mapped[0] for name, mapped in selected.items()}
+    )
+    for column in drift.columns:
+        drift[column] = pd.to_numeric(drift[column], errors="coerce")
+    if drift.empty:
+        raise ValueError("Drift CSV does not contain any rows.")
+    if not np.isfinite(drift.to_numpy(dtype=float)).all():
+        raise ValueError("Drift CSV contains blank, non-numeric, or non-finite values.")
+
+    frame_values = drift["frame"].to_numpy(dtype=float)
+    if np.any(frame_values < 0) or not np.equal(frame_values, np.floor(frame_values)).all():
+        raise ValueError("Drift CSV frame numbers must be non-negative integers.")
+    drift["frame"] = frame_values.astype(np.int64)
+    if drift["frame"].duplicated().any():
+        duplicates = drift.loc[drift["frame"].duplicated(), "frame"].head(5).tolist()
+        raise ValueError(f"Drift CSV contains duplicate frame numbers: {duplicates}.")
+
+    drift = drift.set_index("frame").sort_index()
+    required_frames = pd.RangeIndex(frame_count)
+    missing_frames = required_frames.difference(drift.index)
+    if len(missing_frames):
+        preview = ", ".join(str(frame) for frame in missing_frames[:5])
+        suffix = "..." if len(missing_frames) > 5 else ""
+        raise ValueError(
+            f"Drift CSV does not cover all {frame_count} localization frames; "
+            f"missing {len(missing_frames)} frame(s), starting with {preview}{suffix}."
+        )
+
+    drift = drift.loc[required_frames, [column for column in ("x", "y", "z") if column in drift.columns]].copy()
+    for _source_name, (target_name, is_nm) in selected.items():
+        if is_nm and target_name in drift.columns:
+            drift[target_name] = drift[target_name].to_numpy(dtype=float) / float(pixel_size_nm)
+    drift.index.name = "frame"
+    return drift
+
+
+def apply_drift_file(
+    locs: pd.DataFrame,
+    info: list[dict[str, Any]],
+    path: Path,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    frame_count = int(info[0]["Frames"])
+    pixel_size_nm = float(info[0]["Pixelsize"])
+    drift = read_drift_csv(path, frame_count, pixel_size_nm)
+    localization_frames = locs["frame"].to_numpy(dtype=np.int64, copy=False)
+    if localization_frames.size and int(localization_frames.max()) >= frame_count:
+        raise ValueError("Localization frame numbers exceed the frame count in the loaded metadata.")
+
+    corrected = locs.copy()
+    x_dtype = corrected["x"].dtype if np.issubdtype(corrected["x"].dtype, np.floating) else float
+    y_dtype = corrected["y"].dtype if np.issubdtype(corrected["y"].dtype, np.floating) else float
+    corrected["x"] = corrected["x"].to_numpy(dtype=x_dtype) - drift["x"].to_numpy(dtype=x_dtype)[localization_frames]
+    corrected["y"] = corrected["y"].to_numpy(dtype=y_dtype) - drift["y"].to_numpy(dtype=y_dtype)[localization_frames]
+    if "z" in corrected.columns and "z" in drift.columns:
+        z_dtype = corrected["z"].dtype if np.issubdtype(corrected["z"].dtype, np.floating) else float
+        corrected["z"] = corrected["z"].to_numpy(dtype=z_dtype) - drift["z"].to_numpy(dtype=z_dtype)[localization_frames]
+    return corrected, drift
 
 
 def finite_values(values: np.ndarray) -> np.ndarray:
@@ -334,7 +660,9 @@ class SyncedMapToolbar(NavigationToolbar2Tk):
 
     def home(self, *args: Any) -> None:
         if getattr(self.axis, "images", None):
-            extent = self.axis.images[0].get_extent()
+            extent = self.app._full_map_viewport_nm()
+            if extent is None:
+                extent = self.axis.images[0].get_extent()
             self.axis.set_xlim(float(extent[0]), float(extent[1]))
             self.axis.set_ylim(float(extent[2]), float(extent[3]))
             self.canvas.draw_idle()
@@ -388,11 +716,22 @@ def apply_drift_correction(
     aim_roi_nm: float,
     progress_callback: Any | None = None,
     rcc_lattice_pitch_nm: float = 0.0,
+    drift_file_path: Path | None = None,
 ) -> tuple[pd.DataFrame, pd.DataFrame | None, str]:
     if method == "none":
         if progress_callback is not None:
             progress_callback("Using loaded coordinates without drift correction.")
         return locs.copy(), None, "No drift correction"
+
+    if method == "file":
+        if drift_file_path is None:
+            raise ValueError("Choose a drift correction CSV before applying file-based drift correction.")
+        if progress_callback is not None:
+            progress_callback(f"Loading and applying frame-by-frame drift from {drift_file_path.name}...")
+        corrected_locs, drift = apply_drift_file(locs, info, drift_file_path)
+        if progress_callback is not None:
+            progress_callback("File-based drift correction: 100% complete.")
+        return corrected_locs, drift, f"Drift file: {drift_file_path.name}"
 
     from picasso import aim, postprocess
 
@@ -594,11 +933,52 @@ def render_filtered_map_with_settings(
     return render_picasso_map(locs, info, disp_px_size_nm, blur_method, min_blur_width, viewport_nm)
 
 
+def histogram_density_limits(
+    image: np.ndarray,
+    saturation_fraction: float = AUTO_DENSITY_SATURATION_FRACTION,
+    histogram_bins: int = AUTO_DENSITY_HISTOGRAM_BINS,
+) -> tuple[float, float]:
+    """Choose contrast limits from the brightness distribution of populated pixels.
+
+    The upper edge contains all but a small, configurable outlier fraction and is
+    given a little display headroom so the retained upper histogram bin does not
+    map to the saturated endpoint of the colormap.
+    """
+    image = np.asarray(image, dtype=float)
+    populated = image[np.isfinite(image) & (image > 0)]
+    if populated.size == 0:
+        return 0.0, 1.0
+
+    populated_min = float(np.min(populated))
+    populated_max = float(np.max(populated))
+    if populated_max <= populated_min:
+        return 0.0, populated_max if populated_max > 0 else 1.0
+
+    saturation_fraction = float(np.clip(saturation_fraction, 0.0, 0.5))
+    bin_count = max(2, int(histogram_bins))
+    # Logarithmic bins retain useful resolution near the bulk of a long-tailed
+    # brightness distribution instead of allowing a few outliers to dominate.
+    if populated_min > 0 and populated_max / populated_min >= 100.0:
+        edges = np.geomspace(populated_min, populated_max, bin_count + 1)
+    else:
+        edges = np.linspace(populated_min, populated_max, bin_count + 1)
+    counts, edges = np.histogram(populated, bins=edges)
+    target_count = max(1, int(math.ceil((1.0 - saturation_fraction) * populated.size)))
+    upper_bin = min(int(np.searchsorted(np.cumsum(counts), target_count, side="left")), counts.size - 1)
+    retained_upper_edge = float(edges[upper_bin + 1])
+    max_density = retained_upper_edge / AUTO_DENSITY_HIGHLIGHT_LEVEL
+    return 0.0, max_density if max_density > 0 else 1.0
+
+
+def iqr_density_limits(image: np.ndarray) -> tuple[float, float]:
+    """Backward-compatible alias for the histogram-based automatic limits."""
+    return histogram_density_limits(image)
+
+
 def scale_density_like_picasso(image: np.ndarray, min_density: float, max_density: float) -> tuple[np.ndarray, tuple[float, float]]:
     image = np.asarray(image, dtype=float)
     if max_density <= min_density:
-        max_density = 0.5 * float(np.nanmax(image)) if image.size else 1.0
-        min_density = 0.0
+        min_density, max_density = histogram_density_limits(image)
     if min_density == max_density:
         max_density = min_density + 1e-6
     scaled = (image - min_density) / (max_density - min_density)
@@ -616,6 +996,36 @@ def roi_locs(locs: pd.DataFrame, roi_nm: tuple[float, float, float, float] | Non
     y1 = max(y0_nm, y1_nm) / pixelsize_nm
     mask = (locs["x"] >= x0) & (locs["x"] <= x1) & (locs["y"] >= y0) & (locs["y"] <= y1)
     return locs[mask].copy()
+
+
+def fully_fitting_roi_tiles(
+    full_width_nm: float,
+    full_height_nm: float,
+    validation_roi_nm: tuple[float, float, float, float],
+) -> list[tuple[float, float, float, float]]:
+    """Tile an image on the validation ROI lattice, retaining only complete tiles."""
+    x0, x1, y0, y1 = validation_roi_nm
+    anchor_x = min(float(x0), float(x1))
+    anchor_y = min(float(y0), float(y1))
+    tile_width = abs(float(x1) - float(x0))
+    tile_height = abs(float(y1) - float(y0))
+    if tile_width <= 0 or tile_height <= 0:
+        raise ValueError("The validation ROI must have positive width and height.")
+    if full_width_nm <= 0 or full_height_nm <= 0:
+        raise ValueError("The full image must have positive width and height.")
+
+    tolerance = 1e-9
+    first_x_step = math.ceil((-anchor_x - tolerance) / tile_width)
+    last_x_step = math.floor((full_width_nm - tile_width - anchor_x + tolerance) / tile_width)
+    first_y_step = math.ceil((-anchor_y - tolerance) / tile_height)
+    last_y_step = math.floor((full_height_nm - tile_height - anchor_y + tolerance) / tile_height)
+    x_starts = [anchor_x + step * tile_width for step in range(first_x_step, last_x_step + 1)]
+    y_starts = [anchor_y + step * tile_height for step in range(first_y_step, last_y_step + 1)]
+    return [
+        (start_x, start_x + tile_width, start_y, start_y + tile_height)
+        for start_y in y_starts
+        for start_x in x_starts
+    ]
 
 
 def radial_precision_nm(arrays: dict[str, np.ndarray], pixel_size_nm: float) -> np.ndarray:
@@ -1033,6 +1443,8 @@ def histogram_values_for_mode(
     arrays = df_to_arrays(locs)
     if mode == "photons":
         return arrays["photons"], "Photons per localization"
+    if mode == "precision_nm":
+        return precision_qc_values(arrays["precision_nm"]), "Localization precision (nm, QC filtered)"
     if mode == "precision_radial_nm":
         return precision_qc_values(radial_precision_nm(arrays, pixel_size_nm)), "Radial localization precision (nm, QC filtered)"
     if mode == "lpx_nm":
@@ -1079,6 +1491,8 @@ def localization_series_for_mode(
     index = locs.index
     if mode == "photons":
         return pd.Series(arrays["photons"], index=index, dtype=float), "Photons per localization"
+    if mode == "precision_nm":
+        return precision_qc_series(arrays["precision_nm"], index), "Localization precision (nm, QC filtered)"
     if mode == "precision_radial_nm":
         return precision_qc_series(radial_precision_nm(arrays, pixel_size_nm), index), "Radial localization precision (nm, QC filtered)"
     if mode == "lpx_nm":
@@ -1166,23 +1580,36 @@ class PaintAnalysisApp(tk.Tk):
         self.shared_map_limits: tuple[tuple[float, float], tuple[float, float]] | None = None
         self.syncing_map_limits = False
         self.suspend_map_limit_sync = False
+        self.dynamic_render_after_id: str | None = None
+        self.load_progress_hide_id: str | None = None
+        self.density_refresh_after_id: str | None = None
+        self.map_density_images: dict[int, np.ndarray] = {}
+        self.dynamic_render_request_id = 0
+        self.dynamic_render_running = False
+        self.dynamic_render_pending = False
         self.active_notebook_tab = RAW_MAP_TAB
         self.worker_queue: queue.Queue[tuple[str, Any]] = queue.Queue()
 
         self.exposure_ms = tk.DoubleVar(value=100.0)
-        self.pixel_size_nm = tk.DoubleVar(value=130.0)
+        self.pixel_size_nm = tk.DoubleVar(value=DEFAULT_PIXEL_SIZE_NM)
         self.link_radius_nm = tk.DoubleVar(value=75.0)
         self.max_gap_frames = tk.IntVar(value=1)
         self.linking_source = tk.StringVar(value="Corrected map")
         self.linking_scope = tk.StringVar(value="Selected ROI")
         self.drift_method = tk.StringVar(value="none")
+        self.drift_file_path: Path | None = None
+        self.drift_file_label = tk.StringVar(value="No drift file selected")
         self.drift_segmentation = tk.IntVar(value=1000)
         self.rcc_lattice_pitch_nm = tk.DoubleVar(value=700.0)
         self.aim_intersect_nm = tk.DoubleVar(value=20.0)
         self.aim_roi_nm = tk.DoubleVar(value=60.0)
         self.render_disp_px_nm = tk.DoubleVar(value=10.0)
+        self.dynamic_zoom_render = tk.BooleanVar(value=True)
         self.render_blur_method = tk.StringVar(value="smooth")
         self.min_blur_width = tk.DoubleVar(value=1.0)
+        self.auto_density_contrast = tk.BooleanVar(value=True)
+        self.auto_density_multiplier = tk.DoubleVar(value=1.0)
+        self.auto_density_multiplier_label = tk.StringVar(value="Density multiplier: 1×")
         self.render_min_density = tk.DoubleVar(value=0.0)
         self.render_max_density = tk.DoubleVar(value=0.0)
         self.hist_mode = tk.StringVar(value="photons")
@@ -1201,8 +1628,10 @@ class PaintAnalysisApp(tk.Tk):
         self.temporal_stat = tk.StringVar(value="mean")
         self.filter_scope_label = tk.StringVar(value="Filter scope: selected ROI")
         self.filter_bounds_label = tk.StringVar(value="No active histogram filter")
-        self.status = tk.StringVar(value="Load a Picasso *_locs.hdf5 file.")
+        self.status = tk.StringVar(value="Load a localization CSV or Picasso HDF5 file.")
         self.file_label = tk.StringVar(value="No file loaded")
+        self.load_progress_value = tk.DoubleVar(value=0.0)
+        self.load_progress_text = tk.StringVar(value="")
         self.roi_label = tk.StringVar(value="ROI: full corrected map")
         self.last_error_message = ""
         self.last_error_details = ""
@@ -1223,6 +1652,9 @@ class PaintAnalysisApp(tk.Tk):
         self.origami_pick_result: OrigamiPickResult | None = None
         self.origami_loaded_source_label = ""
         self.origami_loaded_source_path: Path | None = None
+        self.origami_loaded_roi_nm: tuple[float, float, float, float] | None = None
+        self.origami_loaded_source_params: dict[str, Any] | None = None
+        self.origami_identification_params: dict[str, Any] | None = None
         self.origami_result_source = ""
         self.origami_result_source_count = 0
         self.origami_result_render_settings: dict[str, Any] | None = None
@@ -1305,7 +1737,21 @@ class PaintAnalysisApp(tk.Tk):
 
         ttk.Label(sidebar, text=APP_TITLE, font=("Segoe UI", 14, "bold")).grid(row=0, column=0, sticky="w", pady=(0, 12))
         ttk.Button(sidebar, text="Load Locs File", command=self.load_file).grid(row=1, column=0, sticky="ew")
-        ttk.Label(sidebar, textvariable=self.file_label, wraplength=290).grid(row=2, column=0, sticky="ew", pady=(8, 12))
+        file_status = ttk.Frame(sidebar)
+        file_status.grid(row=2, column=0, sticky="ew", pady=(8, 12))
+        file_status.columnconfigure(0, weight=1)
+        ttk.Label(file_status, textvariable=self.file_label, wraplength=290).grid(row=0, column=0, sticky="ew")
+        self.load_progress_bar = ttk.Progressbar(
+            file_status,
+            variable=self.load_progress_value,
+            maximum=100.0,
+            mode="determinate",
+        )
+        self.load_progress_bar.grid(row=1, column=0, sticky="ew", pady=(6, 0))
+        self.load_progress_label = ttk.Label(file_status, textvariable=self.load_progress_text, wraplength=290)
+        self.load_progress_label.grid(row=2, column=0, sticky="ew", pady=(2, 0))
+        self.load_progress_bar.grid_remove()
+        self.load_progress_label.grid_remove()
 
         roi_box = ttk.LabelFrame(sidebar, text="ROI", padding=10)
         roi_box.grid(row=3, column=0, sticky="ew", pady=(0, 10))
@@ -1318,12 +1764,14 @@ class PaintAnalysisApp(tk.Tk):
         drift_box.columnconfigure(1, weight=1)
         self._number_row(drift_box, 0, "Pixel size (nm)", self.pixel_size_nm)
         ttk.Label(drift_box, text="Drift method").grid(row=1, column=0, sticky="w", pady=3)
-        ttk.Combobox(drift_box, textvariable=self.drift_method, state="readonly", values=("none", "rcc", "aim")).grid(row=1, column=1, sticky="ew", padx=(8, 0), pady=3)
+        ttk.Combobox(drift_box, textvariable=self.drift_method, state="readonly", values=("none", "rcc", "aim", "file")).grid(row=1, column=1, sticky="ew", padx=(8, 0), pady=3)
         self._number_row(drift_box, 2, "Segmentation", self.drift_segmentation)
         self._number_row(drift_box, 3, "RCC lattice pitch (nm)", self.rcc_lattice_pitch_nm)
         self._number_row(drift_box, 4, "AIM intersect (nm)", self.aim_intersect_nm)
         self._number_row(drift_box, 5, "AIM ROI (nm)", self.aim_roi_nm)
-        ttk.Button(drift_box, text="Apply Drift Correction", command=self.apply_correction).grid(row=6, column=0, columnspan=2, sticky="ew", pady=(8, 0))
+        ttk.Button(drift_box, text="Load Drift CSV", command=self.load_drift_file).grid(row=6, column=0, columnspan=2, sticky="ew", pady=(8, 0))
+        ttk.Label(drift_box, textvariable=self.drift_file_label, wraplength=270).grid(row=7, column=0, columnspan=2, sticky="ew", pady=(4, 0))
+        ttk.Button(drift_box, text="Apply Drift Correction", command=self.apply_correction).grid(row=8, column=0, columnspan=2, sticky="ew", pady=(8, 0))
 
         render_box = ttk.LabelFrame(sidebar, text="Render Settings", padding=10)
         render_box.grid(row=5, column=0, sticky="ew", pady=(0, 10))
@@ -1332,11 +1780,26 @@ class PaintAnalysisApp(tk.Tk):
         ttk.Label(render_box, text="Render blur").grid(row=1, column=0, sticky="w", pady=3)
         ttk.Combobox(render_box, textvariable=self.render_blur_method, state="readonly", values=("smooth", "none", "gaussian", "gaussian_iso", "convolve")).grid(row=1, column=1, sticky="ew", padx=(8, 0), pady=3)
         self._number_row(render_box, 2, "Min blur (px)", self.min_blur_width)
-        self._number_row(render_box, 3, "Min density", self.render_min_density)
-        self._number_row(render_box, 4, "Max density", self.render_max_density)
-        ttk.Button(render_box, text="Render Raw Map", command=self.show_raw_map).grid(row=5, column=0, columnspan=2, sticky="ew", pady=(8, 0))
-        ttk.Button(render_box, text="Render Corrected Map", command=self.show_current_map).grid(row=6, column=0, columnspan=2, sticky="ew", pady=(6, 0))
-        ttk.Button(render_box, text="Render Linked Map", command=self.color_by_links).grid(row=7, column=0, columnspan=2, sticky="ew", pady=(6, 0))
+        ttk.Checkbutton(
+            render_box,
+            text="Auto density (histogram)",
+            variable=self.auto_density_contrast,
+            command=self._on_auto_density_toggled,
+        ).grid(row=3, column=0, columnspan=2, sticky="w", pady=(6, 0))
+        ttk.Label(render_box, textvariable=self.auto_density_multiplier_label).grid(row=4, column=0, sticky="w", pady=3)
+        ttk.Scale(
+            render_box,
+            from_=0.1,
+            to=10.0,
+            variable=self.auto_density_multiplier,
+            command=self._on_auto_density_multiplier_changed,
+        ).grid(row=4, column=1, sticky="ew", padx=(8, 0), pady=3)
+        self._number_row(render_box, 5, "Min density", self.render_min_density)
+        self._number_row(render_box, 6, "Max density", self.render_max_density)
+        ttk.Checkbutton(render_box, text="Dynamic zoom rendering (minimum 1 nm/pixel)", variable=self.dynamic_zoom_render).grid(row=7, column=0, columnspan=2, sticky="w", pady=(6, 0))
+        ttk.Button(render_box, text="Render Raw Map", command=self.show_raw_map).grid(row=8, column=0, columnspan=2, sticky="ew", pady=(8, 0))
+        ttk.Button(render_box, text="Render Corrected Map", command=self.show_current_map).grid(row=9, column=0, columnspan=2, sticky="ew", pady=(6, 0))
+        ttk.Button(render_box, text="Render Linked Map", command=self.color_by_links).grid(row=10, column=0, columnspan=2, sticky="ew", pady=(6, 0))
 
         linking_box = ttk.LabelFrame(sidebar, text="Linking Settings", padding=10)
         linking_box.grid(row=6, column=0, sticky="ew", pady=(0, 10))
@@ -1675,6 +2138,18 @@ class PaintAnalysisApp(tk.Tk):
             textvariable=self.origami_identification_progress_text,
             wraplength=230,
         ).grid(row=12, column=0, columnspan=2, sticky="w")
+        self.origami_tiled_button = ttk.Button(
+            identify_fields,
+            text="Analyze Whole Image as ROI Tiles",
+            command=self.analyze_tiled_origamis,
+        )
+        self.origami_tiled_button.grid(row=13, column=0, columnspan=2, sticky="ew", pady=(6, 0))
+        self.origami_tiled_button.state(["disabled"])
+        ttk.Label(
+            identify_fields,
+            text="Validate identification in one ROI first; its width and height define the whole-image tile step.",
+            wraplength=230,
+        ).grid(row=14, column=0, columnspan=2, sticky="w", pady=(3, 0))
 
         overlay_section, overlay_fields = scrollable_settings_section("3. Overlay and Statistics", 2, 3)
         ttk.Checkbutton(overlay_fields, text="Allow mirrors", variable=self.origami_allow_mirror).grid(row=0, column=0, columnspan=2, sticky="w", pady=2)
@@ -1766,6 +2241,77 @@ class PaintAnalysisApp(tk.Tk):
     def _number_row(self, parent: ttk.Frame, row: int, label: str, variable: tk.Variable) -> None:
         ttk.Label(parent, text=label).grid(row=row, column=0, sticky="w", pady=3)
         ttk.Entry(parent, textvariable=variable, width=12).grid(row=row, column=1, sticky="ew", padx=(8, 0), pady=3)
+
+    def _scale_map_density(
+        self,
+        image: np.ndarray,
+        min_density: float | None = None,
+        max_density: float | None = None,
+    ) -> tuple[np.ndarray, tuple[float, float]]:
+        automatic = bool(self.auto_density_contrast.get())
+        if automatic:
+            base_min, base_max = histogram_density_limits(image)
+            multiplier = max(0.1, min(10.0, float(self.auto_density_multiplier.get())))
+            requested_min = base_min * multiplier
+            requested_max = base_max * multiplier
+        else:
+            requested_min = float(self.render_min_density.get()) if min_density is None else float(min_density)
+            requested_max = float(self.render_max_density.get()) if max_density is None else float(max_density)
+        scaled, limits = scale_density_like_picasso(image, requested_min, requested_max)
+        if automatic:
+            self.render_min_density.set(limits[0])
+            self.render_max_density.set(limits[1])
+        return scaled, limits
+
+    def _on_auto_density_multiplier_changed(self, value: str) -> None:
+        multiplier = max(0.1, min(10.0, float(value)))
+        self.auto_density_multiplier.set(multiplier)
+        self.auto_density_multiplier_label.set(f"Density multiplier: {multiplier:.2g}×")
+        self._schedule_density_refresh()
+
+    def _on_auto_density_toggled(self) -> None:
+        self._schedule_density_refresh(delay_ms=0)
+
+    def _schedule_density_refresh(self, delay_ms: int = 60) -> None:
+        if self.density_refresh_after_id is not None:
+            try:
+                self.after_cancel(self.density_refresh_after_id)
+            except Exception:
+                pass
+        self.density_refresh_after_id = self.after(delay_ms, self._refresh_active_map_density)
+
+    def _refresh_active_map_density(self) -> None:
+        self.density_refresh_after_id = None
+        tab_index = self.active_notebook_tab
+        raw_image = self.map_density_images.get(tab_index)
+        pair = self._axis_canvas_for_tab(tab_index)
+        if raw_image is None or pair is None:
+            return
+        axis, canvas = pair
+        if not axis.images:
+            return
+        display_image, limits = self._scale_map_density(raw_image)
+        axis.images[0].set_data(display_image)
+        if tab_index == RAW_MAP_TAB:
+            colorbar = self.raw_map_colorbar
+            units = "locs/render px"
+        elif tab_index == CORRECTED_MAP_TAB:
+            colorbar = self.map_colorbar
+            units = "locs/render px"
+        elif tab_index == LINKED_MAP_TAB:
+            colorbar = self.linked_map_colorbar
+            units = "events/render px"
+        else:
+            colorbar = self.filtered_map_colorbar
+            units = "locs/render px"
+        if colorbar is not None:
+            colorbar.set_label(f"density contrast ({limits[0]:.3g}-{limits[1]:.3g} {units})")
+        canvas.draw_idle()
+        if bool(self.auto_density_contrast.get()):
+            self.status.set(
+                f"Auto density {float(self.auto_density_multiplier.get()):.2g}×: "
+                f"limits {limits[0]:.4g}-{limits[1]:.4g}."
+            )
 
     def _connect_map_zoom_sync(self) -> None:
         for axis in (self.raw_map_axis, self.map_axis, self.linked_map_axis, self.filtered_map_axis):
@@ -1861,6 +2407,7 @@ class PaintAnalysisApp(tk.Tk):
         if current_pair is not None:
             current_axis, current_canvas = current_pair
             self._apply_shared_map_limits(current_axis, current_canvas)
+            self._schedule_density_refresh(delay_ms=0)
 
     def _sync_map_limits_from(self, source_axis: Any) -> None:
         if self.syncing_map_limits or self.suspend_map_limit_sync:
@@ -1892,6 +2439,7 @@ class PaintAnalysisApp(tk.Tk):
                 canvas.draw_idle()
         finally:
             self.syncing_map_limits = False
+        self._schedule_dynamic_map_render()
 
     def _apply_shared_map_limits(self, axis: Any, canvas: Any) -> None:
         if self.shared_map_limits is None:
@@ -1919,6 +2467,158 @@ class PaintAnalysisApp(tk.Tk):
     def _clear_shared_map_limits(self) -> None:
         self.shared_map_limits = None
 
+    def _full_map_viewport_nm(self) -> tuple[float, float, float, float] | None:
+        if self.loaded is None:
+            return None
+        pixelsize = float(self.loaded.info[0]["Pixelsize"])
+        return (
+            0.0,
+            float(self.loaded.info[0]["Width"]) * pixelsize,
+            0.0,
+            float(self.loaded.info[0]["Height"]) * pixelsize,
+        )
+
+    def _dynamic_render_pixel_nm(
+        self,
+        axis: Any,
+        viewport_nm: tuple[float, float, float, float],
+    ) -> float:
+        try:
+            bounds = axis.get_window_extent()
+            display_width = float(bounds.width)
+            display_height = float(bounds.height)
+        except Exception:
+            display_width = display_height = 1.0
+        if display_width <= 1 or display_height <= 1:
+            display_width = max(1.0, float(axis.figure.get_figwidth() * axis.figure.dpi))
+            display_height = max(1.0, float(axis.figure.get_figheight() * axis.figure.dpi))
+        pixel_nm = optimal_dynamic_render_pixel_nm(viewport_nm, display_width, display_height)
+        # Keep the control readable and make the latest automatic resolution
+        # immediately available as the manual value if dynamic rendering is disabled.
+        pixel_nm = float(f"{pixel_nm:.6g}")
+        self.render_disp_px_nm.set(pixel_nm)
+        return pixel_nm
+
+    def _render_pixel_nm_for_request(
+        self,
+        axis: Any,
+        viewport_nm: tuple[float, float, float, float] | None,
+        allow_dynamic: bool,
+    ) -> float:
+        pixel_nm = float(self.render_disp_px_nm.get())
+        if allow_dynamic and bool(self.dynamic_zoom_render.get()):
+            pixel_viewport = viewport_nm or self._full_map_viewport_nm()
+            if pixel_viewport is not None:
+                pixel_nm = self._dynamic_render_pixel_nm(axis, pixel_viewport)
+        return pixel_nm
+
+    def _cancel_dynamic_render_for_manual_request(self) -> None:
+        """Prevent queued or stale automatic work from replacing a manual render."""
+        self.dynamic_render_request_id += 1
+        self.dynamic_render_pending = False
+        if self.dynamic_render_after_id is not None:
+            try:
+                self.after_cancel(self.dynamic_render_after_id)
+            except Exception:
+                pass
+            self.dynamic_render_after_id = None
+
+    def _schedule_dynamic_map_render(self) -> None:
+        if not bool(self.dynamic_zoom_render.get()) or self.loaded is None:
+            return
+        if self._axis_canvas_for_tab(self.active_notebook_tab) is None:
+            return
+        self.dynamic_render_request_id += 1
+        if self.dynamic_render_after_id is not None:
+            try:
+                self.after_cancel(self.dynamic_render_after_id)
+            except Exception:
+                pass
+        self.dynamic_render_after_id = self.after(DYNAMIC_RENDER_DEBOUNCE_MS, self._start_dynamic_map_render)
+
+    def _start_dynamic_map_render(self) -> None:
+        self.dynamic_render_after_id = None
+        if not bool(self.dynamic_zoom_render.get()) or self.loaded is None:
+            return
+        if self.dynamic_render_running:
+            self.dynamic_render_pending = True
+            return
+
+        tab_index = self.active_notebook_tab
+        pair = self._axis_canvas_for_tab(tab_index)
+        full_viewport = self._full_map_viewport_nm()
+        if pair is None or full_viewport is None:
+            return
+        axis, _canvas = pair
+        viewport = self._shared_map_viewport_nm()
+        pixel_viewport = viewport or full_viewport
+
+        locs: pd.DataFrame | None = None
+        target_kind = ""
+        extra: dict[str, Any] = {}
+        if tab_index == RAW_MAP_TAB:
+            locs = self.loaded.locs
+            target_kind = "raw_map"
+        elif tab_index == CORRECTED_MAP_TAB and self.corrected_locs is not None:
+            locs = self.corrected_locs
+            target_kind = "map_only"
+        elif tab_index == LINKED_MAP_TAB and self.linked_locs is not None:
+            locs = self.linked_locs
+            target_kind = "link_map"
+            extra = {
+                "linked_count": int(len(self.linked_locs)),
+                "source_count": int(self.linked_source_count),
+                "link_source": self.linked_source_name,
+                "source_label": "raw" if self.linked_source_name == "Raw map" else "corrected",
+                "roi_text": "full map" if self.linked_roi_nm is None else "selected ROI",
+            }
+        if locs is None:
+            return
+
+        render_pixel_nm = self._dynamic_render_pixel_nm(axis, pixel_viewport)
+        request_id = self.dynamic_render_request_id
+        source_path = self.loaded.path
+        info = self.loaded.info
+        blur_method = self.render_blur_method.get()
+        min_blur_width = float(self.min_blur_width.get())
+        self.dynamic_render_running = True
+        self.dynamic_render_pending = False
+        self.status.set(
+            f"Dynamic zoom render: {render_pixel_nm:.3g} nm/pixel "
+            f"(minimum {MIN_DYNAMIC_RENDER_PIXEL_NM:g} nm/pixel)..."
+        )
+
+        def worker() -> tuple[str, Any]:
+            try:
+                result = render_picasso_map(
+                    locs,
+                    info,
+                    render_pixel_nm,
+                    blur_method,
+                    min_blur_width,
+                    viewport,
+                )
+                result.update(extra)
+                result.update(
+                    {
+                        "source_path": source_path,
+                        "dynamic_request_id": request_id,
+                        "dynamic_target_kind": target_kind,
+                        "dynamic_tab_index": tab_index,
+                    }
+                )
+                return "dynamic_map", result
+            except Exception as exc:
+                return "dynamic_map", {
+                    "source_path": source_path,
+                    "dynamic_request_id": request_id,
+                    "dynamic_tab_index": tab_index,
+                    "dynamic_error": str(exc),
+                    "dynamic_error_details": traceback.format_exc(),
+                }
+
+        self._run_worker(worker)
+
     def _file_dialog_initial_dir(self) -> Path:
         candidates: list[Path] = []
         if self.loaded is not None:
@@ -1944,19 +2644,56 @@ class PaintAnalysisApp(tk.Tk):
 
     def load_file(self) -> None:
         path = filedialog.askopenfilename(
-            title="Load Picasso localization file",
+            title="Load localization file",
             initialdir=str(self._file_dialog_initial_dir()),
-            filetypes=[("Localization files", "*.hdf5 *.h5"), ("All files", "*.*")],
+            filetypes=[("Localization files", "*.hdf5 *.h5 *.csv"), ("CSV files", "*.csv"), ("Picasso HDF5 files", "*.hdf5 *.h5"), ("All files", "*.*")],
         )
         if not path:
             return
         self._remember_file_dialog_dir(Path(path))
+        self._show_load_progress(f"Opening {Path(path).name}...")
         self.status.set("Loading localization file...")
-        self._run_worker(lambda: ("loaded", read_locs_hdf5(Path(path))))
+        self._run_worker(lambda: ("loaded", read_locs(Path(path), self._load_progress_callback)))
+
+    def _show_load_progress(self, message: str) -> None:
+        if self.load_progress_hide_id is not None:
+            try:
+                self.after_cancel(self.load_progress_hide_id)
+            except Exception:
+                pass
+            self.load_progress_hide_id = None
+        self.load_progress_value.set(0.0)
+        self.load_progress_text.set(message)
+        self.load_progress_bar.grid()
+        self.load_progress_label.grid()
+
+    def _hide_load_progress(self) -> None:
+        self.load_progress_hide_id = None
+        self.load_progress_bar.grid_remove()
+        self.load_progress_label.grid_remove()
+
+    def _load_progress_callback(self, percent: float, message: str) -> None:
+        self.worker_queue.put(("load_progress", (float(percent), str(message))))
+
+    def load_drift_file(self) -> None:
+        if self.loaded is None:
+            messagebox.showinfo("No localization file", "Load a localization file before choosing its associated drift CSV.")
+            return
+        path = filedialog.askopenfilename(
+            title="Load frame-by-frame drift correction",
+            initialdir=str(Path(self.loaded.path).parent),
+            filetypes=[("Drift CSV files", "*.csv"), ("All files", "*.*")],
+        )
+        if not path:
+            return
+        self.drift_file_path = Path(path)
+        self.drift_file_label.set(self.drift_file_path.name)
+        self.drift_method.set("file")
+        self.status.set(f"Selected drift correction file {self.drift_file_path.name}. Click Apply Drift Correction.")
 
     def apply_correction(self) -> None:
         if self.loaded is None:
-            messagebox.showinfo("No file", "Load a Picasso *_locs.hdf5 file first.")
+            messagebox.showinfo("No file", "Load a localization CSV or Picasso HDF5 file first.")
             return
         self.roi_nm = None
         self._remove_roi_patch()
@@ -1965,12 +2702,19 @@ class PaintAnalysisApp(tk.Tk):
         self.status.set("Applying drift correction...")
         self._run_worker(self._correction_worker)
 
-    def show_current_map(self) -> None:
+    def show_current_map(self, manual_pixel_override: bool = True) -> None:
         if self.corrected_locs is None:
             messagebox.showinfo("No corrected map", "Apply drift correction first.")
             return
+        if manual_pixel_override:
+            self._cancel_dynamic_render_for_manual_request()
         self.render_viewport_nm = self._shared_map_viewport_nm() or self._current_map_viewport_nm()
-        estimate = self._estimate_render_shape(self.render_viewport_nm, float(self.render_disp_px_nm.get()))
+        render_px_nm = self._render_pixel_nm_for_request(
+            self.map_axis,
+            self.render_viewport_nm,
+            allow_dynamic=not manual_pixel_override,
+        )
+        estimate = self._estimate_render_shape(self.render_viewport_nm, render_px_nm)
         if estimate is not None:
             width_px, height_px, total_px = estimate
             if total_px > MAX_RENDER_PIXELS:
@@ -1985,15 +2729,22 @@ class PaintAnalysisApp(tk.Tk):
                 )
                 return
         self._clear_map_before_render()
-        self.status.set("Rendering corrected map...")
-        self._run_worker(self._render_current_corrected_worker)
+        self.status.set(f"Rendering corrected map at {render_px_nm:.3g} nm/pixel...")
+        self._run_worker(lambda: self._render_current_corrected_worker(render_px_nm))
 
     def show_raw_map(self, auto_fit: bool = False) -> None:
         if self.loaded is None:
-            messagebox.showinfo("No file", "Load a Picasso *_locs.hdf5 file first.")
+            messagebox.showinfo("No file", "Load a localization CSV or Picasso HDF5 file first.")
             return
-        render_px_nm = float(self.render_disp_px_nm.get())
+        manual_pixel_override = not auto_fit
+        if manual_pixel_override:
+            self._cancel_dynamic_render_for_manual_request()
         self.raw_render_viewport_nm = self._shared_map_viewport_nm() or self._current_raw_map_viewport_nm()
+        render_px_nm = self._render_pixel_nm_for_request(
+            self.raw_map_axis,
+            self.raw_render_viewport_nm,
+            allow_dynamic=not manual_pixel_override,
+        )
         estimate = self._estimate_render_shape(self.raw_render_viewport_nm, render_px_nm)
         if estimate is not None:
             width_px, height_px, total_px = estimate
@@ -2164,7 +2915,7 @@ class PaintAnalysisApp(tk.Tk):
 
     def run_linking_analysis(self) -> None:
         if self.loaded is None:
-            messagebox.showinfo("No file", "Load a Picasso *_locs.hdf5 file first.")
+            messagebox.showinfo("No file", "Load a localization CSV or Picasso HDF5 file first.")
             return
         if self.linking_source.get() == "Corrected map" and self.corrected_locs is None:
             messagebox.showinfo("No corrected map", "Apply drift correction first, or set Link on to Raw map.")
@@ -2182,9 +2933,15 @@ class PaintAnalysisApp(tk.Tk):
                 "The cached linked localizations were generated with different linking settings or a different linking source. Run Linking Analysis again before rendering the linked map.",
             )
             return
+        self._cancel_dynamic_render_for_manual_request()
         self.render_viewport_nm = self._shared_map_viewport_nm() or self._current_map_viewport_nm()
-        self.status.set("Rendering linked map from cached collapsed linked events...")
-        self._run_worker(self._link_color_worker)
+        render_px_nm = self._render_pixel_nm_for_request(
+            self.linked_map_axis,
+            self.render_viewport_nm,
+            allow_dynamic=False,
+        )
+        self.status.set(f"Rendering linked map at {render_px_nm:.3g} nm/pixel from cached collapsed linked events...")
+        self._run_worker(lambda: self._link_color_worker(render_px_nm))
 
     def plot_temporal_metric(self) -> None:
         if self.corrected_locs is None:
@@ -2232,6 +2989,7 @@ class PaintAnalysisApp(tk.Tk):
             "render_min_blur_width": float(self.min_blur_width.get()),
             "render_min_density": float(self.render_min_density.get()),
             "render_max_density": float(self.render_max_density.get()),
+            "source_roi_nm": self.roi_nm if bool(self.origami_use_roi.get()) else None,
             "render_viewport_nm": (
                 self.roi_nm
                 if bool(self.origami_use_roi.get()) and self.roi_nm is not None
@@ -2254,8 +3012,8 @@ class PaintAnalysisApp(tk.Tk):
             selected = self.corrected_locs.copy()
             source_note = "whole corrected image"
 
-        if bool(params["use_roi"]) and self.roi_nm is not None:
-            selected = roi_locs(selected, self.roi_nm, pixelsize)
+        if bool(params["use_roi"]) and params["source_roi_nm"] is not None:
+            selected = roi_locs(selected, params["source_roi_nm"], pixelsize)
             source_note = "selected ROI"
 
         if source.lower().startswith("filtered") and params["active_filters"]:
@@ -2291,6 +3049,8 @@ class PaintAnalysisApp(tk.Tk):
             "render_result": render_result,
             "source_label": f"{source} ({source_note})",
             "source_path": params["source_path"],
+            "source_roi_nm": params["source_roi_nm"],
+            "source_params": dict(params),
         }
 
     def identify_origamis(self) -> None:
@@ -2328,6 +3088,7 @@ class PaintAnalysisApp(tk.Tk):
         self.origami_identification_progress.set(0.0)
         self.origami_identification_progress_text.set(f"Starting with {len(points_nm):,} source points...")
         self.origami_identify_button.state(["disabled"])
+        self.origami_tiled_button.state(["disabled"])
         self.status.set(f"Identifying whole origami regions in {len(points_nm):,} loaded source points...")
         self._run_worker(lambda: self._identify_origami_worker(points_nm, params))
 
@@ -2349,7 +3110,7 @@ class PaintAnalysisApp(tk.Tk):
             alignment_iterations=int(params["alignment_iterations"]),
             progress_callback=self._origami_identification_worker_progress,
         )
-        return "origami_picks", {"picks": picks, "source_path": params["source_path"]}
+        return "origami_picks", {"picks": picks, "source_path": params["source_path"], "params": dict(params)}
 
     def _origami_identification_worker_progress(self, percent: float, message: str) -> None:
         self.worker_queue.put(("origami_identification_progress", (float(percent), str(message))))
@@ -2357,8 +3118,275 @@ class PaintAnalysisApp(tk.Tk):
     def _finish_origami_identification_progress(self, message: str | None = None) -> None:
         self.origami_identification_running = False
         self.origami_identify_button.state(["!disabled"])
+        if (
+            self.origami_pick_result is not None
+            and self.origami_pick_result.accepted_count > 0
+            and self.origami_loaded_roi_nm is not None
+            and self.origami_identification_params is not None
+        ):
+            self.origami_tiled_button.state(["!disabled"])
+        else:
+            self.origami_tiled_button.state(["disabled"])
         if message is not None:
             self.origami_identification_progress_text.set(message)
+
+    def analyze_tiled_origamis(self) -> None:
+        if self.loaded is None or self.corrected_locs is None:
+            messagebox.showinfo("No corrected data", "Load and drift-correct localization data first.")
+            return
+        if (
+            self.origami_pick_result is None
+            or self.origami_pick_result.accepted_count == 0
+            or self.origami_identification_params is None
+            or self.origami_loaded_source_params is None
+        ):
+            messagebox.showinfo(
+                "Validate one ROI first",
+                "Load source data from a selected ROI, run Identify Origami, and inspect the accepted footprints first.",
+            )
+            return
+        if self.origami_loaded_roi_nm is None:
+            messagebox.showinfo(
+                "ROI source required",
+                "The validated source was not loaded from an ROI. Select an ROI, enable Use selected ROI, reload source data, and validate identification.",
+            )
+            return
+
+        source_params = dict(self.origami_loaded_source_params)
+        source = str(source_params["source"])
+        if "linked" in source.lower():
+            if self.linked_locs is None:
+                messagebox.showinfo("No linked events", "Run whole-image linking before tiled origami analysis.")
+                return
+            if self.linked_roi_nm is not None:
+                messagebox.showinfo(
+                    "Whole-image linking required",
+                    "The linked-event cache only covers an ROI. Run Linking Analysis with Whole image, then reload and validate the origami ROI.",
+                )
+                return
+            source_locs = self.linked_locs
+        else:
+            source_locs = self.corrected_locs
+
+        pixelsize = float(self.loaded.info[0]["Pixelsize"])
+        full_width_nm = float(self.loaded.info[0]["Width"]) * pixelsize
+        full_height_nm = float(self.loaded.info[0]["Height"]) * pixelsize
+        validated_params = dict(self.origami_identification_params)
+        try:
+            tiles = fully_fitting_roi_tiles(full_width_nm, full_height_nm, self.origami_loaded_roi_nm)
+            overlay_params = {
+                "rows": int(validated_params["rows"]),
+                "columns": int(validated_params["columns"]),
+                "spacing_x_nm": float(validated_params["spacing_x_nm"]),
+                "spacing_y_nm": float(validated_params["spacing_y_nm"]),
+                "g5m_sigma_min_nm": float(self.origami_g5m_sigma_min_nm.get()),
+                "g5m_sigma_max_nm": float(self.origami_g5m_sigma_max_nm.get()),
+                "g5m_min_locs": int(self.origami_g5m_min_locs.get()),
+                "g5m_bic_patience": int(self.origami_g5m_bic_patience.get()),
+                "site_radius_nm": float(self.origami_site_radius_nm.get()),
+                "allow_mirror": bool(self.origami_allow_mirror.get()),
+                "overlay_pixel_nm": float(self.origami_overlay_pixel_nm.get()),
+                "overlay_padding_nm": float(self.origami_overlay_padding_nm.get()),
+                "overlay_blur_nm": float(self.origami_overlay_blur_nm.get()),
+                "source_path": self.loaded.path,
+            }
+        except (tk.TclError, ValueError) as exc:
+            messagebox.showerror("Invalid tiled-analysis settings", str(exc))
+            return
+        if not tiles:
+            messagebox.showinfo("No complete tiles", "No ROI-sized tile fits completely inside the image.")
+            return
+        if (
+            overlay_params["g5m_sigma_min_nm"] <= 0
+            or overlay_params["g5m_sigma_max_nm"] < overlay_params["g5m_sigma_min_nm"]
+            or overlay_params["g5m_min_locs"] < 1
+            or overlay_params["g5m_bic_patience"] < 1
+            or overlay_params["site_radius_nm"] <= 0
+        ):
+            messagebox.showerror("Invalid tiled-analysis settings", "Check G5M sigma, localization, patience, and site-radius settings.")
+            return
+
+        self.origami_identification_running = True
+        self.origami_identification_progress.set(0.0)
+        tile_width = tiles[0][1] - tiles[0][0]
+        tile_height = tiles[0][3] - tiles[0][2]
+        self.origami_identification_progress_text.set(
+            f"Starting {len(tiles):,} complete {tile_width:g} × {tile_height:g} nm tiles..."
+        )
+        self.origami_identify_button.state(["disabled"])
+        self.origami_tiled_button.state(["disabled"])
+        self.status.set(f"Tiled origami analysis: preparing {len(tiles):,} whole-image ROIs...")
+        self._run_worker(
+            lambda: self._tiled_origami_worker(
+                source_locs,
+                pixelsize,
+                tiles,
+                validated_params,
+                source_params,
+                overlay_params,
+            )
+        )
+
+    def _tiled_origami_worker(
+        self,
+        source_locs: pd.DataFrame,
+        pixelsize: float,
+        tiles: list[tuple[float, float, float, float]],
+        identification_params: dict[str, Any],
+        source_params: dict[str, Any],
+        overlay_params: dict[str, Any],
+    ) -> tuple[str, Any]:
+        selected = source_locs
+        source = str(source_params["source"])
+        if source.lower().startswith("filtered") and source_params["active_filters"]:
+            keep = pd.Series(True, index=selected.index, dtype=bool)
+            for mode, (left, right) in source_params["active_filters"]:
+                series, _label = localization_series_for_mode(
+                    selected,
+                    mode,
+                    pixelsize,
+                    float(source_params["exposure_ms"]),
+                    float(source_params["link_radius_nm"]),
+                    int(source_params["max_gap_frames"]),
+                )
+                values = series.to_numpy(dtype=float)
+                keep &= np.isfinite(values) & (values >= min(left, right)) & (values <= max(left, right))
+            selected = selected.loc[keep]
+        if selected.empty:
+            raise ValueError("The whole-image source contains no points after applying the validated source filters.")
+
+        x_nm = selected["x"].to_numpy(dtype=np.float32, copy=False) * np.float32(pixelsize)
+        y_nm = selected["y"].to_numpy(dtype=np.float32, copy=False) * np.float32(pixelsize)
+        x_starts = np.asarray(sorted({tile[0] for tile in tiles}), dtype=float)
+        y_starts = np.asarray(sorted({tile[2] for tile in tiles}), dtype=float)
+        tile_width = float(tiles[0][1] - tiles[0][0])
+        tile_height = float(tiles[0][3] - tiles[0][2])
+        nx = len(x_starts)
+        ny = len(y_starts)
+        tile_x = np.floor((x_nm - x_starts[0]) / tile_width).astype(np.int32)
+        tile_y = np.floor((y_nm - y_starts[0]) / tile_height).astype(np.int32)
+        valid = (
+            np.isfinite(x_nm)
+            & np.isfinite(y_nm)
+            & (tile_x >= 0)
+            & (tile_x < nx)
+            & (tile_y >= 0)
+            & (tile_y < ny)
+            & (x_nm < x_starts[-1] + tile_width)
+            & (y_nm < y_starts[-1] + tile_height)
+        )
+        source_indices = np.flatnonzero(valid)
+        tile_ids = tile_y[valid] * nx + tile_x[valid]
+        order = np.argsort(tile_ids, kind="stable")
+        sorted_ids = tile_ids[order]
+        sorted_indices = source_indices[order]
+        del tile_ids, source_indices, order, tile_x, tile_y, valid
+
+        accepted_regions: list[np.ndarray] = []
+        accepted_centers: list[np.ndarray] = []
+        rejected_count = 0
+        candidate_count = 0
+        analyzed_nonempty_tiles = 0
+        for tile_index, tile in enumerate(tiles):
+            left = int(np.searchsorted(sorted_ids, tile_index, side="left"))
+            right = int(np.searchsorted(sorted_ids, tile_index, side="right"))
+            if right <= left:
+                self._origami_identification_worker_progress(
+                    80.0 * (tile_index + 1) / len(tiles),
+                    f"Tile {tile_index + 1}/{len(tiles)}: empty; skipped.",
+                )
+                continue
+            indices = sorted_indices[left:right]
+            tile_points = np.column_stack((x_nm[indices], y_nm[indices])).astype(float, copy=False)
+            analyzed_nonempty_tiles += 1
+
+            def tile_progress(percent: float, message: str, current: int = tile_index) -> None:
+                overall = 80.0 * (current + float(percent) / 100.0) / len(tiles)
+                self._origami_identification_worker_progress(
+                    overall,
+                    f"Tile {current + 1}/{len(tiles)}: {message}",
+                )
+
+            picks = identify_origami_regions(
+                tile_points,
+                pick_bin_size_nm=float(identification_params["pick_bin_size_nm"]),
+                connect_distance_nm=float(identification_params["connect_distance_nm"]),
+                density_threshold=float(identification_params["density_threshold"]),
+                min_candidate_points=int(identification_params["min_candidate_points"]),
+                max_candidate_points=int(identification_params["max_candidate_points"]),
+                rows=int(identification_params["rows"]),
+                columns=int(identification_params["columns"]),
+                spacing_x_nm=float(identification_params["spacing_x_nm"]),
+                spacing_y_nm=float(identification_params["spacing_y_nm"]),
+                rectangle_margin_nm=float(identification_params["rectangle_margin_nm"]),
+                min_rectangle_confidence=float(identification_params["min_rectangle_confidence"]),
+                alignment_pixel_nm=float(identification_params["alignment_pixel_nm"]),
+                alignment_iterations=int(identification_params["alignment_iterations"]),
+                progress_callback=tile_progress,
+            )
+            candidate_count += len(picks.regions)
+            rejected_count += len(picks.regions) - picks.accepted_count
+            accepted_regions.extend(region.copy() for region in picks.accepted_aligned_regions)
+            accepted_centers.extend(
+                np.median(region, axis=0)
+                for region, accepted in zip(picks.regions, picks.accepted_mask)
+                if bool(accepted)
+            )
+            if tile_index % 10 == 0:
+                gc.collect()
+
+        if not accepted_regions:
+            raise ValueError(
+                f"No origamis were accepted across {len(tiles)} complete tiles. Revisit the validation ROI and identification thresholds."
+            )
+        self._origami_identification_worker_progress(
+            82.0,
+            f"Identified {len(accepted_regions):,}/{candidate_count:,} candidates; clustering docking sites...",
+        )
+
+        def alignment_progress(message: str) -> None:
+            self._origami_identification_worker_progress(90.0, message)
+
+        result = align_picked_origamis(
+            accepted_regions,
+            rows=int(overlay_params["rows"]),
+            columns=int(overlay_params["columns"]),
+            spacing_x_nm=float(overlay_params["spacing_x_nm"]),
+            spacing_y_nm=float(overlay_params["spacing_y_nm"]),
+            site_radius_nm=float(overlay_params["site_radius_nm"]),
+            g5m_sigma_min_nm=float(overlay_params["g5m_sigma_min_nm"]),
+            g5m_sigma_max_nm=float(overlay_params["g5m_sigma_max_nm"]),
+            g5m_min_locs=int(overlay_params["g5m_min_locs"]),
+            g5m_max_rounds_without_best_bic=int(overlay_params["g5m_bic_patience"]),
+            prealigned=True,
+            source_centers_nm=np.asarray(accepted_centers, dtype=float),
+            allow_mirror=bool(overlay_params["allow_mirror"]),
+            initially_rejected_count=rejected_count,
+            progress_callback=alignment_progress,
+        )
+        self._origami_identification_worker_progress(100.0, "Tiled whole-image origami analysis complete.")
+        return "origami_tiled", {
+            "result": result,
+            "source": f"{source} (whole image, tiled from validated ROI)",
+            "source_note": "whole-image ROI tiles",
+            "source_count": int(len(selected)),
+            "occupancy_threshold": 1,
+            "render_settings": {
+                "rows": int(overlay_params["rows"]),
+                "columns": int(overlay_params["columns"]),
+                "spacing_x_nm": float(overlay_params["spacing_x_nm"]),
+                "spacing_y_nm": float(overlay_params["spacing_y_nm"]),
+                "pixel_size_nm": float(overlay_params["overlay_pixel_nm"]),
+                "padding_nm": float(overlay_params["overlay_padding_nm"]),
+                "blur_nm": float(overlay_params["overlay_blur_nm"]),
+            },
+            "source_path": overlay_params["source_path"],
+            "tile_count": len(tiles),
+            "nonempty_tile_count": analyzed_nonempty_tiles,
+            "candidate_count": candidate_count,
+            "accepted_count": len(accepted_regions),
+            "tile_size_nm": (tile_width, tile_height),
+        }
 
     def overlay_origamis(self) -> None:
         picks = self.origami_pick_result
@@ -2474,16 +3502,17 @@ class PaintAnalysisApp(tk.Tk):
             float(self.aim_roi_nm.get()),
             self._worker_status,
             float(self.rcc_lattice_pitch_nm.get()),
+            self.drift_file_path,
         )
         return "correction", {"locs": corrected_locs, "drift": drift, "label": label, "source_path": self.loaded.path}
 
-    def _render_current_corrected_worker(self) -> tuple[str, Any]:
+    def _render_current_corrected_worker(self, disp_px_size_nm: float | None = None) -> tuple[str, Any]:
         assert self.loaded is not None
         assert self.corrected_locs is not None
         map_result = render_picasso_map(
             self.corrected_locs,
             self.loaded.info,
-            float(self.render_disp_px_nm.get()),
+            float(disp_px_size_nm if disp_px_size_nm is not None else self.render_disp_px_nm.get()),
             self.render_blur_method.get(),
             float(self.min_blur_width.get()),
             self.render_viewport_nm,
@@ -3034,7 +4063,7 @@ class PaintAnalysisApp(tk.Tk):
             "link_scope": self.linking_scope.get(),
         }
 
-    def _link_color_worker(self) -> tuple[str, Any]:
+    def _link_color_worker(self, disp_px_size_nm: float | None = None) -> tuple[str, Any]:
         assert self.loaded is not None
         assert self.linked_locs is not None
         linked_locs = self.linked_locs
@@ -3042,7 +4071,7 @@ class PaintAnalysisApp(tk.Tk):
         map_result = render_picasso_map(
             linked_locs,
             self.loaded.info,
-            float(self.render_disp_px_nm.get()),
+            float(disp_px_size_nm if disp_px_size_nm is not None else self.render_disp_px_nm.get()),
             self.render_blur_method.get(),
             float(self.min_blur_width.get()),
             self.render_viewport_nm,
@@ -3075,6 +4104,11 @@ class PaintAnalysisApp(tk.Tk):
                 kind, payload = self.worker_queue.get_nowait()
                 if kind == "status":
                     self.status.set(str(payload))
+                elif kind == "load_progress":
+                    percent, message = payload
+                    self.load_progress_value.set(max(0.0, min(100.0, float(percent))))
+                    self.load_progress_text.set(str(message))
+                    self.status.set(str(message))
                 elif kind == "origami_identification_progress":
                     percent, message = payload
                     self.origami_identification_progress.set(max(0.0, min(100.0, float(percent))))
@@ -3082,6 +4116,8 @@ class PaintAnalysisApp(tk.Tk):
                     self.status.set(f"Identify Origami: {float(percent):.0f}% — {message}")
                 elif kind == "error":
                     exc, details = payload
+                    if self.load_progress_bar.winfo_ismapped():
+                        self._hide_load_progress()
                     if self.origami_identification_running:
                         self._finish_origami_identification_progress("Identification stopped because of an error.")
                     self.status.set("Error")
@@ -3092,6 +4128,9 @@ class PaintAnalysisApp(tk.Tk):
                         result_kind, result_payload = payload
                         if result_kind == "loaded":
                             self._after_load(result_payload)
+                            self.load_progress_value.set(100.0)
+                            self.load_progress_text.set(f"Loaded {len(result_payload.locs):,} localizations")
+                            self.load_progress_hide_id = self.after(1200, self._hide_load_progress)
                         elif result_kind == "correction":
                             if self.loaded is None or result_payload.get("source_path") != self.loaded.path:
                                 continue
@@ -3109,10 +4148,39 @@ class PaintAnalysisApp(tk.Tk):
                             self.origami_pick_result = None
                             self.origami_loaded_source_label = ""
                             self.origami_loaded_source_path = None
+                            self.origami_loaded_roi_nm = None
+                            self.origami_loaded_source_params = None
+                            self.origami_identification_params = None
+                            self.origami_tiled_button.state(["disabled"])
                             self.drift = result_payload["drift"]
                             self.correction_label = result_payload["label"]
                             self.status.set(f"{self.correction_label} ready. Rendering map with current render settings...")
-                            self.show_current_map()
+                            self.show_current_map(manual_pixel_override=False)
+                        elif result_kind == "dynamic_map":
+                            self.dynamic_render_running = False
+                            request_id = int(result_payload.get("dynamic_request_id", -1))
+                            is_current = (
+                                self.loaded is not None
+                                and result_payload.get("source_path") == self.loaded.path
+                                and request_id == self.dynamic_render_request_id
+                                and int(result_payload.get("dynamic_tab_index", -1)) == self.active_notebook_tab
+                                and bool(self.dynamic_zoom_render.get())
+                            )
+                            if is_current and result_payload.get("dynamic_error"):
+                                details = str(result_payload.get("dynamic_error_details", ""))
+                                self.status.set(f"Dynamic zoom render failed: {result_payload['dynamic_error']}")
+                                self._show_error_indicator(str(result_payload["dynamic_error"]), details)
+                            elif is_current:
+                                target_kind = result_payload.get("dynamic_target_kind")
+                                if target_kind == "raw_map":
+                                    self._plot_raw_map(result_payload)
+                                elif target_kind == "map_only":
+                                    self._plot_map(result_payload)
+                                elif target_kind == "link_map":
+                                    self._plot_link_map(result_payload)
+                            if self.dynamic_render_pending:
+                                self.dynamic_render_pending = False
+                                self._schedule_dynamic_map_render()
                         elif result_kind == "raw_map":
                             self._plot_raw_map(result_payload)
                         elif result_kind == "map_only":
@@ -3135,6 +4203,10 @@ class PaintAnalysisApp(tk.Tk):
                             self.origami_pick_result = None
                             self.origami_loaded_source_label = ""
                             self.origami_loaded_source_path = None
+                            self.origami_loaded_roi_nm = None
+                            self.origami_loaded_source_params = None
+                            self.origami_identification_params = None
+                            self.origami_tiled_button.state(["disabled"])
                             self.status.set("Linking analysis complete. Drawing summary plots...")
                             self.update_idletasks()
                             self._plot_linking_summary(result_payload)
@@ -3149,19 +4221,38 @@ class PaintAnalysisApp(tk.Tk):
                                 self.origami_source_render_result = dict(result_payload["render_result"])
                                 self.origami_loaded_source_label = str(result_payload["source_label"])
                                 self.origami_loaded_source_path = result_payload["source_path"]
+                                self.origami_loaded_roi_nm = result_payload.get("source_roi_nm")
+                                self.origami_loaded_source_params = dict(result_payload["source_params"])
+                                self.origami_identification_params = None
                                 self.origami_pick_result = None
                                 self.origami_result = None
+                                self.origami_tiled_button.state(["disabled"])
                                 self._plot_origami_source_data()
                         elif result_kind == "origami_picks":
                             completed_picks: OrigamiPickResult = result_payload["picks"]
                             self.origami_identification_progress.set(100.0)
+                            if self.loaded is not None and result_payload.get("source_path") == self.loaded.path:
+                                self.origami_pick_result = completed_picks
+                                self.origami_identification_params = dict(result_payload["params"])
+                                self.origami_result = None
+                                self._plot_identified_origamis()
                             self._finish_origami_identification_progress(
                                 f"Complete: {completed_picks.accepted_count}/{len(completed_picks.regions)} image-matched origamis accepted."
                             )
+                        elif result_kind == "origami_tiled":
+                            self.origami_identification_progress.set(100.0)
+                            self._finish_origami_identification_progress(
+                                f"Complete: {result_payload['accepted_count']:,}/{result_payload['candidate_count']:,} candidates accepted across {result_payload['tile_count']:,} tiles."
+                            )
                             if self.loaded is not None and result_payload.get("source_path") == self.loaded.path:
-                                self.origami_pick_result = completed_picks
-                                self.origami_result = None
-                                self._plot_identified_origamis()
+                                self.origami_plot_option.set("Aligned density")
+                                self._plot_origami_analysis(result_payload)
+                                width_nm, height_nm = result_payload["tile_size_nm"]
+                                self.status.set(
+                                    f"Tiled whole-image analysis complete: {result_payload['accepted_count']:,} origamis from "
+                                    f"{result_payload['candidate_count']:,} candidates in {result_payload['nonempty_tile_count']:,}/"
+                                    f"{result_payload['tile_count']:,} complete {width_nm:g} × {height_nm:g} nm ROIs."
+                                )
                         elif result_kind == "origami":
                             if self.loaded is not None and result_payload.get("source_path") == self.loaded.path:
                                 self._plot_origami_analysis(result_payload)
@@ -3175,6 +4266,14 @@ class PaintAnalysisApp(tk.Tk):
         self.after(100, self._poll_worker)
 
     def _after_load(self, loaded: LoadedData) -> None:
+        self.dynamic_render_request_id += 1
+        self.dynamic_render_pending = False
+        if self.dynamic_render_after_id is not None:
+            try:
+                self.after_cancel(self.dynamic_render_after_id)
+            except Exception:
+                pass
+            self.dynamic_render_after_id = None
         self.loaded = loaded
         self.corrected_locs = None
         self.linked_locs = None
@@ -3184,6 +4283,8 @@ class PaintAnalysisApp(tk.Tk):
         self.linked_source_name = self.linking_source.get()
         self.linked_scope_name = self.linking_scope.get()
         self.drift = None
+        self.drift_file_path = None
+        self.drift_file_label.set("No drift file selected")
         self.roi_nm = None
         self.render_viewport_nm = None
         self.raw_render_viewport_nm = None
@@ -3199,6 +4300,10 @@ class PaintAnalysisApp(tk.Tk):
         self.origami_pick_result = None
         self.origami_loaded_source_label = ""
         self.origami_loaded_source_path = None
+        self.origami_loaded_roi_nm = None
+        self.origami_loaded_source_params = None
+        self.origami_identification_params = None
+        self.origami_tiled_button.state(["disabled"])
         self.hist_filter_bounds.clear()
         self.hist_filter_enabled.clear()
         self._refresh_filter_list()
@@ -3217,6 +4322,13 @@ class PaintAnalysisApp(tk.Tk):
         self.show_raw_map(auto_fit=True)
 
     def _clear_outputs_for_new_file(self) -> None:
+        self.map_density_images.clear()
+        if self.density_refresh_after_id is not None:
+            try:
+                self.after_cancel(self.density_refresh_after_id)
+            except Exception:
+                pass
+            self.density_refresh_after_id = None
         self.suspend_map_limit_sync = True
         try:
             if self.selector is not None:
@@ -3304,7 +4416,7 @@ class PaintAnalysisApp(tk.Tk):
     def _update_hist_options(self) -> None:
         assert self.loaded is not None
         columns = set(self.loaded.locs.columns)
-        options = ["photons", "precision_radial_nm", "lpx_nm", "lpy_nm", "frame", "frame_gap", "localizations_per_frame", "sx", "sy", "bg", "nearest_neighbor_nm", "event_length_frames", "event_length_ms", "event_locs", "event_photons"]
+        options = ["photons", "precision_nm", "precision_radial_nm", "lpx_nm", "lpy_nm", "frame", "frame_gap", "localizations_per_frame", "sx", "sy", "bg", "nearest_neighbor_nm", "event_length_frames", "event_length_ms", "event_locs", "event_photons"]
         available: list[str] = []
         for option in options:
             if option in {"precision_radial_nm"} and {"lpx", "lpy"}.issubset(columns):
@@ -3332,11 +4444,8 @@ class PaintAnalysisApp(tk.Tk):
             self._remove_raw_roi_highlight()
             self.raw_map_axis.clear()
             image = np.asarray(result["image"], dtype=float)
-            display_image, density_limits = scale_density_like_picasso(
-                image,
-                float(self.render_min_density.get()),
-                float(self.render_max_density.get()),
-            )
+            self.map_density_images[RAW_MAP_TAB] = image
+            display_image, density_limits = self._scale_map_density(image)
             im = self.raw_map_axis.imshow(display_image, extent=result["extent"], origin="lower", cmap="magma", interpolation="nearest", aspect="equal", vmin=0.0, vmax=1.0)
             self.raw_map_colorbar = self._add_fixed_colorbar(
                 self.raw_map_figure,
@@ -3355,7 +4464,8 @@ class PaintAnalysisApp(tk.Tk):
         self.raw_map_canvas.draw_idle()
         self.notebook.select(RAW_MAP_TAB)
         self.status.set(
-            f"Rendered raw map with {result['n_rendered']:,} uncorrected localizations. "
+            f"Rendered raw map with {result['n_rendered']:,} uncorrected localizations at "
+            f"{float(result['disp_px_size_nm']):.3g} nm/pixel. "
             "Choose drift settings and click Apply Drift Correction for the corrected map."
         )
 
@@ -3368,11 +4478,8 @@ class PaintAnalysisApp(tk.Tk):
             self._remove_map_colorbar()
             self.map_axis.clear()
             image = np.asarray(result["image"], dtype=float)
-            display_image, density_limits = scale_density_like_picasso(
-                image,
-                float(self.render_min_density.get()),
-                float(self.render_max_density.get()),
-            )
+            self.map_density_images[CORRECTED_MAP_TAB] = image
+            display_image, density_limits = self._scale_map_density(image)
             im = self.map_axis.imshow(display_image, extent=result["extent"], origin="lower", cmap="magma", interpolation="nearest", aspect="equal", vmin=0.0, vmax=1.0)
             self.map_colorbar = self._add_fixed_colorbar(
                 self.map_figure,
@@ -3394,7 +4501,8 @@ class PaintAnalysisApp(tk.Tk):
         self.map_canvas.draw_idle()
         self.notebook.select(CORRECTED_MAP_TAB)
         self.status.set(
-            f"Rendered {result['n_rendered']:,} corrected localizations with Picasso render. "
+            f"Rendered {result['n_rendered']:,} corrected localizations at "
+            f"{float(result['disp_px_size_nm']):.3g} nm/pixel. "
             f"Density limits {density_limits[0]:.4g}-{density_limits[1]:.4g}. "
             f"{'Rendered current zoomed viewport. ' if result.get('viewport_nm') is not None else ''}"
             "Drag on the map to select an ROI."
@@ -4394,6 +5502,7 @@ class PaintAnalysisApp(tk.Tk):
             return
         filtered = result.get("map")
         if filtered is None:
+            self.map_density_images.pop(FILTERED_MAP_TAB, None)
             self.suspend_map_limit_sync = True
             try:
                 self._remove_filtered_map_colorbar()
@@ -4418,7 +5527,8 @@ class PaintAnalysisApp(tk.Tk):
             self._remove_filtered_map_colorbar()
             self.filtered_map_axis.clear()
             filtered_image = np.asarray(filtered["image"], dtype=float)
-            filtered_display, filtered_limits = scale_density_like_picasso(
+            self.map_density_images[FILTERED_MAP_TAB] = filtered_image
+            filtered_display, filtered_limits = self._scale_map_density(
                 filtered_image,
                 min_density,
                 max_density,
@@ -4452,11 +5562,8 @@ class PaintAnalysisApp(tk.Tk):
             self._remove_linked_map_colorbar()
             self.linked_map_axis.clear()
             image = np.asarray(result["image"], dtype=float)
-            display_image, density_limits = scale_density_like_picasso(
-                image,
-                float(self.render_min_density.get()),
-                float(self.render_max_density.get()),
-            )
+            self.map_density_images[LINKED_MAP_TAB] = image
+            display_image, density_limits = self._scale_map_density(image)
             im = self.linked_map_axis.imshow(display_image, extent=result["extent"], origin="lower", cmap="magma", interpolation="nearest", aspect="equal", vmin=0.0, vmax=1.0)
             self.linked_map_colorbar = self._add_fixed_colorbar(
                 self.linked_map_figure,
@@ -4482,7 +5589,8 @@ class PaintAnalysisApp(tk.Tk):
         source_label = str(result.get("source_label", "corrected"))
         self.status.set(
             f"Rendered {result['linked_count']:,} collapsed linked events from {result['source_count']:,} {source_label} "
-            f"{roi_text} localizations. Density limits {density_limits[0]:.4g}-{density_limits[1]:.4g}."
+            f"{roi_text} localizations at {float(result['disp_px_size_nm']):.3g} nm/pixel. "
+            f"Density limits {density_limits[0]:.4g}-{density_limits[1]:.4g}."
         )
 
     def _highlight_raw_roi_locs(self) -> int:

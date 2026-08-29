@@ -2,7 +2,7 @@
 
 This GUI is now map-first:
 
-1. Load a Picasso `*_locs.hdf5` file.
+1. Load a Picasso `.h5`/`.hdf5` file or a localization `.csv` file.
 2. Apply drift correction: `none`, `rcc`, or `aim`.
 3. Render the stored corrected localization table using Picasso's `picasso.render.render`.
 4. Drag a rectangle on the rendered map to select an ROI.
@@ -51,9 +51,18 @@ side by side for the current user using the signed installer from python.org.
 The installation is not added to `PATH`, so other installed Python versions,
 projects, and packages are not changed.
 
-Localization data (`.h5` and `.hdf5`), virtual environments, Python caches, and
+Localization data (`.csv`, `.h5`, and `.hdf5`), virtual environments, Python caches, and
 editor metadata are ignored by Git. CSV exports are written only to the location
 you choose in the save dialog.
+
+CSV imports accept Picasso-style `frame`, `x`, and `y` columns as well as exports
+whose headers use `frameIndex`, `x (nm)`, and `y (nm)`. Common photon, background,
+PSF-width, localization-precision, and channel columns are imported when present.
+Nanometer coordinates and PSF widths are converted to Picasso pixel units using
+the companion YAML `Pixelsize`, or 130 nm/pixel when no metadata is available.
+Large CSV and HDF5 imports show determinate progress beneath the selected file
+name. CSV data is loaded in chunks into preallocated arrays to keep memory close
+to the final localization-table size.
 
 ## Render And Drift
 
@@ -68,6 +77,11 @@ Correction methods:
 - `none`: use loaded coordinates.
 - `rcc`: call Picasso RCC directly, optionally after Fourier lattice suppression.
 - `aim`: call `picasso.aim.aim`.
+- `file`: load a CSV containing one x/y drift value per frame and subtract that
+  drift from every localization in the corresponding frame. Use `Load Drift CSV`,
+  then `Apply Drift Correction`. Columns such as `Frame`, `x-drift (nm)`, and
+  `y-drift (nm)` are recognized; optional z drift is applied when both files
+  contain z values. Nanometer drift is converted using the localization pixel size.
 
 `Segmentation` is frames per drift segment. `RCC lattice pitch (nm)` locates the lattice
 directions in the summed Fourier spectrum and removes narrow notches at the fundamental
@@ -75,9 +89,39 @@ frequency and its harmonics before RCC. The default is 700 nm. Filtering affects
 temporary correlation images, not the localization coordinates. Set the pitch to `0` to use
 unfiltered Picasso RCC. AIM also uses `AIM intersect (nm)` and `AIM ROI (nm)`.
 
-Drift correction and rendering are separate actions. Changing `Render pixel`, `Render blur`, or `Min blur` and pressing `Render Map` re-renders the current corrected localization table without rerunning RCC/AIM.
+Drift correction and rendering are separate actions. With dynamic zoom rendering
+disabled, changing `Render pixel`, `Render blur`, or `Min blur` and pressing
+`Render Map` re-renders the current corrected localization table without
+rerunning RCC/AIM.
 
-`Min density` and `Max density` match Picasso Render's Display Settings contrast controls: they define which localization density per rendered super-resolution pixel maps to the low and high ends of the colormap. Leave `Max density` at `0` for automatic scaling, equivalent to Picasso's autoscale behavior.
+`Dynamic zoom rendering` is enabled by default. After zooming or panning on the
+raw, corrected, or linked map, the visible viewport is rerendered after a short
+debounce. The app chooses approximately one render pixel per on-screen plot
+pixel and progressively refines the data resolution as you zoom, down to a
+minimum of 1 nm/render pixel. This keeps very large full-field views responsive
+without sacrificing high-resolution ROI inspection. Disable this option to use
+the fixed `Render pixel` value instead. The `Render pixel` field is updated to
+show every automatically selected resolution. Entering a value and clicking an
+explicit Render Map button always uses that value for that render, even while
+dynamic zoom rendering remains enabled; the next zoom or pan resumes automatic
+sizing. The toolbar Home button restores the full acquisition field, even after
+a viewport-only rerender.
+
+`Min density` and `Max density` define which localization density per rendered
+super-resolution pixel maps to the low and high ends of the colormap. Enable
+`Auto density (histogram)` to derive robust contrast limits from a histogram of
+populated, finite render pixels. Its upper limit retains at least 99.9% of the
+populated brightness distribution and adds highlight headroom so the highest
+retained bin does not render as saturated white. Only the rarest 0.1% bright
+outliers may clip. Log-spaced bins are used for long-tailed images so isolated
+extreme pixels do not make the rest of the map too dark. Empty background pixels
+are excluded. The computed
+limits are written into the `Min density` and `Max density` fields after every
+map render; disable automatic density to enter fixed values manually.
+The `Density multiplier` slider scales both automatic limits from 0.1× to 10×
+and updates the current cached map immediately without rerendering localization
+data. Values above 1× raise the density ceiling and reduce highlight saturation;
+values below 1× brighten lower-density structure.
 
 ## ROI Histograms
 
@@ -113,6 +157,18 @@ that contains all origamis you want to compare, before starting the overlay.
 
 The workflow is deliberately staged so identification can be inspected and
 tuned before alignment:
+
+For fields too large to identify in one pass, select a representative ROI,
+enable `Use selected ROI`, load the source, and run `Identify Origami` until the
+accepted footprints look correct. `Analyze Whole Image as ROI Tiles` then uses
+that validated ROI's width and height as both tile size and x/y step. The tile
+lattice is anchored to the validation ROI and extended across the acquisition;
+only tiles that fit completely inside the image are processed. Identification
+settings from the validated run are frozen for every tile, accepted origamis
+are aggregated, and one combined docking-site overlay/statistical analysis is
+produced. Processing is sequential by tile to bound image-working memory, while
+source points are spatially indexed once for efficient lookup. If the selected
+source uses linked events, linking must first be run with `Whole image`.
 
 The four workflow panels remain in one compact row. Every panel has its own
 vertical scrollbar, including mouse-wheel/trackpad scrolling while the pointer
