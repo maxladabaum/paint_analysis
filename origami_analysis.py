@@ -3,11 +3,14 @@
 from __future__ import annotations
 
 import math
+from functools import lru_cache
 from dataclasses import dataclass
 from typing import Callable
 
 import numpy as np
-from scipy.ndimage import gaussian_filter, map_coordinates, rotate
+from scipy.ndimage import gaussian_filter, map_coordinates, rotate, shift as ndimage_shift
+from scipy.optimize import nnls
+from scipy.signal import fftconvolve
 from scipy.spatial import cKDTree
 
 
@@ -31,6 +34,8 @@ class OrigamiAnalysisResult:
     g5m_min_locs: int
     g5m_max_rounds_without_best_bic: int
     site_match_radius_nm: float
+    direct_min_site_localizations: int
+    direct_min_site_evidence: float
     rejected_candidate_count: int
     symmetrized_180: bool
     clustering_method: str = "Picasso G5M"
@@ -50,16 +55,27 @@ class OrigamiPickResult:
     rectangle_corners_nm: np.ndarray
     rectangle_angles_deg: np.ndarray
     rectangle_confidence: np.ndarray
+    site_gap_contrast: np.ndarray
+    on_site_fraction: np.ndarray
+    site_mask_radius_nm: float
+    supported_site_count: np.ndarray
+    supported_row_count: np.ndarray
+    supported_column_count: np.ndarray
+    site_spacing_rms_nm: np.ndarray
+    site_spacing_max_error_nm: np.ndarray
+    grid_vs_blob_delta_bic: np.ndarray
     rectangle_matched_site_count: np.ndarray
     rectangle_fit_rms_nm: np.ndarray
     rectangle_width_nm: float
     rectangle_height_nm: float
     density_image: np.ndarray
     density_contrast: np.ndarray
+    density_component_labels: np.ndarray
     density_extent_nm: tuple[float, float, float, float]
     density_threshold: float
     alignment_pixel_nm: float
     alignment_reference_image: np.ndarray
+    alignment_candidate_images: np.ndarray
 
     @property
     def accepted_regions(self) -> list[np.ndarray]:
@@ -551,12 +567,13 @@ def _pick_origami_regions(
     bin_size_nm: float,
     connect_distance_nm: float,
     density_threshold: float,
-) -> tuple[list[np.ndarray], np.ndarray, np.ndarray, tuple[float, float, float, float]]:
+) -> tuple[list[np.ndarray], np.ndarray, np.ndarray, tuple[float, float, float, float], np.ndarray]:
     """Connect only dense bins, then recover original points near each object."""
     density, contrast, extent, x_edges, y_edges = density_map_for_origami_picking(points_nm, bin_size_nm)
+    component_labels = np.full(contrast.shape, -1, dtype=np.int32)
     active_indices = np.argwhere(contrast >= density_threshold)
     if len(active_indices) == 0:
-        return [], density, contrast, extent
+        return [], density, contrast, extent, component_labels
     cell_centers = np.column_stack(
         [
             x_edges[active_indices[:, 0]] + bin_size_nm / 2.0,
@@ -565,7 +582,11 @@ def _pick_origami_regions(
     )
     if len(cell_centers) == 1:
         distances = np.linalg.norm(points_nm - cell_centers[0], axis=1)
-        return [points_nm[distances <= connect_distance_nm]], density, contrast, extent
+        region = points_nm[distances <= connect_distance_nm]
+        if len(region):
+            component_labels[tuple(active_indices[0])] = 0
+            return [region], density, contrast, extent, component_labels
+        return [], density, contrast, extent, component_labels
 
     pairs = cKDTree(cell_centers).query_pairs(connect_distance_nm, output_type="ndarray")
     parents = np.arange(len(cell_centers), dtype=np.int64)
@@ -602,7 +623,11 @@ def _pick_origami_regions(
     sorted_components = point_components[order]
     boundaries = np.flatnonzero(np.diff(sorted_components)) + 1
     regions = [region for region in np.split(assigned_points[order], boundaries) if len(region)]
-    return regions, density, contrast, extent
+    present_components = np.unique(sorted_components)
+    for display_label, component in enumerate(present_components):
+        member_bins = active_indices[cell_components == component]
+        component_labels[member_bins[:, 0], member_bins[:, 1]] = display_label
+    return regions, density, contrast, extent, component_labels
 
 
 def _fit_grid_rectangle(
@@ -741,6 +766,352 @@ def _render_candidate_image(
     return image / norm if norm > 0 else image
 
 
+def site_gap_contrast_for_regions(
+    aligned_regions: list[np.ndarray],
+    grid_points_nm: np.ndarray,
+    *,
+    rectangle_width_nm: float,
+    rectangle_height_nm: float,
+    site_radius_nm: float,
+) -> tuple[np.ndarray, np.ndarray, float]:
+    """Measure expected-site enrichment relative to explicit interior negative space."""
+    if site_radius_nm <= 0:
+        raise ValueError("Site-mask radius must be greater than zero.")
+    grid = np.asarray(grid_points_nm, dtype=float)
+    if grid.ndim != 2 or grid.shape[1] != 2 or not len(grid):
+        raise ValueError("Site-gap scoring requires at least one 2D template point.")
+
+    def design_bounds(values: np.ndarray, fallback_span: float) -> tuple[float, float]:
+        unique = np.unique(np.asarray(values, dtype=float))
+        if len(unique) > 1:
+            step = float(np.median(np.diff(unique)))
+            return float(unique[0] - step / 2.0), float(unique[-1] + step / 2.0)
+        return float(unique[0] - fallback_span / 2.0), float(unique[0] + fallback_span / 2.0)
+
+    x_lower, x_upper = design_bounds(grid[:, 0], rectangle_width_nm)
+    y_lower, y_upper = design_bounds(grid[:, 1], rectangle_height_nm)
+    sample_count = 256
+    sample_x = np.linspace(x_lower, x_upper, sample_count)
+    sample_y = np.linspace(y_lower, y_upper, sample_count)
+    sample_xx, sample_yy = np.meshgrid(sample_x, sample_y)
+    sample_points = np.column_stack((sample_xx.ravel(), sample_yy.ravel()))
+    sample_distances, _sample_sites = cKDTree(grid).query(sample_points, k=1)
+    site_area_fraction = float(np.mean(sample_distances <= site_radius_nm))
+    site_area_fraction = float(np.clip(site_area_fraction, 1e-6, 1.0 - 1e-6))
+
+    contrasts = np.zeros(len(aligned_regions), dtype=float)
+    on_site_fractions = np.zeros(len(aligned_regions), dtype=float)
+    grid_tree = cKDTree(grid)
+    for index, region in enumerate(aligned_regions):
+        points = np.asarray(region, dtype=float)
+        if not len(points):
+            continue
+        distances, _sites = grid_tree.query(points, k=1)
+        on_site_fraction = float(np.mean(distances <= site_radius_nm))
+        on_density = on_site_fraction / site_area_fraction
+        gap_density = (1.0 - on_site_fraction) / (1.0 - site_area_fraction)
+        denominator = on_density + gap_density
+        contrasts[index] = (on_density - gap_density) / denominator if denominator > 0 else 0.0
+        on_site_fractions[index] = on_site_fraction
+    return contrasts, on_site_fractions, site_area_fraction
+
+
+def sparse_site_evidence(
+    aligned_region: np.ndarray,
+    grid_points_nm: np.ndarray,
+    *,
+    site_radius_nm: float,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Return per-site counts and local density-peak prominence.
+
+    Each expected site seeds a bounded peak search on one shared Gaussian-
+    smoothed localization-density image.
+    Prominence is the fractional drop from that local maximum to the high end
+    of the surrounding boundary density.  A dim but isolated peak can therefore
+    score highly, while a shoulder or arbitrary location inside a broad blob
+    scores poorly.  The separate localization-count floor protects against
+    declaring one-point fluctuations to be occupied sites.
+    """
+    points = np.asarray(aligned_region, dtype=float)
+    grid = np.asarray(grid_points_nm, dtype=float)
+    if site_radius_nm <= 0:
+        raise ValueError("Site-mask radius must be greater than zero.")
+    if not len(points):
+        return np.zeros(len(grid), dtype=int), np.zeros(len(grid), dtype=float)
+    distances = np.linalg.norm(points[:, None, :] - grid[None, :, :], axis=2)
+    nearest_sites = np.argmin(distances, axis=1)
+    nearest_distances = distances[np.arange(len(points)), nearest_sites]
+    assigned_sites = nearest_sites[nearest_distances <= site_radius_nm]
+    on_counts = np.bincount(assigned_sites, minlength=len(grid)).astype(int)
+    if len(grid) > 1:
+        nearest_spacing = cKDTree(grid).query(grid, k=2)[0][:, 1]
+        typical_spacing = float(np.median(nearest_spacing))
+    else:
+        typical_spacing = max(2.0 * site_radius_nm, 1.0)
+        nearest_spacing = np.full(len(grid), typical_spacing, dtype=float)
+    bandwidth_nm = float(np.clip(0.15 * typical_spacing, 1.5, 3.5))
+    boundary_angles = 2.0 * math.pi * np.arange(32, dtype=float) / 32.0
+    prominence = np.zeros(len(grid), dtype=float)
+    render_margin_nm = max(typical_spacing, site_radius_nm + 3.0 * bandwidth_nm)
+    x_min = float(np.min(grid[:, 0]) - render_margin_nm)
+    x_max = float(np.max(grid[:, 0]) + render_margin_nm)
+    y_min = float(np.min(grid[:, 1]) - render_margin_nm)
+    y_max = float(np.max(grid[:, 1]) + render_margin_nm)
+    requested_pixel_nm = min(1.0, bandwidth_nm / 2.0)
+    x_bins = max(16, int(np.ceil((x_max - x_min) / requested_pixel_nm)))
+    y_bins = max(16, int(np.ceil((y_max - y_min) / requested_pixel_nm)))
+    x_edges = np.linspace(x_min, x_max, x_bins + 1)
+    y_edges = np.linspace(y_min, y_max, y_bins + 1)
+    effective_x_nm = float((x_max - x_min) / x_bins)
+    effective_y_nm = float((y_max - y_min) / y_bins)
+    x_centers = 0.5 * (x_edges[:-1] + x_edges[1:])
+    y_centers = 0.5 * (y_edges[:-1] + y_edges[1:])
+    density, _x_edges, _y_edges = np.histogram2d(
+        points[:, 0],
+        points[:, 1],
+        bins=(x_edges, y_edges),
+    )
+    density = gaussian_filter(
+        density.T,
+        sigma=(bandwidth_nm / effective_y_nm, bandwidth_nm / effective_x_nm),
+        mode="constant",
+    )
+
+    for site_index, site in enumerate(grid):
+        if on_counts[site_index] == 0:
+            continue
+        search_radius = min(site_radius_nm, 0.40 * float(nearest_spacing[site_index]))
+        x_indices = np.flatnonzero(np.abs(x_centers - site[0]) <= search_radius)
+        y_indices = np.flatnonzero(np.abs(y_centers - site[1]) <= search_radius)
+        if not len(x_indices) or not len(y_indices):
+            continue
+        local_density = density[np.ix_(y_indices, x_indices)].copy()
+        local_xx, local_yy = np.meshgrid(x_centers[x_indices], y_centers[y_indices])
+        inside_search = (local_xx - site[0]) ** 2 + (local_yy - site[1]) ** 2 <= search_radius**2
+        local_density[~inside_search] = -float("inf")
+        peak_row, peak_column = np.unravel_index(np.argmax(local_density), local_density.shape)
+        peak = np.asarray(
+            (x_centers[x_indices[peak_column]], y_centers[y_indices[peak_row]]),
+            dtype=float,
+        )
+        peak_density = float(local_density[peak_row, peak_column])
+        boundary_radius = min(
+            0.48 * float(nearest_spacing[site_index]),
+            max(site_radius_nm, 2.5 * bandwidth_nm),
+        )
+        boundary = peak + boundary_radius * np.column_stack(
+            (np.cos(boundary_angles), np.sin(boundary_angles))
+        )
+        boundary_rows = (boundary[:, 1] - y_min) / effective_y_nm - 0.5
+        boundary_columns = (boundary[:, 0] - x_min) / effective_x_nm - 0.5
+        boundary_density = map_coordinates(
+            density,
+            (boundary_rows, boundary_columns),
+            order=1,
+            mode="constant",
+            cval=0.0,
+        )
+        saddle_density = float(np.percentile(boundary_density, 90.0))
+        if peak_density > 1e-12:
+            prominence[site_index] = np.clip(
+                (peak_density - saddle_density) / peak_density,
+                0.0,
+                1.0,
+            )
+    return on_counts, prominence
+
+
+def supported_grid_site_mask(
+    aligned_region: np.ndarray,
+    grid_points_nm: np.ndarray,
+    *,
+    site_radius_nm: float,
+    min_site_localizations: int,
+    min_site_evidence: float,
+) -> np.ndarray:
+    """Return which theoretical grid sites have sufficient localized evidence."""
+    counts, evidence = sparse_site_evidence(
+        aligned_region,
+        grid_points_nm,
+        site_radius_nm=site_radius_nm,
+    )
+    return (counts >= int(min_site_localizations)) & (evidence >= float(min_site_evidence))
+
+
+def supported_site_spacing_errors(
+    aligned_region: np.ndarray,
+    grid_points_nm: np.ndarray,
+    supported_sites: np.ndarray,
+    *,
+    site_radius_nm: float,
+) -> tuple[float, float]:
+    """Return RMS and maximum pairwise spacing errors for supported site centroids."""
+    centroids = supported_site_centroids(
+        aligned_region,
+        grid_points_nm,
+        supported_sites,
+        site_radius_nm=site_radius_nm,
+    )
+    retained_indices = np.flatnonzero(np.all(np.isfinite(centroids), axis=1))
+    if len(retained_indices) < 2:
+        return float("inf"), float("inf")
+    observed = centroids[retained_indices]
+    expected = np.asarray(grid_points_nm, dtype=float)[retained_indices]
+    pair_rows, pair_columns = np.triu_indices(len(observed), k=1)
+    observed_spacing = np.linalg.norm(observed[pair_rows] - observed[pair_columns], axis=1)
+    expected_spacing = np.linalg.norm(expected[pair_rows] - expected[pair_columns], axis=1)
+    errors = np.abs(observed_spacing - expected_spacing)
+    return float(np.sqrt(np.mean(np.square(errors)))), float(np.max(errors))
+
+
+def supported_site_centroids(
+    aligned_region: np.ndarray,
+    grid_points_nm: np.ndarray,
+    supported_sites: np.ndarray,
+    *,
+    site_radius_nm: float,
+) -> np.ndarray:
+    """Return measured centroid for each supported grid assignment; other rows are NaN."""
+    points = np.asarray(aligned_region, dtype=float)
+    grid = np.asarray(grid_points_nm, dtype=float)
+    supported = np.asarray(supported_sites, dtype=bool)
+    if supported.shape != (len(grid),):
+        raise ValueError("Supported-site mask must have one value per grid site.")
+    centroids = np.full((len(grid), 2), np.nan, dtype=float)
+    supported_indices = np.flatnonzero(supported)
+    if not len(supported_indices) or not len(points):
+        return centroids
+    distances, nearest_sites = cKDTree(grid).query(points, k=1)
+    for site_index in supported_indices:
+        assigned = points[(nearest_sites == site_index) & (distances <= site_radius_nm)]
+        if not len(assigned):
+            continue
+        centroids[site_index] = np.mean(assigned, axis=0)
+    return centroids
+
+
+@lru_cache(maxsize=32)
+def _grid_blob_model_basis(
+    rectangle_width_nm: float,
+    rectangle_height_nm: float,
+    pixel_nm: float,
+    psf_sigma_nm: float,
+    grid_coordinates: tuple[float, ...],
+) -> tuple[int, int, np.ndarray, np.ndarray, np.ndarray]:
+    """Cache the fixed grid-model design shared by every candidate in a run."""
+    x_bins = max(16, int(np.ceil(rectangle_width_nm / pixel_nm)))
+    y_bins = max(16, int(np.ceil(rectangle_height_nm / pixel_nm)))
+    x_edges = np.linspace(-rectangle_width_nm / 2.0, rectangle_width_nm / 2.0, x_bins + 1)
+    y_edges = np.linspace(-rectangle_height_nm / 2.0, rectangle_height_nm / 2.0, y_bins + 1)
+    x_centers = 0.5 * (x_edges[:-1] + x_edges[1:])
+    y_centers = 0.5 * (y_edges[:-1] + y_edges[1:])
+    xx, yy = np.meshgrid(x_centers, y_centers)
+    grid = np.asarray(grid_coordinates, dtype=float).reshape(-1, 2)
+    grid_columns = [
+        np.exp(-0.5 * ((xx - site[0]) ** 2 + (yy - site[1]) ** 2) / psf_sigma_nm**2).ravel()
+        for site in grid
+    ]
+    grid_design = np.column_stack([*grid_columns, np.ones(xx.size)])
+    return x_bins, y_bins, xx, yy, grid_design
+
+
+def grid_vs_blob_delta_bic(
+    aligned_region: np.ndarray,
+    grid_points_nm: np.ndarray,
+    *,
+    rectangle_width_nm: float,
+    rectangle_height_nm: float,
+    pixel_nm: float,
+) -> float:
+    """Positive values favor an adaptive-width sparse grid over one broad blob."""
+    points = np.asarray(aligned_region, dtype=float)
+    grid = np.asarray(grid_points_nm, dtype=float)
+    if not len(points):
+        return -float("inf")
+    if pixel_nm <= 0:
+        raise ValueError("Grid-versus-blob scoring pixel must be positive.")
+    # Model selection uses one stable physical sampling grid.  It must not
+    # change merely because the user requests a different alignment thumbnail.
+    pixel_nm = 2.0
+    x_bins = max(16, int(np.ceil(rectangle_width_nm / pixel_nm)))
+    y_bins = max(16, int(np.ceil(rectangle_height_nm / pixel_nm)))
+    image, _x_edges, _y_edges = np.histogram2d(
+        points[:, 0],
+        points[:, 1],
+        bins=(x_bins, y_bins),
+        range=(
+            (-rectangle_width_nm / 2.0, rectangle_width_nm / 2.0),
+            (-rectangle_height_nm / 2.0, rectangle_height_nm / 2.0),
+        ),
+    )
+    observation = image.T.ravel().astype(float)
+    if len(grid) > 1:
+        nearest_grid_spacing = float(np.median(cKDTree(grid).query(grid, k=2)[0][:, 1]))
+    else:
+        nearest_grid_spacing = max(rectangle_width_nm, rectangle_height_nm)
+    minimum_sigma = max(1.5, 0.75 * pixel_nm)
+    maximum_sigma = max(minimum_sigma, min(8.0, 0.40 * nearest_grid_spacing))
+    candidate_sigmas = np.unique(
+        np.concatenate(
+            (
+                np.geomspace(minimum_sigma, maximum_sigma, 7),
+                np.asarray([max(2.0, pixel_nm)]),
+            )
+        )
+    )
+    correlation_sigma = max(1.5, pixel_nm)
+    footprint_area = max(float(rectangle_width_nm * rectangle_height_nm), pixel_nm**2)
+    independent_resolution_elements = footprint_area / (math.pi * correlation_sigma**2)
+    effective_sample_count = max(
+        16.0,
+        min(float(observation.size), float(len(points)), independent_resolution_elements),
+    )
+    mean_square_denominator = float(observation.size)
+    best_grid_bic = float("inf")
+    xx = yy = None
+    for psf_sigma in candidate_sigmas:
+        _x_bins, _y_bins, xx, yy, grid_design = _grid_blob_model_basis(
+            float(rectangle_width_nm),
+            float(rectangle_height_nm),
+            pixel_nm,
+            float(psf_sigma),
+            tuple(float(value) for value in grid.ravel()),
+        )
+        grid_coefficients, _grid_residual = nnls(grid_design, observation)
+        grid_fit = grid_design @ grid_coefficients
+        grid_rss = max(float(np.sum(np.square(observation - grid_fit))), 1e-12)
+        # Active amplitudes plus background and one fitted shared-width parameter.
+        grid_parameters = max(2, int(np.count_nonzero(grid_coefficients[:-1] > 1e-8)) + 2)
+        grid_bic = effective_sample_count * math.log(grid_rss / mean_square_denominator) + (
+            grid_parameters * math.log(effective_sample_count)
+        )
+        best_grid_bic = min(best_grid_bic, grid_bic)
+
+    assert xx is not None and yy is not None
+    psf_sigma = max(2.0, pixel_nm)
+
+    center = np.mean(points, axis=0)
+    covariance = np.cov(points.T) if len(points) > 1 else np.eye(2) * psf_sigma**2
+    covariance = np.asarray(covariance, dtype=float) + np.eye(2) * psf_sigma**2
+    try:
+        inverse_covariance = np.linalg.inv(covariance)
+    except np.linalg.LinAlgError:
+        inverse_covariance = np.linalg.pinv(covariance)
+    offsets = np.stack((xx - center[0], yy - center[1]), axis=-1)
+    exponent = np.einsum("...i,ij,...j->...", offsets, inverse_covariance, offsets)
+    blob = np.exp(-0.5 * exponent).ravel()
+    blob_design = np.column_stack((blob, np.ones(observation.size)))
+    blob_coefficients, _blob_residual = nnls(blob_design, observation)
+    blob_fit = blob_design @ blob_coefficients
+    blob_rss = max(float(np.sum(np.square(observation - blob_fit))), 1e-12)
+
+    # Mean and covariance were estimated from the points in addition to amplitude/background.
+    blob_bic = effective_sample_count * math.log(blob_rss / mean_square_denominator) + (
+        7 * math.log(effective_sample_count)
+    )
+    return float(blob_bic - best_grid_bic)
+
+
 def _polar_image(image: np.ndarray, angle_count: int = 180) -> np.ndarray:
     """Sample a square localization image in polar coordinates for fast rotation search."""
     radius_count = max(12, image.shape[0] // 2 - 2)
@@ -755,39 +1126,191 @@ def _polar_image(image: np.ndarray, angle_count: int = 180) -> np.ndarray:
     return polar
 
 
-def _rotation_from_polar(image: np.ndarray, reference_polar_fft: np.ndarray) -> float:
+def _rotation_candidates_from_polar(
+    image: np.ndarray,
+    reference_polar_fft: np.ndarray,
+    *,
+    maximum_candidates: int = 4,
+    minimum_separation_deg: float = 20.0,
+) -> np.ndarray:
+    """Return separated angular-correlation peaks for full-pose scoring."""
+    if maximum_candidates < 1:
+        raise ValueError("At least one rotation candidate is required.")
     polar_fft = np.fft.rfft(_polar_image(image), axis=0)
     correlation = np.fft.irfft(
         np.sum(polar_fft * np.conj(reference_polar_fft), axis=1),
         n=180,
     )
-    peak = int(np.argmax(correlation))
-    left = float(correlation[(peak - 1) % len(correlation)])
-    middle = float(correlation[peak])
-    right = float(correlation[(peak + 1) % len(correlation)])
-    denominator = left - 2.0 * middle + right
-    subpixel = 0.5 * (left - right) / denominator if abs(denominator) > 1e-12 else 0.0
-    refined_peak = peak + float(np.clip(subpixel, -0.5, 0.5))
-    if refined_peak > 90.0:
-        refined_peak -= 180.0
-    return refined_peak * 2.0
+    local_maxima = np.flatnonzero(
+        (correlation >= np.roll(correlation, 1)) & (correlation >= np.roll(correlation, -1))
+    )
+    ranked = local_maxima[np.argsort(correlation[local_maxima])[::-1]]
+    if not len(ranked):
+        ranked = np.asarray([int(np.argmax(correlation))], dtype=int)
+    minimum_separation_bins = max(1, int(np.ceil(float(minimum_separation_deg) / 2.0)))
+    selected: list[int] = []
+    for peak_value in ranked:
+        peak = int(peak_value)
+        if any(
+            min((peak - other) % len(correlation), (other - peak) % len(correlation))
+            < minimum_separation_bins
+            for other in selected
+        ):
+            continue
+        selected.append(peak)
+        if len(selected) >= maximum_candidates:
+            break
+
+    angles: list[float] = []
+    for peak in selected:
+        left = float(correlation[(peak - 1) % len(correlation)])
+        middle = float(correlation[peak])
+        right = float(correlation[(peak + 1) % len(correlation)])
+        denominator = left - 2.0 * middle + right
+        subpixel = 0.5 * (left - right) / denominator if abs(denominator) > 1e-12 else 0.0
+        refined_peak = peak + float(np.clip(subpixel, -0.5, 0.5))
+        if refined_peak > 90.0:
+            refined_peak -= 180.0
+        angles.append(refined_peak * 2.0)
+    return np.asarray(angles, dtype=float)
 
 
-def _translation_to_reference(image: np.ndarray, reference_fft: np.ndarray) -> tuple[int, int]:
-    cross_power = np.fft.fft2(image) * np.conj(reference_fft)
-    correlation = np.fft.ifft2(cross_power).real
+def _rotation_from_polar(image: np.ndarray, reference_polar_fft: np.ndarray) -> float:
+    """Return the strongest polar-correlation angle for compatibility."""
+    return float(_rotation_candidates_from_polar(image, reference_polar_fft, maximum_candidates=1)[0])
+
+
+def _principal_axis_angle(image: np.ndarray) -> tuple[float, float]:
+    """Return the rendered signal's principal-axis angle and anisotropy ratio."""
+    weights = np.asarray(image, dtype=float) - float(np.min(image))
+    weight_sum = float(np.sum(weights))
+    if weight_sum <= 1e-12:
+        return 0.0, 1.0
+    yy, xx = np.indices(weights.shape, dtype=float)
+    xx -= (weights.shape[1] - 1.0) / 2.0
+    yy -= (weights.shape[0] - 1.0) / 2.0
+    center_x = float(np.sum(weights * xx) / weight_sum)
+    center_y = float(np.sum(weights * yy) / weight_sum)
+    centered_x = xx - center_x
+    centered_y = yy - center_y
+    covariance = np.asarray(
+        [
+            [np.sum(weights * centered_x * centered_x), np.sum(weights * centered_x * centered_y)],
+            [np.sum(weights * centered_x * centered_y), np.sum(weights * centered_y * centered_y)],
+        ],
+        dtype=float,
+    ) / weight_sum
+    eigenvalues, eigenvectors = np.linalg.eigh(covariance)
+    principal = eigenvectors[:, int(np.argmax(eigenvalues))]
+    smallest = max(float(np.min(eigenvalues)), 1e-12)
+    anisotropy = float(np.max(eigenvalues)) / smallest
+    return float(np.rad2deg(np.arctan2(principal[1], principal[0]))), anisotropy
+
+
+def _full_pose_rotation_candidates(
+    image: np.ndarray,
+    template: np.ndarray,
+    template_polar_fft: np.ndarray,
+) -> np.ndarray:
+    """Combine polar peaks with a broad principal-axis neighborhood."""
+    polar_angles = _rotation_candidates_from_polar(image, template_polar_fft)
+    image_axis, image_anisotropy = _principal_axis_angle(image)
+    template_axis, template_anisotropy = _principal_axis_angle(template)
+    candidates = list(float(value) for value in polar_angles)
+    if image_anisotropy >= 1.05 and template_anisotropy >= 1.05:
+        principal_rotation = image_axis - template_axis
+        candidates.extend(principal_rotation + offset for offset in np.arange(-20.0, 20.1, 5.0))
+
+    unique: list[float] = []
+    for angle in candidates:
+        if any(abs(((angle - existing + 90.0) % 180.0) - 90.0) < 0.25 for existing in unique):
+            continue
+        unique.append(float(angle))
+    return np.asarray(unique, dtype=float)
+
+
+def _translation_to_reference(image: np.ndarray, reference: np.ndarray) -> tuple[float, float]:
+    """Find a bounded, subpixel linear-correlation shift without wraparound."""
+    correlation = fftconvolve(image, reference[::-1, ::-1], mode="full")
+    zero_y = reference.shape[0] - 1
+    zero_x = reference.shape[1] - 1
     max_shift = max(2, image.shape[0] // 8)
-    allowed = np.zeros(image.shape, dtype=bool)
-    allowed[: max_shift + 1, : max_shift + 1] = True
-    allowed[: max_shift + 1, -max_shift:] = True
-    allowed[-max_shift:, : max_shift + 1] = True
-    allowed[-max_shift:, -max_shift:] = True
-    peak = np.unravel_index(int(np.argmax(np.where(allowed, correlation, -np.inf))), image.shape)
-    shifts = [int(value) for value in peak]
-    for axis in range(2):
-        if shifts[axis] > image.shape[axis] // 2:
-            shifts[axis] -= image.shape[axis]
-    return shifts[0], shifts[1]
+    y_slice = slice(max(0, zero_y - max_shift), min(correlation.shape[0], zero_y + max_shift + 1))
+    x_slice = slice(max(0, zero_x - max_shift), min(correlation.shape[1], zero_x + max_shift + 1))
+    search = correlation[y_slice, x_slice]
+    local_peak = np.unravel_index(int(np.argmax(search)), search.shape)
+    peak_y = int(local_peak[0] + y_slice.start)
+    peak_x = int(local_peak[1] + x_slice.start)
+
+    def subpixel_offset(before: float, middle: float, after: float) -> float:
+        denominator = before - 2.0 * middle + after
+        if abs(denominator) <= 1e-12:
+            return 0.0
+        return float(np.clip(0.5 * (before - after) / denominator, -0.5, 0.5))
+
+    offset_y = 0.0
+    offset_x = 0.0
+    if 0 < peak_y < correlation.shape[0] - 1:
+        offset_y = subpixel_offset(
+            float(correlation[peak_y - 1, peak_x]),
+            float(correlation[peak_y, peak_x]),
+            float(correlation[peak_y + 1, peak_x]),
+        )
+    if 0 < peak_x < correlation.shape[1] - 1:
+        offset_x = subpixel_offset(
+            float(correlation[peak_y, peak_x - 1]),
+            float(correlation[peak_y, peak_x]),
+            float(correlation[peak_y, peak_x + 1]),
+        )
+    return peak_y - zero_y + offset_y, peak_x - zero_x + offset_x
+
+
+def _score_complete_image_pose(
+    image: np.ndarray,
+    template: np.ndarray,
+    angle_deg: float,
+) -> tuple[float, float, float, np.ndarray]:
+    """Optimize translation and score one complete rotation/translation pose."""
+    rotated = rotate(image, angle_deg, reshape=False, order=1, mode="constant", prefilter=False)
+    shift_y, shift_x = _translation_to_reference(rotated, template)
+    aligned = ndimage_shift(
+        rotated,
+        shift=(-shift_y, -shift_x),
+        order=1,
+        mode="constant",
+        cval=0.0,
+        prefilter=False,
+    )
+    denominator = max(float(np.linalg.norm(aligned) * np.linalg.norm(template)), 1e-12)
+    score = float(np.clip(np.dot(aligned.ravel(), template.ravel()) / denominator, -1.0, 1.0))
+    return score, float(shift_x), float(shift_y), aligned
+
+
+def _sparse_pose_quality(
+    aligned_region: np.ndarray,
+    grid_points_nm: np.ndarray,
+    *,
+    site_radius_nm: float,
+    required_sites: int,
+    minimum_site_localizations: int,
+) -> float:
+    points = np.asarray(aligned_region, dtype=float)
+    grid = np.asarray(grid_points_nm, dtype=float)
+    if not len(points) or not len(grid):
+        return -1.0
+    distances, sites = cKDTree(grid).query(points, k=1)
+    counts = np.bincount(
+        sites[distances <= site_radius_nm], minlength=len(grid)
+    ).astype(float)
+    eligible = np.sort(counts[counts >= minimum_site_localizations])[::-1]
+    if required_sites <= 0:
+        return 0.0
+    selected = np.full(required_sites, -1.0, dtype=float)
+    retained = min(required_sites, len(eligible))
+    if retained:
+        reference = max(float(np.percentile(eligible, 75.0)), 1.0)
+        selected[:retained] = np.clip(eligible[:retained] / reference, 0.0, 1.0)
+    return float(np.mean(selected))
 
 
 def _align_regions_by_image_correlation(
@@ -798,56 +1321,39 @@ def _align_regions_by_image_correlation(
     requested_pixel_nm: float,
     iterations: int,
     template_points_nm: np.ndarray | None = None,
-    max_patch_pixels: int = 64,
+    max_patch_pixels: int = 128,
+    sparse_pose_site_count: int = 0,
+    sparse_site_radius_nm: float = 7.5,
+    sparse_min_site_localizations: int = 3,
     progress_callback: Callable[[float, str], None] | None = None,
+    aligned_image_output: list[np.ndarray] | None = None,
 ) -> tuple[list[np.ndarray], np.ndarray, np.ndarray, np.ndarray, np.ndarray, float, np.ndarray]:
-    """Classify and rigidly align candidate images to an iteratively refined template."""
+    """Independently classify and rigidly align candidates to the theoretical grid image."""
     if requested_pixel_nm <= 0:
         raise ValueError("Alignment pixel size must be greater than zero.")
     if iterations < 1:
-        raise ValueError("Template refinement iterations must be at least 1.")
+        raise ValueError("Theoretical-template alignment passes must be at least 1.")
     side_nm = float(np.hypot(rectangle_width_nm, rectangle_height_nm))
     pixel_nm = max(float(requested_pixel_nm), side_nm / max_patch_pixels)
     centers = np.asarray([np.median(region, axis=0) for region in regions], dtype=float)
-    images = np.asarray([
-        _render_candidate_image(region, center, side_nm, pixel_nm, max(pixel_nm, 1.0))
-        for region, center in zip(regions, centers)
-    ], dtype=np.float32)
+    rendered_images: list[np.ndarray] = []
+    render_progress_every = max(1, len(regions) // 25)
+    for index, (region, center) in enumerate(zip(regions, centers), start=1):
+        rendered_images.append(
+            _render_candidate_image(region, center, side_nm, pixel_nm, max(pixel_nm, 1.0))
+        )
+        if progress_callback and (index == len(regions) or index % render_progress_every == 0):
+            progress_callback(
+                15.0 + 5.0 * index / max(len(regions), 1),
+                f"Rendering alignment thumbnails: {index:,}/{len(regions):,} candidates...",
+            )
+    images = np.asarray(rendered_images, dtype=np.float32)
     if len(images) == 0:
         return [], centers, np.empty(0), np.empty((0, 2)), np.empty(0), pixel_nm, np.empty((0, 0))
 
-    contrast = np.asarray([np.percentile(image, 99) - np.percentile(image, 50) for image in images])
-    reference = images[int(np.argmax(contrast))].copy()
-    angles = np.zeros(len(images), dtype=float)
-    shifts = np.zeros((len(images), 2), dtype=float)
-    aligned_images = images.copy()
-    for iteration in range(iterations):
-        reference_polar_fft = np.fft.rfft(_polar_image(reference), axis=0)
-        reference_fft = np.fft.fft2(reference)
-        for index, image in enumerate(images):
-            angle = _rotation_from_polar(image, reference_polar_fft)
-            rotated = rotate(image, angle, reshape=False, order=1, mode="constant", prefilter=False)
-            shift_y, shift_x = _translation_to_reference(rotated, reference_fft)
-            aligned_images[index] = np.roll(rotated, (-shift_y, -shift_x), axis=(0, 1))
-            angles[index] = angle
-            shifts[index] = (shift_x, shift_y)
-        reference = np.median(aligned_images, axis=0)
-        reference -= np.mean(reference)
-        reference_norm = float(np.linalg.norm(reference))
-        if reference_norm > 0:
-            reference /= reference_norm
-        if progress_callback:
-            progress_callback(
-                25.0 + 55.0 * (iteration + 1) / iterations,
-                f"Image cross-correlation pass {iteration + 1}/{iterations}: {len(regions):,} candidates...",
-            )
-
-    correlations = np.asarray([
-        float(np.clip(np.dot(image.ravel(), reference.ravel()) / max(np.linalg.norm(image), 1e-12), -1.0, 1.0))
-        for image in aligned_images
-    ])
-    # Use the known rectangular aspect ratio only to create an absolute orientation
-    # target. Candidate-to-candidate alignment above remains independent of sites.
+    # Build one fixed reference from the configured physical design. Candidates
+    # are aligned and scored independently, so the result does not depend on
+    # how many other objects happen to be present in the ROI.
     if template_points_nm is None:
         template_x = np.linspace(-rectangle_width_nm * 0.3, rectangle_width_nm * 0.3, 4)
         template_y = np.linspace(-rectangle_height_nm * 0.25, rectangle_height_nm * 0.25, 3)
@@ -860,14 +1366,77 @@ def _align_regions_by_image_correlation(
         pixel_nm,
         max(pixel_nm, 1.5),
     )
-    canonical_image_angle_deg = _rotation_from_polar(reference, np.fft.rfft(_polar_image(template), axis=0))
-    canonical_angle_deg = -canonical_image_angle_deg
-    canonical_angle = np.deg2rad(canonical_angle_deg)
-    canonical_rotation = np.asarray([
-        [np.cos(canonical_angle), -np.sin(canonical_angle)],
-        [np.sin(canonical_angle), np.cos(canonical_angle)],
-    ])
-    reference = rotate(reference, -canonical_angle_deg, reshape=False, order=1, mode="constant", prefilter=False)
+    template_polar_fft = np.fft.rfft(_polar_image(template), axis=0)
+    angles = np.zeros(len(images), dtype=float)
+    shifts = np.zeros((len(images), 2), dtype=float)
+    aligned_images = images.copy()
+    correlations = np.full(len(images), -1.0, dtype=float)
+    total_alignment_work = iterations * len(images)
+    alignment_progress_every = max(1, total_alignment_work // 40)
+    for iteration in range(iterations):
+        for index, image in enumerate(images):
+            if iteration == 0:
+                trial_angles = _full_pose_rotation_candidates(image, template, template_polar_fft)
+            else:
+                refinement_step = 2.0 / (2.0 ** (iteration - 1))
+                trial_angles = angles[index] + refinement_step * np.asarray([-1.0, -0.5, 0.0, 0.5, 1.0])
+            best_score = -float("inf")
+            best_pose_quality = -float("inf")
+            best_shift_x = 0.0
+            best_shift_y = 0.0
+            best_angle = float(angles[index])
+            best_image = aligned_images[index]
+            for trial_angle in trial_angles:
+                score, shift_x, shift_y, candidate_image = _score_complete_image_pose(
+                    image,
+                    template,
+                    float(trial_angle),
+                )
+                pose_quality = score
+                if sparse_pose_site_count > 0:
+                    raw_angle = np.deg2rad(-float(trial_angle))
+                    raw_rotation = np.asarray(
+                        [[np.cos(raw_angle), -np.sin(raw_angle)], [np.sin(raw_angle), np.cos(raw_angle)]]
+                    )
+                    trial_points = (regions[index] - centers[index]) @ raw_rotation.T
+                    trial_points -= np.asarray([shift_x, shift_y]) * pixel_nm
+                    inside = (
+                        (np.abs(trial_points[:, 0]) <= rectangle_width_nm / 2.0)
+                        & (np.abs(trial_points[:, 1]) <= rectangle_height_nm / 2.0)
+                    )
+                    pose_quality = _sparse_pose_quality(
+                        trial_points[inside],
+                        np.asarray(template_points_nm, dtype=float),
+                        site_radius_nm=sparse_site_radius_nm,
+                        required_sites=sparse_pose_site_count,
+                        minimum_site_localizations=sparse_min_site_localizations,
+                    )
+                if pose_quality > best_pose_quality or (
+                    abs(pose_quality - best_pose_quality) <= 1e-12 and score > best_score
+                ):
+                    best_pose_quality = pose_quality
+                    best_score = score
+                    best_shift_x = shift_x
+                    best_shift_y = shift_y
+                    best_angle = float(trial_angle)
+                    best_image = candidate_image
+            angles[index] = best_angle
+            shifts[index] = (best_shift_x, best_shift_y)
+            aligned_images[index] = best_image
+            correlations[index] = best_score
+            completed_alignment_work = iteration * len(images) + index + 1
+            if progress_callback and (
+                completed_alignment_work == total_alignment_work
+                or completed_alignment_work % alignment_progress_every == 0
+            ):
+                progress_callback(
+                    20.0 + 52.0 * completed_alignment_work / total_alignment_work,
+                    f"Theoretical-template alignment pass {iteration + 1}/{iterations}: "
+                    f"candidate {index + 1:,}/{len(images):,}...",
+                )
+
+    if aligned_image_output is not None:
+        aligned_image_output.extend(image.copy() for image in aligned_images)
     aligned_regions: list[np.ndarray] = []
     corners: list[np.ndarray] = []
     local_corners = np.asarray([
@@ -876,16 +1445,24 @@ def _align_regions_by_image_correlation(
         [rectangle_width_nm / 2.0, rectangle_height_nm / 2.0],
         [-rectangle_width_nm / 2.0, rectangle_height_nm / 2.0],
     ])
-    for region, center, angle_deg, (shift_x, shift_y) in zip(regions, centers, angles, shifts):
+    transform_progress_every = max(1, len(regions) // 20)
+    for index, (region, center, angle_deg, (shift_x, shift_y)) in enumerate(
+        zip(regions, centers, angles, shifts), start=1
+    ):
         raw_angle = np.deg2rad(-angle_deg)
         raw_rotation = np.asarray([[np.cos(raw_angle), -np.sin(raw_angle)], [np.sin(raw_angle), np.cos(raw_angle)]])
         shift_nm = np.asarray([shift_x, shift_y]) * pixel_nm
-        aligned = ((region - center) @ raw_rotation.T - shift_nm) @ canonical_rotation.T
+        aligned = (region - center) @ raw_rotation.T - shift_nm
         inside = (np.abs(aligned[:, 0]) <= rectangle_width_nm / 2.0) & (np.abs(aligned[:, 1]) <= rectangle_height_nm / 2.0)
         aligned_regions.append(aligned[inside])
-        corners.append((local_corners @ canonical_rotation + shift_nm) @ raw_rotation + center)
-    reported_angles = np.mod(angles - canonical_angle_deg, 360.0)
-    return aligned_regions, centers, np.asarray(corners), reported_angles, correlations, pixel_nm, reference
+        corners.append((local_corners + shift_nm) @ raw_rotation + center)
+        if progress_callback and (index == len(regions) or index % transform_progress_every == 0):
+            progress_callback(
+                72.0 + 3.0 * index / max(len(regions), 1),
+                f"Applying fitted poses: {index:,}/{len(regions):,} candidates...",
+            )
+    reported_angles = np.mod(angles, 360.0)
+    return aligned_regions, centers, np.asarray(corners), reported_angles, correlations, pixel_nm, template
 
 
 def identify_origami_regions(
@@ -907,8 +1484,17 @@ def identify_origami_regions(
     g5m_max_rounds_without_best_bic: int = 3,
     site_match_radius_nm: float = 7.5,
     min_rectangle_confidence: float = 0.0,
+    use_correlation_gate: bool = True,
+    site_mask_radius_nm: float = 7.5,
+    min_supported_sites: int = 0,
+    min_site_evidence: float = 0.25,
+    min_site_localizations: int = 3,
+    min_supported_rows: int = 0,
+    min_supported_columns: int = 0,
+    max_site_spacing_error_nm: float = float("inf"),
     alignment_pixel_nm: float = 1.0,
-    alignment_iterations: int = 2,
+    alignment_max_patch_pixels: int = 128,
+    alignment_iterations: int = 3,
     progress_callback: Callable[[float, str], None] | None = None,
 ) -> OrigamiPickResult:
     points_nm = np.asarray(points_nm, dtype=float)
@@ -925,10 +1511,20 @@ def identify_origami_regions(
         raise ValueError("Invalid candidate point limits.")
     if not 0.0 <= min_rectangle_confidence <= 1.0:
         raise ValueError("Minimum rectangle confidence must be between 0 and 1.")
+    if site_mask_radius_nm <= 0:
+        raise ValueError("Site-mask radius must be greater than zero.")
+    if min_supported_sites < 0 or min_supported_rows < 0 or min_supported_columns < 0 or min_site_localizations < 1:
+        raise ValueError("Sparse-grid support counts cannot be negative, and minimum localizations per site must be positive.")
+    if not 0.0 <= min_site_evidence <= 1.0:
+        raise ValueError("Minimum site prominence must be between 0 and 1.")
+    if max_site_spacing_error_nm <= 0:
+        raise ValueError("Maximum site-spacing error must be greater than zero.")
+    if alignment_max_patch_pixels < 16:
+        raise ValueError("Maximum alignment image size must be at least 16 pixels.")
 
     if progress_callback:
         progress_callback(2.0, "Building the spatial density map...")
-    regions, density, contrast, extent = _pick_origami_regions(
+    regions, density, contrast, extent, component_labels = _pick_origami_regions(
         points_nm, pick_bin_size_nm, connect_distance_nm, density_threshold
     )
     if progress_callback:
@@ -940,6 +1536,7 @@ def identify_origami_regions(
     rectangle_confidences: list[float] = []
     rectangle_matched_sites: list[int] = []
     rectangle_fit_rms: list[float] = []
+    aligned_candidate_images: list[np.ndarray] = []
     if rows is not None and columns is not None and spacing_x_nm is not None and spacing_y_nm is not None:
         if rectangle_margin_nm < 0:
             raise ValueError("Rectangle margin cannot be negative.")
@@ -952,9 +1549,14 @@ def identify_origami_regions(
                 rectangle_width_nm=rectangle_width_nm,
                 rectangle_height_nm=rectangle_height_nm,
                 requested_pixel_nm=alignment_pixel_nm,
+                max_patch_pixels=alignment_max_patch_pixels,
+                sparse_pose_site_count=min_supported_sites,
+                sparse_site_radius_nm=site_mask_radius_nm,
+                sparse_min_site_localizations=min_site_localizations,
                 iterations=alignment_iterations,
                 template_points_nm=grid,
                 progress_callback=progress_callback,
+                aligned_image_output=aligned_candidate_images,
             )
         )
         rectangle_corners = list(fitted_corners)
@@ -975,12 +1577,82 @@ def identify_origami_regions(
             rectangle_matched_sites.append(0)
             rectangle_fit_rms.append(0.0)
 
+    if rows is not None and columns is not None and spacing_x_nm is not None and spacing_y_nm is not None:
+        if progress_callback:
+            progress_callback(
+                76.0,
+                f"Measuring site-versus-gap density for {len(aligned_regions):,} candidates...",
+            )
+        site_gap_contrast, on_site_fraction, _site_area_fraction = site_gap_contrast_for_regions(
+            aligned_regions,
+            grid,
+            rectangle_width_nm=rectangle_width_nm,
+            rectangle_height_nm=rectangle_height_nm,
+            site_radius_nm=site_mask_radius_nm,
+        )
+    else:
+        site_gap_contrast = np.ones(len(aligned_regions), dtype=float)
+        on_site_fraction = np.ones(len(aligned_regions), dtype=float)
+    if progress_callback:
+        progress_callback(79.0, "Site-versus-gap density complete; evaluating individual candidates...")
+
+    supported_site_counts = np.zeros(len(aligned_regions), dtype=int)
+    supported_row_counts = np.zeros(len(aligned_regions), dtype=int)
+    supported_column_counts = np.zeros(len(aligned_regions), dtype=int)
+    site_spacing_rms = np.full(len(aligned_regions), float("inf"), dtype=float)
+    site_spacing_max_errors = np.full(len(aligned_regions), float("inf"), dtype=float)
+    grid_blob_delta_bic = np.full(len(aligned_regions), float("inf"), dtype=float)
+    if rows is not None and columns is not None and spacing_x_nm is not None and spacing_y_nm is not None:
+        candidate_progress_every = max(1, len(aligned_regions) // 40)
+        for index, region in enumerate(aligned_regions):
+            supported = supported_grid_site_mask(
+                region,
+                grid,
+                site_radius_nm=site_mask_radius_nm,
+                min_site_localizations=min_site_localizations,
+                min_site_evidence=min_site_evidence,
+            )
+            supported_indices = np.flatnonzero(supported)
+            supported_site_counts[index] = len(supported_indices)
+            if len(supported_indices):
+                supported_row_counts[index] = len(np.unique(supported_indices // columns))
+                supported_column_counts[index] = len(np.unique(supported_indices % columns))
+            site_spacing_rms[index], site_spacing_max_errors[index] = supported_site_spacing_errors(
+                region,
+                grid,
+                supported,
+                site_radius_nm=site_mask_radius_nm,
+            )
+            grid_blob_delta_bic[index] = grid_vs_blob_delta_bic(
+                region,
+                grid,
+                rectangle_width_nm=rectangle_width_nm,
+                rectangle_height_nm=rectangle_height_nm,
+                pixel_nm=effective_alignment_pixel,
+            )
+            completed_candidates = index + 1
+            if progress_callback and (
+                completed_candidates == len(aligned_regions)
+                or completed_candidates % candidate_progress_every == 0
+            ):
+                progress_callback(
+                    79.0 + 20.0 * completed_candidates / max(len(aligned_regions), 1),
+                    "Evaluating site prominence, spacing, and ΔBIC QC: "
+                    f"{completed_candidates:,}/{len(aligned_regions):,} candidates...",
+                )
+    elif progress_callback:
+        progress_callback(99.0, "Candidate measurements complete; applying acceptance limits...")
+
     point_counts = np.asarray([len(region) for region in aligned_regions], dtype=int)
     confidence_array = np.asarray(rectangle_confidences, dtype=float)
     accepted_mask = (
         (point_counts >= min_candidate_points)
         & (point_counts <= max_candidate_points)
-        & (confidence_array >= min_rectangle_confidence)
+        & ((confidence_array >= min_rectangle_confidence) if use_correlation_gate else True)
+        & (supported_site_counts >= min_supported_sites)
+        & (supported_row_counts >= min_supported_rows)
+        & (supported_column_counts >= min_supported_columns)
+        & (site_spacing_max_errors <= max_site_spacing_error_nm)
     )
     bounds = np.asarray(
         [
@@ -1003,19 +1675,33 @@ def identify_origami_regions(
         rectangle_corners_nm=np.asarray(rectangle_corners, dtype=float) if rectangle_corners else np.empty((0, 4, 2)),
         rectangle_angles_deg=np.asarray(rectangle_angles, dtype=float),
         rectangle_confidence=confidence_array,
+        site_gap_contrast=np.asarray(site_gap_contrast, dtype=float),
+        on_site_fraction=np.asarray(on_site_fraction, dtype=float),
+        site_mask_radius_nm=float(site_mask_radius_nm),
+        supported_site_count=supported_site_counts,
+        supported_row_count=supported_row_counts,
+        supported_column_count=supported_column_counts,
+        site_spacing_rms_nm=site_spacing_rms,
+        site_spacing_max_error_nm=site_spacing_max_errors,
+        grid_vs_blob_delta_bic=grid_blob_delta_bic,
         rectangle_matched_site_count=np.asarray(rectangle_matched_sites, dtype=int),
         rectangle_fit_rms_nm=np.asarray(rectangle_fit_rms, dtype=float),
         rectangle_width_nm=float(rectangle_width_nm),
         rectangle_height_nm=float(rectangle_height_nm),
         density_image=density,
         density_contrast=contrast,
+        density_component_labels=component_labels,
         density_extent_nm=extent,
         density_threshold=float(density_threshold),
         alignment_pixel_nm=float(effective_alignment_pixel),
         alignment_reference_image=reference,
+        alignment_candidate_images=np.asarray(aligned_candidate_images, dtype=np.float32),
     )
     if progress_callback:
-        progress_callback(100.0, f"Identification complete: {result.accepted_count}/{len(result.regions)} image-matched origamis accepted.")
+        progress_callback(
+            100.0,
+            f"Identification complete: {result.accepted_count}/{len(result.regions)} candidates passed point, site-prominence, grid-coverage, and spacing limits.",
+        )
     return result
 
 
@@ -1037,6 +1723,8 @@ def align_picked_origamis(
     allow_mirror: bool = False,
     initially_rejected_count: int = 0,
     use_g5m: bool = True,
+    direct_min_site_localizations: int = 1,
+    direct_min_site_evidence: float = 0.0,
     progress_callback: Callable[[str], None] | None = None,
 ) -> OrigamiAnalysisResult:
     if not picked_regions:
@@ -1047,6 +1735,8 @@ def align_picked_origamis(
         raise ValueError("G5M sigma bounds must be positive and ordered minimum to maximum.")
     if use_g5m and (g5m_min_locs < 1 or g5m_max_rounds_without_best_bic < 1):
         raise ValueError("G5M minimum localizations and BIC patience must be at least 1.")
+    if direct_min_site_localizations < 1 or not 0.0 <= direct_min_site_evidence <= 1.0:
+        raise ValueError("Direct assignment requires a positive site count and site prominence from 0 to 1.")
 
     grid = ideal_grid_points(rows, columns, spacing_x_nm, spacing_y_nm)
     if rectangle_corners_nm is not None and len(rectangle_corners_nm) != len(picked_regions):
@@ -1124,7 +1814,14 @@ def align_picked_origamis(
             )
         else:
             distances, nearest_sites = cKDTree(grid).query(aligned, k=1)
-            matched = distances <= site_radius_nm
+            supported_sites = supported_grid_site_mask(
+                aligned,
+                grid,
+                site_radius_nm=site_radius_nm,
+                min_site_localizations=direct_min_site_localizations,
+                min_site_evidence=direct_min_site_evidence,
+            )
+            matched = (distances <= site_radius_nm) & supported_sites[nearest_sites]
             cluster_sites = np.unique(nearest_sites[matched]).astype(int)
             cluster_labels = np.full(len(aligned), -1, dtype=int)
             cluster_centers_rows: list[np.ndarray] = []
@@ -1183,9 +1880,11 @@ def align_picked_origamis(
         g5m_min_locs=int(g5m_min_locs),
         g5m_max_rounds_without_best_bic=int(g5m_max_rounds_without_best_bic),
         site_match_radius_nm=float(site_radius_nm),
+        direct_min_site_localizations=int(direct_min_site_localizations),
+        direct_min_site_evidence=float(direct_min_site_evidence),
         rejected_candidate_count=rejected,
         symmetrized_180=True,
-        clustering_method="Picasso G5M" if use_g5m else "Direct nearest-grid assignment",
+        clustering_method="Picasso G5M" if use_g5m else "Supported-site direct assignment",
     )
 
 

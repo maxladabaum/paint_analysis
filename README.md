@@ -170,7 +170,7 @@ processing a large field.
 
 For fields too large to identify in one pass, select a representative ROI,
 enable `Use selected ROI`, load the source, and run `Identify Origami` until the
-accepted footprints look correct. `Analyze Whole Image as ROI Tiles` then uses
+accepted footprints look correct. `Analyze Whole Image as Tiles` then uses
 that validated ROI's width and height as both tile size and x/y step. The tile
 lattice is anchored to the validation ROI and extended across the acquisition;
 only tiles that fit completely inside the image are processed. Identification
@@ -180,9 +180,38 @@ produced. Processing is sequential by tile to bound image-working memory, while
 source points are spatially indexed once for efficient lookup. If the selected
 source uses linked events, linking must first be run with `Whole image`.
 
-The four workflow panels remain in one compact row. Every panel has its own
-vertical scrollbar, including mouse-wheel/trackpad scrolling while the pointer
-is over that panel, so settings never reduce the result plot area.
+To analyze a bounded sample instead, enter `Tiles to analyze` and click
+`Analyze N Distributed Tiles`. The app deterministically spreads up to N picks
+across the complete tile lattice using farthest-point spatial sampling, so the
+sample covers the acquisition rather than taking the first N tiles from one
+corner. If N is at least the number of available complete tiles, every tile is
+analyzed. Counts and occupancy statistics from this action describe only the
+selected tiles; they are not extrapolated to the unanalyzed portion of the
+image. `Analyze Whole Image as Tiles` remains available for an exhaustive
+run.
+
+Before either tiled analysis, click `Inspect Random ROI` repeatedly to spot-check
+other complete ROI-sized tiles. Each click chooses a previously unseen random
+tile, applies the frozen source filters and identification settings from the
+validated ROI, and displays its accepted and rejected candidate footprints with
+the optional theoretical-site overlay. Random inspection does not replace the
+validated ROI, alter its settings, or build an overlay; after every available
+tile has been visited, sampling begins a new randomized cycle.
+
+The Origami tab uses a plot-first workspace. Source, Identify, and Overlay are
+stages in one collapsible left sidebar with a single scrollbar; only
+the selected stage is shown. The current stage's primary action remains pinned
+to the bottom. Identify settings are visibly divided into numbered workflow
+groups: coarse candidate detection, template and footprint, rigid alignment,
+individual site detection, final acceptance filters, and QC/display controls
+that do not filter candidates. Overlay-stage G5M, rendering, and gallery
+controls remain in their own section. The
+app-wide rendering sidebar is hidden while this tab is open. `Plot Only` hides
+the Origami workflow sidebar, `Full Screen` hides all surrounding application
+controls until Escape is pressed, and `Pop Out` opens a resizable snapshot with
+its own navigation toolbar. Hover compact controls for setting help, or use each
+stage's reset button to restore its defaults. CSV and paged-gallery PDF exports
+are available at the bottom of the Overlay stage after an overlay is built.
 
 1. Click `Load Source Data` to display the selected corrected or linked points,
    optionally restricted to the rectangular ROI selected on a map. This preview
@@ -193,32 +222,118 @@ is over that panel, so settings never reduce the result plot area.
    grid, smooths the density by one bin, ignores bins below `Min density
    contrast`, and connects nearby dense bins to find candidate centers. It then
    renders each candidate into a small fixed-size image and aligns those images
-   by rotational cross-correlation plus bounded FFT translation correlation. Two
-   passes build a median population template, and a final image correlation
-   classifies candidates as similar or dissimilar. The expected grid image sets
-   the absolute orientation, but no docking-site clustering is performed during
-   identification. Only points inside the aligned grid-sized footprint plus
-   `Image margin` are retained. A progress bar reports density preparation and
-   each cross-correlation pass. Change the identification
+   independently to a synthetic image of the configured rows, columns, and x/y
+   spacing using a multi-hypothesis rotation search plus bounded linear FFT
+   translation correlation. Polar-correlation peaks and a broad principal-axis
+   neighborhood are retained; translation is optimized for every hypothesis,
+   and translation is refined to subpixel precision without circular image
+   wraparound. For sparse origami, each pose is ranked using its strongest
+   independently supported sites, with full-template correlation used only as
+   a tie-breaker. Identification then measures localization-density
+   enrichment inside disks around the expected sites relative to the explicit
+   negative space between those disks. It also compares a nonnegative sparse
+   mixture of fixed grid-site peaks with one adaptively fitted shared site width
+   against one broad elliptical-blob model using BIC as an informational QC
+   statistic. BIC is evaluated on a
+   fixed 2 nm physical scoring grid and uses independent resolution elements,
+   so alignment-thumbnail resolution and oversampled neighboring pixels do not
+   exaggerate the result. It measures every pairwise distance between supported-site
+   centroids and rejects candidates whose largest spacing error exceeds the
+   configured limit. Sparse site prominence, row/column coverage, and site spacing
+   classify each candidate without using other
+   candidates in the ROI. No docking-site
+   clustering is performed during identification. Only points inside the aligned grid-sized footprint plus
+   `Image margin` are retained. The progress bar advances through density-map
+   preparation, per-candidate thumbnail rendering, each candidate in every
+   alignment pass, fitted-pose application, site-gap measurement, and the
+   per-candidate prominence, spacing, and ΔBIC QC calculations. Change the identification
    settings and click `Identify Origami` repeatedly until the boxes look right.
    If none pass, the plot and status bar report the minimum, median, and maximum
    region point counts so the limits can be chosen from the actual data.
 
 `Pick bin` affects only the fast coarse candidate search. `Alignment pixel`
-controls the candidate-image sampling, but each thumbnail is capped at 64 by 64
+controls the candidate-image sampling, but each thumbnail is capped at 128 by 128
 pixels; the app automatically coarsens the requested pixel size for a larger
 footprint. This bounds memory and FFT work per candidate, making thousands of
-origamis practical. `Template passes` defaults to 2. More passes may marginally
-improve a heterogeneous dataset but increase runtime linearly.
+origamis practical. `Alignment passes` defaults to 3. A later pass estimates
+and corrects residual rotation against the same fixed theoretical template;
+additional passes increase runtime linearly.
 
-`Min image correlation` is the normalized similarity to the refined population
-template and defaults to `0.80`. Candidates below it are excluded even when
-their localization counts pass. The preview shows accepted footprints as solid
-colored outlines and rejected candidates as gray dashed outlines; labels report
-correlation, rotation, and point count.
+`Correlation threshold` is the normalized image similarity to the complete
+synthetic grid template and defaults to `0.50`, but `Use correlation acceptance
+gate` is off by default. Correlation therefore remains visible as a QC metric
+without preferentially accepting origami merely because more of their sites are
+occupied. Enable the gate only when full-grid similarity is intentionally
+required. `Site mask radius` defines positive disks around theoretical sites.
+Each site is supported when it has at least `Min locs / site` and exceeds `Min
+site prominence`. Starting at the expected grid location, the algorithm finds a
+nearby local maximum in a Gaussian-smoothed localization-density estimate. Site
+prominence is the fractional density drop from that peak to the high-density end
+of a surrounding boundary. A dim but isolated peak can therefore pass even when
+other sites are much brighter, while a shoulder or arbitrary grid location in a
+smooth broad blob has low prominence. The localization-count floor remains an
+independent safeguard against interpreting one-point fluctuations as sites.
+The default gate
+requires at least five supported sites spanning two rows and two columns; the
+other seven sites may be empty without reducing that support score. `Max
+spacing error` defaults to `6 nm` and requires every pair of supported-site
+centroids to retain its corresponding theoretical grid distance within that
+tolerance. This checks grid geometry without treating unoccupied sites as
+failures. Site-gap contrast is calculated as an informational comparison of
+localizations inside the site disks with those in the intervening space. It is
+not an acceptance gate because broad but distinguishable sites can place valid
+signal outside those disks. Grid-vs-blob ΔBIC is likewise displayed for QC only:
+its strength depends on localization count and on how closely sites follow its
+shared-width Gaussian model. Site prominence, grid coverage, and spacing instead
+reject smooth broad blobs without requiring every site to be occupied. The
+preview shows accepted footprints as solid colored outlines and rejected
+candidates as gray dashed outlines; labels report correlation, supported-site
+count, site-gap contrast, ΔBIC, rotation, and point count. In the
+overview, every rejected candidate also receives a bold red `FAIL:` line that
+lists each missed gate and its threshold; disabled gates are omitted. In the
+identified-template view, click a footprint to inspect its exact correlation
+contributions plus lime supported sites, gray unsupported sites, and amber
+penalized negative-space regions. The theoretical grid overlay remains enabled
+by default and can still be toggled with `Show theoretical overlay`. A separate
+`Show detected sites overlay` control draws filled lime markers only at grid
+locations that pass both `Min locs / site` and `Min site prominence` for that
+individual origami. Filled markers are placed at the measured assigned-site
+centroids rather than at the ideal coordinates; thin lime segments connect them
+to their hollow theoretical grid targets. `Show site decision labels` adds the
+assigned-localization count and peak-prominence value at every expected site.
+Passing sites are lime; orange means too few assigned localizations, magenta
+means insufficient prominence, and red means both tests failed. Each failed
+label includes the measured value and active threshold. On crowded overviews,
+failed sites remain marked with colored crosses and the text appears after
+zooming to 12 or fewer candidate footprints. It can be displayed with or without
+the hollow full-grid overlay. Left/Right arrow keys and the bottom
+arrow buttons navigate ROI-sized validation/inspection windows rather than
+individual template matches; previously inspected windows are retained for
+backward navigation. `Validation ROI` returns to the original validated window.
+The same ROI navigation is available in `Coarse identification density`, where
+each window displays its own cached picker density and connected components.
+Zooming or panning either the loaded-source preview or the identified-template
+view rerenders the visible density from the exact filtered or linked source
+localizations. Its sampling follows
+the displayed viewport down to 1 nm/pixel, while the cached fitted footprints
+and theoretical-site overlays are redrawn over the new image. Every viewport
+render also recalculates its display-density limits from the populated pixels,
+so zoomed regions do not retain the full-ROI contrast range.
+The plot toolbar's Home, Back, and Forward actions trigger the same rerender
+after restoring their saved viewport.
+`Show text statistics` independently hides or displays the candidate ID, point
+count, fitted angle, and correlation annotation beside every visible footprint,
+regardless of how many candidates are present in the ROI window.
+Rejected candidates are included so their failure can be inspected rather than
+hidden. `Show theoretical
+overlay` draws the expected docking-site grid at every fitted candidate pose in
+the overview and can be toggled without rerunning identification.
 3. Click `Build Fast Overlay (no G5M)` to reuse the cached image-aligned
-   coordinates. No rectangle refit or rotational search is repeated. Points
-   within `Site radius` are assigned directly to their nearest expected site.
+   coordinates. No rectangle refit or rotational search is repeated. The fast
+   overlay reuses identification's `Site mask radius`, `Min locs / site`, and
+   `Min site prominence`: only supported sites are occupied, and points
+   are assigned to their nearest supported expected site. A lone background
+   localization can therefore no longer create an occupied site.
    Optionally click `Refine Current Overlay with G5M` afterward to replace those
    direct assignments with per-origami Picasso G5M components. Because a
    rectangular grid has an unavoidable 180°
@@ -227,8 +342,13 @@ correlation, rotation, and point count.
    completeness, galleries, and CSV statistics invariant to arbitrary 180°
    choices without doubling the reported origami count. Per-site occupancy
    weights are therefore `0`, `0.5`, or `1` for an individual origami.
-4. Choose a result from the `Plot` menu and click `Render Plot`. The viewer
-   displays one selected result at a time: the cached identified-image-match
+4. Choose a result from the `View` menu above the plot. Cached results redraw
+   immediately without a separate render button. The viewer displays one
+   selected result at a time. After identification, `View Coarse
+   Density Map` (also available as `Coarse identification density` in the Plot menu)
+   shows the Gaussian-smoothed picker bins beside the thresholded bins colored
+   by connected candidate region, making the effects of `Pick bin`, `Min
+   density`, and `Connect` directly visible. The other choices include the cached identification with a dynamically rerendered template-match density preview,
    preview, paged individual aligned origamis, per-origami site assignments,
    a selected-origami detail view, aligned density, integrated density per site, mean site counts,
    site occupancy, or occupied-site completeness. `Integrated density per site`
@@ -241,7 +361,7 @@ correlation, rotation, and point count.
    remain visible. Both individual gallery views show only the single cached
    orientation used for that origami's assignment, making their tiles directly
    comparable. Equal-weight 0°/180° duplication is applied only to population
-   density and statistics. Switching between `Identified origami image matches` and the
+   density and statistics. Switching between `Identified origami template matches` and the
    overlay/statistics choices only redraws cached results; it does not rerun
    identification, image alignment, G5M, or alignment.
 
@@ -262,7 +382,8 @@ is cached for reuse by `Integrated density per site`. Mean counts, occupancy,
 and completeness likewise use the complete accepted population. On the
 identified-footprint preview, at most 500 visible outlines are drawn at once;
 zooming or panning dynamically replaces them with footprints in the current
-view and enables labels when 100 or fewer are visible.
+view. Text labels follow the `Show text statistics` checkbox without an
+additional candidate-count cutoff.
 
 Changing the source, active histogram filters, or ROI does not silently replace
 the displayed points; click `Load Source Data` again to refresh them.
@@ -287,13 +408,25 @@ the site-match radius are excluded from occupancy. Site counts are the numbers
 of source points assigned to matched components.
 
 The initial origami settings match the example corrected-localization workflow:
-corrected localizations, selected ROI enabled, 10 nm pick bins, 35 nm connection
-distance, 0.30 minimum density contrast, 500–5,000 points, a 3-by-4 grid with
-20 nm x/y spacing, a 20 nm image margin, 1 nm alignment pixels, two template
-passes, minimum image correlation 0.80, 1–8 nm G5M sigma bounds, 20
+corrected localizations, selected ROI enabled, 5 nm pick bins, 35 nm connection
+distance, 0.10 minimum density contrast, 100–1,000 points, a 3-by-4 grid with
+20 nm x/y spacing, a 20 nm image margin, 7.5 nm site-mask radius, 1 nm
+alignment pixels, three alignment passes, minimum
+site prominence 0.25, three localizations per supported site, five supported sites
+spanning at least two rows and two columns, and a 0.50
+correlation threshold with its acceptance gate disabled. Supported-site spacing
+must match the theoretical grid within 6 nm. Overlay refinement uses
+1–8 nm G5M sigma bounds, 20
 minimum localizations per G5M component, BIC patience 3, 7.5 nm site-match
 radius, and mirrored picks disabled. This produces a 100 × 80 nm analysis
 footprint for the default grid.
+
+The Identify panel exposes the alignment image margin, requested alignment pixel
+size, maximum alignment-image diagonal (128 pixels by default), and alignment
+passes. The effective alignment pixel size is the larger of the requested value
+and the footprint diagonal divided by the maximum alignment pixels; the plot
+title reports that effective value. Increasing the maximum permits finer
+alignment at the cost of memory and processing time.
 
 `Min density contrast` is normalized from `0` to `1` using the same linear
 automatic contrast convention used for map display (`1` is the bright end of
@@ -301,8 +434,8 @@ the scale). Only bins at or above this value seed origami identification. Raise
 it to suppress sparse background bridges; lower it if dim real origamis vanish.
 The cyan contour in the identification preview shows this cutoff. Original
 coordinates near each dense object—not the binned coordinates—are retained for
-alignment and site counting. A starting value of `0.30` worked well for the
-example corrected-localization ROI; tune it for each dataset's contrast.
+alignment and site counting. The default is `0.10`; tune it for each dataset's
+contrast.
 
 All origamis accepted in the identification preview are included in the
 overlay. Alignment RMS and grid-match fraction are reported as quality
