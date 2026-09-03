@@ -102,6 +102,7 @@ class TiledOrigamiTests(unittest.TestCase):
             "min_rectangle_confidence": 0.4,
             "alignment_pixel_nm": 2.0,
             "alignment_iterations": 2,
+            "alignment_template_image": np.eye(3),
         }
         source_params = {
             "source": "Corrected localizations",
@@ -133,6 +134,10 @@ class TiledOrigamiTests(unittest.TestCase):
         np.testing.assert_allclose(payload["points_nm"], [[12.0, 2.0], [13.0, 3.0]])
         self.assertEqual(identify.call_args.kwargs["density_threshold"], 0.2)
         self.assertEqual(identify.call_args.kwargs["alignment_iterations"], 2)
+        np.testing.assert_array_equal(
+            identify.call_args.kwargs["alignment_template_image"],
+            np.eye(3),
+        )
 
 
 if __name__ == "__main__":

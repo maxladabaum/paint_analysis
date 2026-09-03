@@ -95,8 +95,9 @@ disabled, changing `Render pixel`, `Render blur`, or `Min blur` and pressing
 rerunning RCC/AIM.
 
 `Dynamic zoom rendering` is enabled by default. After zooming or panning on the
-raw, corrected, or linked map, the visible viewport is rerendered after a short
-debounce. The app chooses approximately one render pixel per on-screen plot
+raw, corrected, linked, or filtered map, the visible viewport is rerendered after
+a short debounce. Filtered-map rerenders reuse the exact localization subset
+produced by the last applied histogram filters. The app chooses approximately one render pixel per on-screen plot
 pixel and progressively refines the data resolution as you zoom, down to a
 minimum of 1 nm/render pixel. This keeps very large full-field views responsive
 without sacrificing high-resolution ROI inspection. Disable this option to use
@@ -138,6 +139,17 @@ After selecting an ROI on the corrected map, the following plots are generated o
 - linked photons per event
 
 Use `Show Corrected Map` to return to the map after viewing a histogram.
+
+## Temporal Metrics
+
+The `Temporal` tab plots a selected localization or linked-event metric over
+frame windows. Use `Vertical frame annotations` to enter a frame and arbitrary
+text such as `power 20% exposure 100ms`, then click `Add / Update`. The plot
+shows a dashed vertical line at that frame with the supplied text. Adding the
+same frame again updates its label. Select annotations in the list to edit or
+remove them, or use `Clear all`. Annotation changes update the displayed plot
+without recalculating the temporal metric and remain overlaid when the metric
+is replotted.
 
 ## Linking
 
@@ -220,7 +232,11 @@ are available at the bottom of the Overlay stage after an overlay is built.
    have the same visual appearance as the Corrected Map.
 2. Click `Identify Origami`. The app bins the coordinates onto a coarse spatial
    grid, smooths the density by one bin, ignores bins below `Min density
-   contrast`, and connects nearby dense bins to find candidate centers. It then
+   contrast`, and connects nearby supported bins into candidate regions. This
+   stage does not require density in the center of an object. With a custom
+   template, bins along a hollow or sparse shape are joined across the configured
+   docking-site pitch, allowing the arms of an L to form one candidate without
+   filling its empty interior. It then
    renders each candidate into a small fixed-size image and aligns those images
    independently to a synthetic image of the configured rows, columns, and x/y
    spacing using a multi-hypothesis rotation search plus bounded linear FFT
@@ -259,12 +275,65 @@ origamis practical. `Alignment passes` defaults to 3. A later pass estimates
 and corrects residual rotation against the same fixed theoretical template;
 additional passes increase runtime linearly.
 
+The first alignment pass keeps several separated translation peaks for every
+rotation rather than trusting only the strongest whole-image match. It also
+retains coarse hypotheses across the complete 180-degree rotational range for
+the symmetric synthetic grid and the full 360-degree range for a custom image,
+so an asymmetric template preserves its directional orientation and a nearby
+object cannot remove the target orientation from consideration. Each hypothesis
+is then rigidly refined from grid-supported site centroids only.
+Pose selection rewards distributed supported sites, precise centroids, and a
+high inlier fraction; unrelated localizations do not participate in the rigid
+refit and are cropped after the winning pose is chosen.
+
+The `Alignment template` control can replace the simulated full-grid image with
+a custom barcode raster. Choose `Custom image`, then load a PNG, TIFF, or JPEG.
+Templates must use bright pixels for expected localization signal and a dark
+background; grayscale is preferred, while RGB/RGBA files are converted to
+luminance and transparency is respected. Templates exported by Picklist
+Generator embed their x/y nanometres-per-pixel calibration in the PNG and write
+the same geometry to a same-name JSON sidecar. Loading one automatically restores
+its rows, columns, site spacing, margin, and pixel calibration. The current
+Picklist Generator defaults use uniform 10.909 nm column and 5.714 nm row
+spacing, giving a 120 × 40 nm span between the outer site centers; the image
+margin is blank physical padding around those sites. For older images,
+set `Template pixel x / y (nm)` manually. Raster top remains physical top after
+loading, and every raster pixel retains its calibrated physical position. Avoid
+labels, scale bars, and unrelated decorations because every
+visible feature participates in correlation. Image resolution is not itself a
+physical calibration. Custom
+templates use extra thumbnail canvas so off-center signal, including an L whose
+localization median lies near its elbow, is not cropped before pose fitting.
+
+For mixed samples, `Load Multiple Template Images…` accepts two or more
+Picklist Generator templates with embedded or sidecar calibration. Identification
+fits every spatial candidate against each template, matches duplicate detections
+one-to-one by position, and assigns the object to the highest-correlation fit
+among the templates whose normal acceptance gates pass. `Origami type counts`
+plots the assigned count for every template plus an unclassified count. The
+`Classification view` selector switches the identification overview to one
+template at a time; building the fast overlay from that selection produces its
+own aligned-density, gallery, site-assignment, and occupancy views. Completed
+per-template overlays are cached while switching between classified types. To
+count the complete image rather than the selected ROI, disable the source ROI
+option before loading Origami source data.
+
+With a custom image, that raster drives rotation, translation, and the reported
+correlation, including dark barcode locations as negative-space evidence. Each
+separate bright component in the image also defines a theoretical docking site
+for localization counts, prominence, detected-site assignment, coverage, and
+spacing checks. The configured rows, columns, spacing, and margin define the
+physical scale and outer crop rather than adding unmarked sites to the overlay.
+Keep the correlation gate enabled to reject candidates that do not resemble the
+uploaded barcode. The Template and Overlay panels in the individual match
+inspector display the exact resampled raster and extracted sites used for scoring.
+
 `Correlation threshold` is the normalized image similarity to the complete
-synthetic grid template and defaults to `0.50`, but `Use correlation acceptance
-gate` is off by default. Correlation therefore remains visible as a QC metric
-without preferentially accepting origami merely because more of their sites are
-occupied. Enable the gate only when full-grid similarity is intentionally
-required. `Site mask radius` defines positive disks around theoretical sites.
+synthetic grid template and defaults to `0.40`. `Use correlation acceptance
+gate` is enabled by default, so candidates below that value are rejected.
+Correlation remains visible as a QC metric and the gate can be disabled when
+full-grid similarity should not affect acceptance. `Site mask radius` defines
+positive disks around theoretical sites.
 Each site is supported when it has at least `Min locs / site` and exceeds `Min
 site prominence`. Starting at the expected grid location, the algorithm finds a
 nearby local maximum in a Gaussian-smoothed localization-density estimate. Site
@@ -276,26 +345,32 @@ independent safeguard against interpreting one-point fluctuations as sites.
 The default gate
 requires at least five supported sites spanning two rows and two columns; the
 other seven sites may be empty without reducing that support score. `Max
-spacing error` defaults to `6 nm` and requires every pair of supported-site
+spacing error` defaults to `8 nm` and requires every pair of supported-site
 centroids to retain its corresponding theoretical grid distance within that
 tolerance. This checks grid geometry without treating unoccupied sites as
 failures. Site-gap contrast is calculated as an informational comparison of
 localizations inside the site disks with those in the intervening space. It is
 not an acceptance gate because broad but distinguishable sites can place valid
-signal outside those disks. Grid-vs-blob ΔBIC is likewise displayed for QC only:
+signal outside those disks. Grid-vs-blob ΔBIC is displayed for QC only because
 its strength depends on localization count and on how closely sites follow its
-shared-width Gaussian model. Site prominence, grid coverage, and spacing instead
-reject smooth broad blobs without requiring every site to be occupied. The
-preview shows accepted footprints as solid colored outlines and rejected
-candidates as gray dashed outlines; labels report correlation, supported-site
+shared-width Gaussian model. Site prominence, grid coverage, spacing, and the
+optional correlation gate determine acceptance instead. The
+preview shows one canonical set of hollow docking-site markers for custom
+templates and rectangular crop boundaries for simulated grids. The custom
+raster's Gaussian contours are not drawn a second time over those sites.
+Labels report correlation, supported-site
 count, site-gap contrast, ΔBIC, rotation, and point count. In the
 overview, every rejected candidate also receives a bold red `FAIL:` line that
 lists each missed gate and its threshold; disabled gates are omitted. In the
 identified-template view, click a footprint to inspect its exact correlation
 contributions plus lime supported sites, gray unsupported sites, and amber
-penalized negative-space regions. The theoretical grid overlay remains enabled
-by default and can still be toggled with `Show theoretical overlay`. A separate
-`Show detected sites overlay` control draws filled lime markers only at grid
+penalized negative-space regions. The theoretical grid overlay is the only
+identification overlay enabled by default and can still be toggled with `Show
+theoretical overlay`. Detected sites and text statistics start disabled. A
+rejected fit is omitted from the theoretical overlay unless `Show text
+statistics` is selected, so any displayed rejected pose is accompanied by its
+failure explanation. A
+separate `Show detected sites overlay` control draws filled lime markers only at grid
 locations that pass both `Min locs / site` and `Min site prominence` for that
 individual origami. Filled markers are placed at the measured assigned-site
 centroids rather than at the ideal coordinates; thin lime segments connect them
@@ -306,7 +381,16 @@ means insufficient prominence, and red means both tests failed. Each failed
 label includes the measured value and active threshold. On crowded overviews,
 failed sites remain marked with colored crosses and the text appears after
 zooming to 12 or fewer candidate footprints. It can be displayed with or without
-the hollow full-grid overlay. Left/Right arrow keys and the bottom
+the hollow full-grid overlay. `Show prominence sampling` exposes the exact
+measurement geometry: cyan diamonds mark the locally selected density peaks,
+dashed cyan rings show the 32-point boundary used for comparison, and magenta
+squares mark the boundary samples nearest the 90th-percentile reference. The
+magenta line connects each selected peak to that reference sample. Because this
+overlay is detailed, it appears only when 12 or fewer candidates are visible.
+Per-site counts, prominence geometry, decisions, and measured centroids are
+cached in the identification result; toggling these displays does not recompute
+the KDE measurements on the GUI thread.
+Left/Right arrow keys and the bottom
 arrow buttons navigate ROI-sized validation/inspection windows rather than
 individual template matches; previously inspected windows are retained for
 backward navigation. `Validation ROI` returns to the original validated window.
@@ -318,7 +402,12 @@ localizations. Its sampling follows
 the displayed viewport down to 1 nm/pixel, while the cached fitted footprints
 and theoretical-site overlays are redrawn over the new image. Every viewport
 render also recalculates its display-density limits from the populated pixels,
-so zoomed regions do not retain the full-ROI contrast range.
+so zoomed regions do not retain the full-ROI contrast range. The Origami toolbar
+Home button restores the original validation/inspection extent and immediately
+rerenders that complete viewport rather than stretching the last zoom tile.
+Loading source data likewise rerenders once the Origami tab is visible, so its
+initial resolution is based on the Origami canvas rather than the map tab where
+the ROI was selected.
 The plot toolbar's Home, Back, and Forward actions trigger the same rerender
 after restoring their saved viewport.
 `Show text statistics` independently hides or displays the candidate ID, point
@@ -408,13 +497,13 @@ the site-match radius are excluded from occupancy. Site counts are the numbers
 of source points assigned to matched components.
 
 The initial origami settings match the example corrected-localization workflow:
-corrected localizations, selected ROI enabled, 5 nm pick bins, 35 nm connection
+corrected localizations, selected ROI enabled, 5 nm pick bins, 20 nm connection
 distance, 0.10 minimum density contrast, 100–1,000 points, a 3-by-4 grid with
 20 nm x/y spacing, a 20 nm image margin, 7.5 nm site-mask radius, 1 nm
 alignment pixels, three alignment passes, minimum
-site prominence 0.25, three localizations per supported site, five supported sites
-spanning at least two rows and two columns, and a 0.50
-correlation threshold with its acceptance gate disabled. Supported-site spacing
+site prominence 0.10, three localizations per supported site, five supported sites
+spanning at least two rows and two columns, and a 0.30
+correlation threshold with its acceptance gate enabled. Supported-site spacing
 must match the theoretical grid within 6 nm. Overlay refinement uses
 1–8 nm G5M sigma bounds, 20
 minimum localizations per G5M component, BIC patience 3, 7.5 nm site-match

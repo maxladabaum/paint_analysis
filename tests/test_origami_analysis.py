@@ -4,10 +4,12 @@ from unittest import mock
 import numpy as np
 
 from origami_analysis import (
+    classify_template_candidates,
     _align_regions_by_image_correlation,
     align_picked_origamis,
     analyze_origami_regions,
     cluster_aligned_origami_sites,
+    custom_template_site_points,
     fit_picasso_g5m_components,
     grid_vs_blob_delta_bic,
     ideal_grid_points,
@@ -15,10 +17,12 @@ from origami_analysis import (
     integrate_rendered_density_at_sites,
     origami_gallery_indices,
     origami_gallery_page,
+    prepare_custom_alignment_template,
     render_aligned_origami_density,
     render_localization_preview,
     site_gap_contrast_for_regions,
     sparse_site_evidence,
+    sparse_site_evidence_diagnostics,
     supported_grid_site_mask,
     supported_site_centroids,
     supported_site_spacing_errors,
@@ -26,6 +30,324 @@ from origami_analysis import (
 
 
 class OrigamiAnalysisTests(unittest.TestCase):
+    def test_multi_template_classification_assigns_each_object_once(self) -> None:
+        classification = classify_template_candidates(
+            [
+                np.asarray([[0.0, 0.0], [100.0, 0.0], [200.0, 0.0]]),
+                np.asarray([[1.0, -1.0], [101.0, 1.0], [201.0, 0.0]]),
+            ],
+            [np.asarray([True, True, False]), np.asarray([True, True, False])],
+            [np.asarray([0.8, 0.45, 0.2]), np.asarray([0.5, 0.9, 0.3])],
+            match_distance_nm=10.0,
+        )
+
+        np.testing.assert_array_equal(classification.assignment_masks[0], [True, False, False])
+        np.testing.assert_array_equal(classification.assignment_masks[1], [False, True, False])
+        np.testing.assert_array_equal(classification.counts, [1, 1])
+        self.assertEqual(classification.unclassified_count, 1)
+
+    def test_multi_template_classification_prefers_a_passing_fit(self) -> None:
+        classification = classify_template_candidates(
+            [np.asarray([[0.0, 0.0]]), np.asarray([[1.0, 0.0]])],
+            [np.asarray([True]), np.asarray([False])],
+            [np.asarray([0.41]), np.asarray([0.95])],
+            match_distance_nm=10.0,
+        )
+
+        np.testing.assert_array_equal(classification.counts, [1, 0])
+        self.assertEqual(classification.unclassified_count, 0)
+
+    def test_two_custom_templates_classify_a_mixed_image(self) -> None:
+        from scipy.ndimage import gaussian_filter
+
+        rng = np.random.default_rng(20_260_902)
+        grid = ideal_grid_points(3, 4, 20.0, 20.0)
+        patterns = [np.asarray([0, 1, 5, 6, 11]), np.asarray([2, 3, 4, 8, 9, 10])]
+        templates: list[np.ndarray] = []
+        for occupied in patterns:
+            image = np.zeros((80, 100), dtype=float)
+            for x_nm, y_nm in grid[occupied]:
+                column = int(round((x_nm + 50.0) / 100.0 * 99.0))
+                row = int(round((y_nm + 40.0) / 80.0 * 79.0))
+                image[row, column] = 1.0
+            templates.append(gaussian_filter(image, 2.0))
+
+        mixed_regions: list[np.ndarray] = []
+        for occupied, angle_degrees, center in zip(
+            patterns,
+            (23.0, -31.0),
+            ((250.0, 300.0), (600.0, 500.0)),
+        ):
+            angle = np.deg2rad(angle_degrees)
+            rotation = np.asarray(
+                [[np.cos(angle), -np.sin(angle)], [np.sin(angle), np.cos(angle)]]
+            )
+            mixed_regions.append(
+                np.vstack([rng.normal(grid[index], 1.4, size=(30, 2)) for index in occupied])
+                @ rotation.T
+                + np.asarray(center)
+            )
+        points = np.vstack(mixed_regions)
+
+        picks_by_template = [
+            identify_origami_regions(
+                points,
+                pick_bin_size_nm=5.0,
+                connect_distance_nm=15.0,
+                density_threshold=0.02,
+                min_candidate_points=100,
+                max_candidate_points=300,
+                rows=3,
+                columns=4,
+                spacing_x_nm=20.0,
+                spacing_y_nm=20.0,
+                rectangle_margin_nm=20.0,
+                min_rectangle_confidence=0.4,
+                site_mask_radius_nm=7.5,
+                min_supported_sites=4,
+                min_site_evidence=0.10,
+                min_site_localizations=3,
+                min_supported_rows=2,
+                min_supported_columns=2,
+                max_site_spacing_error_nm=8.0,
+                alignment_pixel_nm=1.0,
+                alignment_template_image=template,
+                template_pixel_size_x_nm=100.0 / 99.0,
+                template_pixel_size_y_nm=80.0 / 79.0,
+            )
+            for template in templates
+        ]
+        classification = classify_template_candidates(
+            [
+                np.asarray([np.median(region, axis=0) for region in picks.regions])
+                for picks in picks_by_template
+            ],
+            [picks.accepted_mask for picks in picks_by_template],
+            [picks.rectangle_confidence for picks in picks_by_template],
+            match_distance_nm=20.0,
+        )
+
+        np.testing.assert_array_equal(classification.counts, [1, 1])
+        self.assertEqual(classification.unclassified_count, 0)
+    def test_custom_template_sites_use_configured_pitch_not_black_image_border(self) -> None:
+        template = np.zeros((100, 200), dtype=float)
+        for row in (20, 30, 40):
+            for column in (50, 80, 110):
+                template[row, column] = 1.0
+
+        sites = custom_template_site_points(
+            template,
+            rectangle_width_nm=180.0,
+            rectangle_height_nm=120.0,
+            spacing_x_nm=20.0,
+            spacing_y_nm=20.0,
+        )
+
+        np.testing.assert_allclose(np.unique(sites[:, 0]), [-20.0, 0.0, 20.0])
+        np.testing.assert_allclose(np.unique(sites[:, 1]), [-20.0, 0.0, 20.0])
+
+    def test_custom_template_dot_count_does_not_expand_configured_footprint(self) -> None:
+        template = np.zeros((220, 500), dtype=float)
+        for column in range(60, 435, 34):
+            template[170, column] = 1.0
+        for row in range(58, 171, 16):
+            template[row, 230] = 1.0
+            template[row, 434] = 1.0
+
+        sites = custom_template_site_points(
+            template,
+            rectangle_width_nm=120.0,
+            rectangle_height_nm=100.0,
+            spacing_x_nm=20.0,
+            spacing_y_nm=20.0,
+            active_width_nm=100.0,
+            active_height_nm=80.0,
+        )
+
+        self.assertAlmostEqual(float(np.ptp(sites[:, 0])), 100.0)
+        self.assertAlmostEqual(float(np.ptp(sites[:, 1])), 80.0)
+
+    def test_custom_template_uses_explicit_nanometres_per_pixel(self) -> None:
+        template = np.zeros((10, 20), dtype=float)
+        template[2, 3] = 1.0
+        template[7, 13] = 1.0
+
+        sites = custom_template_site_points(
+            template,
+            rectangle_width_nm=100.0,
+            rectangle_height_nm=80.0,
+            pixel_size_x_nm=2.0,
+            pixel_size_y_nm=3.0,
+        )
+
+        np.testing.assert_allclose(sites, [[-13.0, -7.5], [7.0, 7.5]])
+
+    def test_generated_grid_preserves_spacing_inside_image_margin(self) -> None:
+        width_px, height_px = 500, 250
+        width_nm, height_nm = 160.0, 80.0
+        grid_width_nm, grid_height_nm = 120.0, 40.0
+        template = np.zeros((height_px, width_px), dtype=float)
+        left = int(round(20.0 * (width_px - 1) / width_nm))
+        right = int(round(140.0 * (width_px - 1) / width_nm))
+        bottom = int(round(20.0 * (height_px - 1) / height_nm))
+        top = int(round(60.0 * (height_px - 1) / height_nm))
+        template[bottom, left] = 1.0
+        template[top, right] = 1.0
+
+        sites = custom_template_site_points(
+            template,
+            rectangle_width_nm=width_nm,
+            rectangle_height_nm=height_nm,
+            pixel_size_x_nm=width_nm / (width_px - 1),
+            pixel_size_y_nm=height_nm / (height_px - 1),
+        )
+
+        np.testing.assert_allclose(
+            np.ptp(sites, axis=0),
+            [grid_width_nm, grid_height_nm],
+            atol=max(
+                width_nm / (width_px - 1),
+                height_nm / (height_px - 1),
+            ),
+        )
+
+    def test_custom_template_is_scaled_into_the_physical_footprint(self) -> None:
+        source = np.zeros((8, 10), dtype=float)
+        source[2:4, 6:8] = 1.0
+
+        prepared = prepare_custom_alignment_template(
+            source,
+            output_shape=(128, 128),
+            rectangle_width_nm=100.0,
+            rectangle_height_nm=80.0,
+            canvas_side_nm=float(np.hypot(100.0, 80.0)),
+        )
+
+        self.assertEqual(prepared.shape, (128, 128))
+        self.assertAlmostEqual(float(np.linalg.norm(prepared)), 1.0)
+        self.assertAlmostEqual(float(np.mean(prepared)), 0.0, places=12)
+        self.assertGreater(float(np.max(prepared)), 0.0)
+        self.assertLess(float(np.min(prepared)), 0.0)
+
+    def test_custom_barcode_template_drives_alignment_and_correlation(self) -> None:
+        rng = np.random.default_rng(333)
+        grid = ideal_grid_points(3, 4, 20.0, 20.0)
+        occupied = np.asarray([0, 1, 5, 6, 11])
+        barcode = np.zeros((80, 100), dtype=float)
+        for x_nm, y_nm in grid[occupied]:
+            column = int(round((x_nm + 50.0) / 100.0 * 99.0))
+            row = int(round((y_nm + 40.0) / 80.0 * 79.0))
+            barcode[row, column] = 1.0
+        from scipy.ndimage import gaussian_filter
+
+        barcode = gaussian_filter(barcode, 2.0)
+        expected_angle = 27.0
+        angle = np.deg2rad(expected_angle)
+        rotation = np.asarray([[np.cos(angle), -np.sin(angle)], [np.sin(angle), np.cos(angle)]])
+        region = np.vstack(
+            [rng.normal(grid[index], 1.4, size=(25, 2)) for index in occupied]
+        ) @ rotation.T
+
+        aligned, _centers, _corners, angles, correlations, _pixel_nm, reference = (
+            _align_regions_by_image_correlation(
+                [region],
+                rectangle_width_nm=100.0,
+                rectangle_height_nm=80.0,
+                requested_pixel_nm=1.0,
+                iterations=3,
+                template_points_nm=grid,
+                template_image=barcode,
+                sparse_pose_site_count=3,
+                sparse_site_radius_nm=7.5,
+                sparse_min_site_localizations=3,
+            )
+        )
+
+        angle_error = abs(((float(angles[0]) - expected_angle + 90.0) % 180.0) - 90.0)
+        self.assertLess(angle_error, 1.0)
+        self.assertGreater(float(correlations[0]), 0.9)
+        self.assertEqual(len(aligned[0]), len(region))
+        self.assertAlmostEqual(float(np.linalg.norm(reference)), 1.0)
+
+    def test_asymmetric_custom_template_distinguishes_180_degree_orientation(self) -> None:
+        rng = np.random.default_rng(334)
+        grid = ideal_grid_points(7, 7, 20.0, 20.0)
+        occupied = np.unique(np.r_[np.arange(7), np.arange(6, 49, 7)])
+        barcode = np.zeros((140, 140), dtype=float)
+        for x_nm, y_nm in grid[occupied]:
+            column = int(round((x_nm + 70.0) / 140.0 * 139.0))
+            row = int(round((y_nm + 70.0) / 140.0 * 139.0))
+            barcode[row, column] = 1.0
+        from scipy.ndimage import gaussian_filter
+
+        barcode = gaussian_filter(barcode, 2.0)
+        expected_angle = 207.0
+        angle = np.deg2rad(expected_angle)
+        rotation = np.asarray([[np.cos(angle), -np.sin(angle)], [np.sin(angle), np.cos(angle)]])
+        points = np.vstack(
+            [rng.normal(grid[index], 1.4, size=(25, 2)) for index in occupied]
+        ) @ rotation.T + np.asarray([500.0, 500.0])
+
+        picks = identify_origami_regions(
+            points,
+            pick_bin_size_nm=5.0,
+            connect_distance_nm=10.0,
+            density_threshold=0.02,
+            min_candidate_points=200,
+            max_candidate_points=400,
+            rows=7,
+            columns=7,
+            spacing_x_nm=20.0,
+            spacing_y_nm=20.0,
+            rectangle_margin_nm=10.0,
+            min_rectangle_confidence=0.3,
+            site_mask_radius_nm=7.5,
+            min_supported_sites=8,
+            min_site_evidence=0.10,
+            min_site_localizations=3,
+            min_supported_rows=2,
+            min_supported_columns=2,
+            max_site_spacing_error_nm=8.0,
+            alignment_pixel_nm=1.0,
+            alignment_template_image=barcode,
+        )
+
+        self.assertEqual(len(picks.regions), 1)
+        self.assertEqual(picks.accepted_count, 1)
+        angle_error = abs(
+            ((float(picks.rectangle_angles_deg[0]) - expected_angle + 180.0) % 360.0) - 180.0
+        )
+        self.assertLess(angle_error, 1.0)
+        self.assertGreater(float(picks.rectangle_confidence[0]), 0.7)
+        self.assertEqual(len(picks.aligned_regions[0]), len(points))
+        self.assertEqual(picks.template_points_nm.shape, (len(occupied), 2))
+        self.assertEqual(picks.site_localization_counts.shape, (1, len(occupied)))
+        nearest_template_distance = np.min(
+            np.linalg.norm(
+                picks.template_points_nm[:, None, :] - grid[occupied][None, :, :],
+                axis=2,
+            ),
+            axis=1,
+        )
+        self.assertLess(float(np.max(nearest_template_distance)), 1.0)
+
+        overlay = align_picked_origamis(
+            picks.accepted_aligned_regions,
+            rows=7,
+            columns=7,
+            spacing_x_nm=20.0,
+            spacing_y_nm=20.0,
+            site_radius_nm=7.5,
+            prealigned=True,
+            use_g5m=False,
+            direct_min_site_localizations=3,
+            grid_points_nm=picks.template_points_nm,
+            symmetrize_180=False,
+        )
+        np.testing.assert_allclose(overlay.grid_points_nm, picks.template_points_nm)
+        self.assertEqual(overlay.site_counts.shape, (1, len(occupied)))
+        self.assertFalse(overlay.symmetrized_180)
+
     def test_sparse_site_support_is_not_penalized_for_unoccupied_sites(self) -> None:
         rng = np.random.default_rng(41)
         grid = ideal_grid_points(3, 4, 20.0, 20.0)
@@ -43,6 +365,26 @@ class OrigamiAnalysisTests(unittest.TestCase):
         np.testing.assert_array_equal(np.flatnonzero(supported), occupied)
         self.assertEqual(int(np.count_nonzero(supported)), 5)
         self.assertTrue(np.all(evidence[occupied] > 0.8))
+
+    def test_site_prominence_diagnostics_expose_the_measured_geometry(self) -> None:
+        rng = np.random.default_rng(4_100)
+        grid = ideal_grid_points(3, 4, 20.0, 20.0)
+        points = rng.normal(grid[5], 1.5, size=(30, 2))
+
+        diagnostics = sparse_site_evidence_diagnostics(points, grid, site_radius_nm=7.5)
+
+        self.assertEqual(diagnostics.boundary_points_nm.shape, (12, 32, 2))
+        self.assertTrue(np.all(np.isfinite(diagnostics.peak_positions_nm[5])))
+        self.assertTrue(np.all(np.isfinite(diagnostics.boundary_reference_positions_nm[5])))
+        expected_prominence = (
+            diagnostics.peak_density[5] - diagnostics.boundary_reference_density[5]
+        ) / diagnostics.peak_density[5]
+        self.assertAlmostEqual(float(diagnostics.prominence[5]), float(expected_prominence))
+        boundary_radii = np.linalg.norm(
+            diagnostics.boundary_points_nm[5] - diagnostics.peak_positions_nm[5],
+            axis=1,
+        )
+        self.assertAlmostEqual(float(np.min(boundary_radii)), float(np.max(boundary_radii)))
 
     def test_site_prominence_accepts_a_broad_but_distinct_peak(self) -> None:
         rng = np.random.default_rng(4_102)
@@ -177,7 +519,7 @@ class OrigamiAnalysisTests(unittest.TestCase):
             any("candidate 1/1" in message for _percent, message in progress_updates)
         )
         self.assertTrue(
-            any("site prominence, spacing, and ΔBIC QC" in message for _percent, message in progress_updates)
+            any("site prominence, spacing, and ΔBIC" in message for _percent, message in progress_updates)
         )
         self.assertTrue(
             all(left[0] <= right[0] for left, right in zip(progress_updates, progress_updates[1:]))
@@ -602,6 +944,11 @@ class OrigamiAnalysisTests(unittest.TestCase):
         self.assertLess(picks.point_counts[0], len(points))
         self.assertLessEqual(picks.alignment_reference_image.shape[0], 128)
         self.assertEqual(picks.alignment_candidate_images.shape[0], 1)
+        self.assertEqual(picks.site_localization_counts.shape, (1, 12))
+        self.assertEqual(picks.site_prominence.shape, (1, 12))
+        self.assertEqual(picks.site_peak_positions_nm.shape, (1, 12, 2))
+        self.assertEqual(picks.site_boundary_points_nm.shape, (1, 12, 32, 2))
+        self.assertEqual(picks.site_centroids_nm.shape, (1, 12, 2))
         candidate = picks.alignment_candidate_images[0]
         template = picks.alignment_reference_image
         displayed_score = float(
@@ -616,7 +963,7 @@ class OrigamiAnalysisTests(unittest.TestCase):
         self.assertTrue(any("Theoretical-template alignment pass" in message for _percent, message in progress_updates))
         self.assertTrue(any("Applying fitted poses" in message for _percent, message in progress_updates))
         self.assertTrue(any("Measuring site-versus-gap density" in message for _percent, message in progress_updates))
-        self.assertTrue(any("site prominence, spacing, and ΔBIC QC" in message for _percent, message in progress_updates))
+        self.assertTrue(any("site prominence, spacing, and ΔBIC" in message for _percent, message in progress_updates))
         self.assertTrue(all(left[0] <= right[0] for left, right in zip(progress_updates, progress_updates[1:])))
         result = align_picked_origamis(
             picks.accepted_aligned_regions,
@@ -697,6 +1044,55 @@ class OrigamiAnalysisTests(unittest.TestCase):
         self.assertLess(angle_error, 2.0)
         self.assertGreater(float(correlations[0]), 0.68)
         self.assertEqual(len(aligned), 1)
+
+    def test_sparse_pose_alignment_rejects_a_nearby_origami_distractor(self) -> None:
+        rng = np.random.default_rng(2026)
+        grid = ideal_grid_points(3, 4, 20.0, 20.0)
+        expected_angle = 34.0
+        angle = np.deg2rad(expected_angle)
+        rotation = np.asarray([[np.cos(angle), -np.sin(angle)], [np.sin(angle), np.cos(angle)]])
+        target_sites = np.asarray([0, 1, 2, 4, 5, 7, 9, 11])
+        target = np.vstack(
+            [rng.normal(grid[index], 1.8, size=(22, 2)) for index in target_sites]
+        ) @ rotation.T
+
+        distractor_angle = np.deg2rad(-25.0)
+        distractor_rotation = np.asarray(
+            [
+                [np.cos(distractor_angle), -np.sin(distractor_angle)],
+                [np.sin(distractor_angle), np.cos(distractor_angle)],
+            ]
+        )
+        distractor_sites = np.asarray([0, 1, 4, 5, 8, 9])
+        distractor = (
+            np.vstack(
+                [rng.normal(grid[index], 2.0, size=(14, 2)) for index in distractor_sites]
+            )
+            @ distractor_rotation.T
+            + np.asarray([50.0, -45.0])
+        )
+
+        aligned, _centers, _corners, angles, correlations, _pixel_nm, _reference = (
+            _align_regions_by_image_correlation(
+                [np.vstack((target, distractor))],
+                rectangle_width_nm=100.0,
+                rectangle_height_nm=80.0,
+                requested_pixel_nm=1.0,
+                iterations=3,
+                template_points_nm=grid,
+                sparse_pose_site_count=5,
+                sparse_site_radius_nm=7.5,
+                sparse_min_site_localizations=3,
+            )
+        )
+
+        angle_error = abs(((float(angles[0]) - expected_angle + 90.0) % 180.0) - 90.0)
+        # The robust search must recover the target basin rather than the
+        # distractor's roughly 60-degree-different orientation. Subsequent site
+        # assignment tolerates this small residual angular error.
+        self.assertLess(angle_error, 4.0)
+        self.assertGreater(float(correlations[0]), 0.3)
+        self.assertLess(len(aligned[0]), len(target) + len(distractor))
 
     def test_theoretical_template_score_is_independent_of_roi_population(self) -> None:
         rng = np.random.default_rng(73)
