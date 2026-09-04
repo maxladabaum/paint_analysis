@@ -2,12 +2,15 @@ import unittest
 from unittest import mock
 
 import numpy as np
+import origami_analysis
 
 from origami_analysis import (
     classify_template_candidates,
     _align_regions_by_image_correlation,
     align_picked_origamis,
     analyze_origami_regions,
+    bidirectional_template_classification_scores,
+    detected_lattice_template_agreement,
     cluster_aligned_origami_sites,
     custom_template_site_points,
     fit_picasso_g5m_components,
@@ -15,8 +18,15 @@ from origami_analysis import (
     ideal_grid_points,
     identify_origami_regions,
     integrate_rendered_density_at_sites,
+    lattice_template_on_site_fractions,
+    lattice_template_empty_cell_fractions,
+    lattice_count_template_probability_agreement,
+    logical_stroke_template_evidence,
+    lattice_template_probability_agreement,
+    monte_carlo_template_evidence,
     origami_gallery_indices,
     origami_gallery_page,
+    pick_origami_candidates,
     prepare_custom_alignment_template,
     render_aligned_origami_density,
     render_localization_preview,
@@ -30,6 +40,468 @@ from origami_analysis import (
 
 
 class OrigamiAnalysisTests(unittest.TestCase):
+    def test_logical_stroke_evidence_aggregates_physical_sites_per_bit(self) -> None:
+        bit_cells = ((0, 1, 2, 3, 4), (5, 6, 7, 8, 9), (10, 11, 12, 13, 14))
+        counts = np.zeros((1, 20), dtype=float)
+        counts[0, [0, 1, 2, 3]] = 12.0  # One missing extension on active bit 0.
+        counts[0, [10, 11, 12, 13, 14]] = 10.0
+        correct_p, correct_score, bit_p, _pattern = logical_stroke_template_evidence(
+            counts, bit_cells, (True, False, True)
+        )
+        wrong_p, wrong_score, _wrong_bits, _wrong_pattern = logical_stroke_template_evidence(
+            counts, bit_cells, (False, True, False)
+        )
+        self.assertGreater(bit_p[0, 0], 0.5)
+        self.assertGreater(bit_p[0, 2], 0.5)
+        self.assertGreater(correct_score[0], wrong_score[0])
+        self.assertGreater(correct_p[0], 0.5)
+
+    def test_overlapping_logical_bits_use_physical_union_semantics(self) -> None:
+        # Cell 1 belongs to both bits. When A is ON and B is OFF, brightness at
+        # that shared cell is explained by A and must not count against B.
+        counts = np.zeros((1, 4), dtype=float)
+        counts[0, [0, 1]] = 12.0
+        bit_cells = ((0, 1), (1, 2))
+        correct_p, correct_score, _bits, _pattern = logical_stroke_template_evidence(
+            counts, bit_cells, (True, False)
+        )
+        wrong_p, wrong_score, _wrong_bits, _wrong_pattern = logical_stroke_template_evidence(
+            counts, bit_cells, (True, True)
+        )
+        self.assertGreater(correct_score[0], wrong_score[0])
+        self.assertGreater(correct_p[0], wrong_p[0])
+
+    def test_candidate_detection_is_stable_in_presence_of_one_bright_aggregate(self) -> None:
+        rng = np.random.default_rng(4)
+        ordinary = np.vstack(
+            [rng.normal((x, 0.0), 3.0, size=(150, 2)) for x in np.arange(0.0, 800.0, 100.0)]
+        )
+        aggregate = rng.normal((1000.0, 0.0), 3.0, size=(3000, 2))
+        baseline = pick_origami_candidates(
+            ordinary,
+            bin_size_nm=5.0,
+            connect_distance_nm=20.0,
+            density_threshold=0.1,
+        )[0]
+        contaminated = pick_origami_candidates(
+            np.vstack((ordinary, aggregate)),
+            bin_size_nm=5.0,
+            connect_distance_nm=20.0,
+            density_threshold=0.1,
+        )[0]
+
+        self.assertEqual(len(baseline), 8)
+        self.assertEqual(sum(len(region) == 150 for region in contaminated), 8)
+
+    def test_candidate_point_minimum_is_applied_before_alignment(self) -> None:
+        rng = np.random.default_rng(405)
+        small = rng.normal((0.0, 0.0), 2.0, size=(40, 2))
+        viable = rng.normal((150.0, 0.0), 2.0, size=(120, 2))
+        regions, _density, _contrast, _extent, labels = pick_origami_candidates(
+            np.vstack((small, viable)),
+            bin_size_nm=5.0,
+            connect_distance_nm=20.0,
+            density_threshold=0.1,
+            minimum_points=100,
+        )
+        self.assertEqual(len(regions), 1)
+        self.assertEqual(len(regions[0]), 120)
+        self.assertEqual(set(np.unique(labels)), {-1, 0})
+
+    def test_alignment_cache_reuses_candidate_images_and_polar_transforms(self) -> None:
+        from scipy.ndimage import gaussian_filter
+
+        rng = np.random.default_rng(909)
+        grid = ideal_grid_points(3, 4, 20.0, 20.0)
+        region = np.vstack([rng.normal(site, 1.2, size=(12, 2)) for site in grid])
+        regions = [region]
+        templates: list[np.ndarray] = []
+        for omitted in (0, 11):
+            image = np.zeros((80, 100), dtype=float)
+            for x_nm, y_nm in np.delete(grid, omitted, axis=0):
+                column = int(round((x_nm + 50.0) / 100.0 * 99.0))
+                row = int(round((y_nm + 40.0) / 80.0 * 79.0))
+                image[row, column] = 1.0
+            templates.append(gaussian_filter(image, 2.0))
+
+        cache: dict[tuple[object, ...], tuple[object, ...]] = {}
+        with (
+            mock.patch(
+                "origami_analysis._render_candidate_image",
+                wraps=origami_analysis._render_candidate_image,
+            ) as render_mock,
+            mock.patch(
+                "origami_analysis._polar_image",
+                wraps=origami_analysis._polar_image,
+            ) as polar_mock,
+        ):
+            _align_regions_by_image_correlation(
+                regions,
+                rectangle_width_nm=100.0,
+                rectangle_height_nm=80.0,
+                requested_pixel_nm=1.0,
+                iterations=1,
+                template_points_nm=grid,
+                template_image=templates[0],
+                sparse_pose_site_count=3,
+                candidate_image_cache=cache,
+            )
+            _align_regions_by_image_correlation(
+                regions,
+                rectangle_width_nm=100.0,
+                rectangle_height_nm=80.0,
+                requested_pixel_nm=1.0,
+                iterations=1,
+                template_points_nm=grid,
+                template_image=templates[1],
+                sparse_pose_site_count=3,
+                candidate_image_cache=cache,
+            )
+            # The base region thumbnail is rendered once. Additional renders
+            # are template-specific refined pose trials centered at zero.
+            self.assertEqual(
+                sum(call.args[0] is region for call in render_mock.call_args_list),
+                1,
+            )
+            # Polar conversion runs once for that candidate plus once for each
+            # distinct template.
+            self.assertEqual(polar_mock.call_count, 3)
+
+    def test_bidirectional_classification_penalizes_dense_superset_templates(self) -> None:
+        sparse_scores = bidirectional_template_classification_scores(
+            # The dense template has a much higher raw correlation for the
+            # sparse object, while the sparse template has a higher raw
+            # correlation for the full object. Bidirectional evidence must
+            # overcome both one-sided correlation mistakes.
+            np.asarray([0.45, 0.95]),
+            np.asarray([0.90, 0.45]),
+            np.asarray([5, 5]),
+            5,
+        )
+        full_scores = bidirectional_template_classification_scores(
+            np.asarray([0.99, 0.70]),
+            np.asarray([0.95, 0.90]),
+            np.asarray([5, 10]),
+            10,
+        )
+        classification = classify_template_candidates(
+            [np.asarray([[0.0, 0.0], [100.0, 0.0]]), np.asarray([[0.0, 0.0], [100.0, 0.0]])],
+            [np.asarray([True, True]), np.asarray([True, True])],
+            [sparse_scores, full_scores],
+            match_distance_nm=5.0,
+        )
+
+        np.testing.assert_array_equal(classification.counts, [1, 1])
+        self.assertGreater(sparse_scores[0], full_scores[0])
+        self.assertGreater(full_scores[1], sparse_scores[1])
+
+    def test_classification_balances_observed_bright_and_black_evidence(self) -> None:
+        sparse_score = bidirectional_template_classification_scores(
+            np.asarray([0.5]),
+            np.asarray([0.75]),
+            np.asarray([13]),
+            26,
+            off_site_empty_fractions=np.asarray([0.80]),
+        )[0]
+        dense_score = bidirectional_template_classification_scores(
+            np.asarray([0.5]),
+            np.asarray([0.90]),
+            np.asarray([32]),
+            64,
+            off_site_empty_fractions=np.asarray([0.80]),
+        )[0]
+
+        expected_sparse = np.cbrt(0.75 * 0.50 * 0.80) * (0.75 + 0.25 * 0.5)
+        expected_dense = np.cbrt(0.90 * 0.50 * 0.80) * (0.75 + 0.25 * 0.5)
+        self.assertAlmostEqual(sparse_score, expected_sparse, places=12)
+        self.assertAlmostEqual(dense_score, expected_dense, places=12)
+        self.assertGreater(dense_score, sparse_score)
+
+    def test_classification_prefers_the_correct_spatial_cell_pattern(self) -> None:
+        correct = bidirectional_template_classification_scores(
+            np.asarray([0.5]),
+            np.asarray([0.75]),
+            np.asarray([12]),
+            24,
+            off_site_empty_fractions=np.asarray([0.75]),
+            bright_site_probabilities=np.asarray([0.75]),
+            cell_pattern_correlations=np.asarray([0.80]),
+        )[0]
+        wrong = bidirectional_template_classification_scores(
+            np.asarray([0.5]),
+            np.asarray([0.75]),
+            np.asarray([12]),
+            24,
+            off_site_empty_fractions=np.asarray([0.75]),
+            bright_site_probabilities=np.asarray([0.75]),
+            cell_pattern_correlations=np.asarray([0.20]),
+        )[0]
+
+        self.assertGreater(correct, wrong * 1.5)
+
+    def test_detected_site_mask_prefers_matching_template_layout(self) -> None:
+        grid = ideal_grid_points(3, 4, 10.0, 8.0)
+        square_cells = np.asarray([0, 1, 2, 3, 4, 7, 8, 9, 10, 11])
+        diagonal_cells = np.asarray([0, 1, 2, 3, 5, 6, 8, 11])
+        detected = np.zeros((1, 12), dtype=bool)
+        detected[0, square_cells] = True
+
+        square_bright, square_dark, square_pattern = detected_lattice_template_agreement(
+            detected,
+            grid[square_cells],
+            rows=3,
+            columns=4,
+            spacing_x_nm=10.0,
+            spacing_y_nm=8.0,
+        )
+        diagonal_bright, diagonal_dark, diagonal_pattern = detected_lattice_template_agreement(
+            detected,
+            grid[diagonal_cells],
+            rows=3,
+            columns=4,
+            spacing_x_nm=10.0,
+            spacing_y_nm=8.0,
+        )
+
+        self.assertAlmostEqual(square_bright[0], 1.0)
+        self.assertAlmostEqual(square_dark[0], 1.0)
+        self.assertAlmostEqual(square_pattern[0], 1.0)
+        self.assertGreater(square_pattern[0], diagonal_pattern[0] + 0.50)
+        self.assertGreater(square_bright[0], diagonal_bright[0])
+        self.assertGreater(square_dark[0], diagonal_dark[0])
+
+    def test_monte_carlo_evidence_recovers_template_and_rejects_blob(self) -> None:
+        rows, columns = 6, 8
+        grid = ideal_grid_points(rows, columns, 10.0, 7.0)
+        row_ids = np.arange(rows * columns) // columns
+        column_ids = np.arange(rows * columns) % columns
+        square_cells = np.flatnonzero(
+            (row_ids == 0) | (row_ids == rows - 1) | (column_ids == 0) | (column_ids == columns - 1)
+        )
+        diagonal_cells = np.flatnonzero(
+            (column_ids == row_ids) | (column_ids == columns - row_ids - 1)
+        )
+        observed_square = np.zeros((1, rows * columns), dtype=bool)
+        observed_square[0, square_cells] = True
+
+        square_posterior, square_evidence = monte_carlo_template_evidence(
+            observed_square,
+            grid[square_cells],
+            rows=rows,
+            columns=columns,
+            spacing_x_nm=10.0,
+            spacing_y_nm=7.0,
+        )
+        _diagonal_posterior, diagonal_evidence = monte_carlo_template_evidence(
+            observed_square,
+            grid[diagonal_cells],
+            rows=rows,
+            columns=columns,
+            spacing_x_nm=10.0,
+            spacing_y_nm=7.0,
+        )
+        blob = np.sum(np.square(grid / np.asarray([18.0, 12.0])), axis=1) < 1.0
+        blob_posterior, _blob_evidence = monte_carlo_template_evidence(
+            blob[None, :],
+            grid[square_cells],
+            rows=rows,
+            columns=columns,
+            spacing_x_nm=10.0,
+            spacing_y_nm=7.0,
+        )
+
+        self.assertGreater(square_posterior[0], 0.95)
+        self.assertGreater(square_evidence[0], diagonal_evidence[0] + 5.0)
+        self.assertLess(blob_posterior[0], 0.70)
+
+    def test_monte_carlo_evidence_tolerates_dropout_without_zero_probability(self) -> None:
+        rows, columns = 8, 12
+        grid = ideal_grid_points(rows, columns, 10.0, 6.0)
+        row_ids = np.arange(rows * columns) // columns
+        column_ids = np.arange(rows * columns) % columns
+        square_cells = np.flatnonzero(
+            (row_ids == 0)
+            | (row_ids == rows - 1)
+            | (column_ids == 0)
+            | (column_ids == columns - 1)
+        )
+        observed = np.zeros((2, rows * columns), dtype=bool)
+        # Only about one third of the expected sites are detected in the first
+        # footprint, as commonly happens with sparse localization data.
+        observed[0, square_cells[::3]] = True
+
+        posterior, evidence = monte_carlo_template_evidence(
+            observed,
+            grid[square_cells],
+            rows=rows,
+            columns=columns,
+            spacing_x_nm=10.0,
+            spacing_y_nm=6.0,
+        )
+
+        self.assertGreater(posterior[0], 0.50)
+        self.assertTrue(np.isfinite(evidence[0]))
+        self.assertEqual(posterior[1], 0.0)
+        self.assertLess(evidence[1], 0.0)
+
+    def test_monte_carlo_evidence_uses_graded_localization_counts(self) -> None:
+        rows, columns = 6, 8
+        grid = ideal_grid_points(rows, columns, 10.0, 7.0)
+        row_ids = np.arange(rows * columns) // columns
+        column_ids = np.arange(rows * columns) % columns
+        square_cells = np.flatnonzero(
+            (row_ids == 0)
+            | (row_ids == rows - 1)
+            | (column_ids == 0)
+            | (column_ids == columns - 1)
+        )
+        diagonal_cells = np.flatnonzero(
+            (column_ids == row_ids) | (column_ids == columns - row_ids - 1)
+        )
+        counts = np.ones((1, rows * columns), dtype=float)
+        counts[0, square_cells] = np.linspace(8.0, 40.0, len(square_cells))
+
+        square_probability, square_evidence = monte_carlo_template_evidence(
+            counts,
+            grid[square_cells],
+            rows=rows,
+            columns=columns,
+            spacing_x_nm=10.0,
+            spacing_y_nm=7.0,
+        )
+        _diagonal_probability, diagonal_evidence = monte_carlo_template_evidence(
+            counts,
+            grid[diagonal_cells],
+            rows=rows,
+            columns=columns,
+            spacing_x_nm=10.0,
+            spacing_y_nm=7.0,
+        )
+
+        self.assertGreater(square_probability[0], 0.90)
+        self.assertGreater(square_evidence[0], diagonal_evidence[0])
+
+    def test_equal_prior_cell_probabilities_recover_bright_and_dark_pattern(self) -> None:
+        grid = ideal_grid_points(2, 4, 10.0, 10.0)
+        occupied = np.asarray([0, 2, 5, 7])
+        rng = np.random.default_rng(31)
+        region = np.vstack([rng.normal(grid[cell], 0.4, size=(8, 2)) for cell in occupied])
+
+        bright, dark, on_site, pattern = lattice_template_probability_agreement(
+            [region],
+            grid[occupied],
+            rows=2,
+            columns=4,
+            spacing_x_nm=10.0,
+            spacing_y_nm=10.0,
+        )
+        wrong_bright, wrong_dark, wrong_on_site, wrong_pattern = lattice_template_probability_agreement(
+            [region],
+            grid[[0, 1, 4, 7]],
+            rows=2,
+            columns=4,
+            spacing_x_nm=10.0,
+            spacing_y_nm=10.0,
+        )
+
+        self.assertGreater(bright[0], 0.95)
+        self.assertGreater(dark[0], 0.95)
+        self.assertAlmostEqual(on_site[0], 1.0)
+        self.assertAlmostEqual(wrong_on_site[0], 0.5)
+        self.assertGreater(pattern[0], 0.95)
+        self.assertGreater(pattern[0], wrong_pattern[0] + 0.50)
+        self.assertGreater(np.sqrt(bright[0] * dark[0]), np.sqrt(wrong_bright[0] * wrong_dark[0]) + 0.30)
+
+    def test_continuous_count_agreement_uses_graded_cell_evidence(self) -> None:
+        grid = ideal_grid_points(2, 4, 10.0, 10.0)
+        occupied = np.asarray([0, 2, 5, 7])
+        counts = np.asarray([[12, 0, 8, 1, 0, 10, 0, 7]], dtype=float)
+        bright, dark, pattern = lattice_count_template_probability_agreement(
+            counts,
+            grid[occupied],
+            rows=2,
+            columns=4,
+            spacing_x_nm=10.0,
+            spacing_y_nm=10.0,
+        )
+        wrong_bright, wrong_dark, wrong_pattern = lattice_count_template_probability_agreement(
+            counts,
+            grid[[0, 1, 4, 7]],
+            rows=2,
+            columns=4,
+            spacing_x_nm=10.0,
+            spacing_y_nm=10.0,
+        )
+
+        self.assertGreater(bright[0], wrong_bright[0])
+        self.assertGreater(dark[0], wrong_dark[0])
+        self.assertGreater(pattern[0], wrong_pattern[0] + 0.5)
+
+    def test_lattice_classification_distinguishes_neighboring_black_cells(self) -> None:
+        rng = np.random.default_rng(202_609_03)
+        full_grid = ideal_grid_points(8, 12, 10.9090909091, 5.7142857143)
+        almost_full_cells = np.asarray(
+            [
+                0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11,
+                12, 13, 18, 19, 24, 26, 29, 30, 32, 35, 36, 39,
+                40, 42, 45, 46, 48, 51, 52, 54, 57, 58, 60, 62,
+                65, 66, 68, 71, 72, 73, 74, 75, 76, 77,
+            ]
+        )
+        square_cells = np.asarray(
+            [
+                0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11,
+                12, 17, 18, 23, 24, 29, 30, 35, 36, 41, 42, 47,
+                48, 53, 54, 59, 60, 65, 66, 71, 72, 77, 78, 83,
+                84, 89, 90, 95, 85, 86, 87, 88, 91, 92, 93, 94,
+            ]
+        )
+        square_region = np.vstack(
+            [rng.normal(full_grid[cell], 1.0, size=(12, 2)) for cell in square_cells]
+        )
+
+        almost_precision = lattice_template_on_site_fractions(
+            [square_region],
+            full_grid[almost_full_cells],
+            rows=8,
+            columns=12,
+            spacing_x_nm=10.9090909091,
+            spacing_y_nm=5.7142857143,
+        )[0]
+        square_precision = lattice_template_on_site_fractions(
+            [square_region],
+            full_grid[square_cells],
+            rows=8,
+            columns=12,
+            spacing_x_nm=10.9090909091,
+            spacing_y_nm=5.7142857143,
+        )[0]
+
+        self.assertGreater(square_precision, 0.90)
+        self.assertLess(almost_precision, 0.75)
+        self.assertGreater(square_precision, almost_precision + 0.20)
+
+        almost_black_empty = lattice_template_empty_cell_fractions(
+            [square_region],
+            full_grid[almost_full_cells],
+            rows=8,
+            columns=12,
+            spacing_x_nm=10.9090909091,
+            spacing_y_nm=5.7142857143,
+            min_site_localizations=3,
+        )[0]
+        square_black_empty = lattice_template_empty_cell_fractions(
+            [square_region],
+            full_grid[square_cells],
+            rows=8,
+            columns=12,
+            spacing_x_nm=10.9090909091,
+            spacing_y_nm=5.7142857143,
+            min_site_localizations=3,
+        )[0]
+
+        self.assertGreater(square_black_empty, almost_black_empty + 0.20)
+
     def test_multi_template_classification_assigns_each_object_once(self) -> None:
         classification = classify_template_candidates(
             [
@@ -45,6 +517,20 @@ class OrigamiAnalysisTests(unittest.TestCase):
         np.testing.assert_array_equal(classification.assignment_masks[1], [False, True, False])
         np.testing.assert_array_equal(classification.counts, [1, 1])
         self.assertEqual(classification.unclassified_count, 1)
+        np.testing.assert_array_equal(classification.candidate_group_indices[0], [0, 1, 2])
+        np.testing.assert_array_equal(classification.candidate_group_indices[1], [0, 1, 2])
+        np.testing.assert_allclose(
+            np.sum(classification.template_probabilities, axis=1),
+            np.asarray([1.0, 1.0, 0.0]),
+        )
+        np.testing.assert_allclose(
+            np.sum(classification.raw_template_probabilities, axis=1),
+            np.ones(3),
+        )
+        self.assertGreater(classification.template_probabilities[0, 0], 0.5)
+        self.assertGreater(classification.template_probabilities[1, 1], 0.5)
+        self.assertAlmostEqual(classification.winning_score_margins[0], 0.3)
+        self.assertAlmostEqual(classification.winning_score_margins[1], 0.45)
 
     def test_multi_template_classification_prefers_a_passing_fit(self) -> None:
         classification = classify_template_candidates(
@@ -56,13 +542,64 @@ class OrigamiAnalysisTests(unittest.TestCase):
 
         np.testing.assert_array_equal(classification.counts, [1, 0])
         self.assertEqual(classification.unclassified_count, 0)
+        np.testing.assert_allclose(classification.template_probabilities[0], [1.0, 0.0])
+        self.assertGreater(classification.raw_template_probabilities[0, 1], 0.5)
+        self.assertEqual(classification.runner_up_template_indices[0], -1)
+        self.assertTrue(np.isinf(classification.winning_score_margins[0]))
+
+    def test_shared_candidate_classification_is_template_order_invariant(self) -> None:
+        centers = np.asarray([[0.0, 0.0], [100.0, 20.0]])
+        accepted = [np.asarray([True, True]), np.asarray([True, False]), np.asarray([False, True])]
+        scores = [np.asarray([0.4, 0.5]), np.asarray([0.9, 1.2]), np.asarray([1.5, 0.8])]
+        baseline = classify_template_candidates(
+            [centers.copy() for _ in range(3)],
+            accepted,
+            scores,
+            match_distance_nm=20.0,
+        )
+        permutation = np.asarray([2, 0, 1])
+        reordered = classify_template_candidates(
+            [centers.copy() for _ in range(3)],
+            [accepted[index] for index in permutation],
+            [scores[index] for index in permutation],
+            match_distance_nm=20.0,
+        )
+
+        np.testing.assert_array_equal(
+            permutation[reordered.winning_template_indices],
+            baseline.winning_template_indices,
+        )
+        np.testing.assert_allclose(
+            reordered.template_probabilities[:, np.argsort(permutation)],
+            baseline.template_probabilities,
+        )
+
+    def test_multi_template_classification_suppresses_nearby_duplicate_fragments(self) -> None:
+        classification = classify_template_candidates(
+            [
+                np.asarray([[0.0, 0.0], [35.0, 0.0]]),
+                np.empty((0, 2), dtype=float),
+            ],
+            [np.asarray([True, True]), np.empty(0, dtype=bool)],
+            [np.asarray([0.8, 0.6]), np.empty(0, dtype=float)],
+            match_distance_nm=20.0,
+            deduplication_distance_nm=48.0,
+        )
+
+        np.testing.assert_array_equal(classification.counts, [1, 0])
+        np.testing.assert_array_equal(classification.assignment_masks[0], [True, False])
+        self.assertEqual(classification.unclassified_count, 0)
+        self.assertEqual(classification.suppressed_duplicate_count, 1)
+        np.testing.assert_array_equal(classification.winning_template_indices, [0, -2])
 
     def test_two_custom_templates_classify_a_mixed_image(self) -> None:
         from scipy.ndimage import gaussian_filter
 
         rng = np.random.default_rng(20_260_902)
         grid = ideal_grid_points(3, 4, 20.0, 20.0)
-        patterns = [np.asarray([0, 1, 5, 6, 11]), np.asarray([2, 3, 4, 8, 9, 10])]
+        # The second design is a strict bright-site superset of the first.
+        # Raw overlap alone must not classify both objects as the dense type.
+        patterns = [np.asarray([0, 1, 4, 5, 9]), np.arange(len(grid))]
         templates: list[np.ndarray] = []
         for occupied in patterns:
             image = np.zeros((80, 100), dtype=float)
@@ -96,7 +633,7 @@ class OrigamiAnalysisTests(unittest.TestCase):
                 connect_distance_nm=15.0,
                 density_threshold=0.02,
                 min_candidate_points=100,
-                max_candidate_points=300,
+                max_candidate_points=500,
                 rows=3,
                 columns=4,
                 spacing_x_nm=20.0,
@@ -114,6 +651,7 @@ class OrigamiAnalysisTests(unittest.TestCase):
                 alignment_template_image=template,
                 template_pixel_size_x_nm=100.0 / 99.0,
                 template_pixel_size_y_nm=80.0 / 79.0,
+                compute_grid_blob_bic=False,
             )
             for template in templates
         ]
@@ -123,7 +661,15 @@ class OrigamiAnalysisTests(unittest.TestCase):
                 for picks in picks_by_template
             ],
             [picks.accepted_mask for picks in picks_by_template],
-            [picks.rectangle_confidence for picks in picks_by_template],
+            [
+                bidirectional_template_classification_scores(
+                    picks.rectangle_confidence,
+                    picks.on_site_fraction,
+                    picks.supported_site_count,
+                    len(picks.template_points_nm),
+                )
+                for picks in picks_by_template
+            ],
             match_distance_nm=20.0,
         )
 
@@ -322,6 +868,8 @@ class OrigamiAnalysisTests(unittest.TestCase):
         self.assertEqual(len(picks.aligned_regions[0]), len(points))
         self.assertEqual(picks.template_points_nm.shape, (len(occupied), 2))
         self.assertEqual(picks.site_localization_counts.shape, (1, len(occupied)))
+        self.assertEqual(picks.lattice_supported_sites.shape, (1, 49))
+        np.testing.assert_array_equal(np.flatnonzero(picks.lattice_supported_sites[0]), occupied)
         nearest_template_distance = np.min(
             np.linalg.norm(
                 picks.template_points_nm[:, None, :] - grid[occupied][None, :, :],
@@ -942,6 +1490,11 @@ class OrigamiAnalysisTests(unittest.TestCase):
         self.assertAlmostEqual(picks.rectangle_height_nm, 56.0)
         self.assertGreater(picks.rectangle_confidence[0], 0.8)
         self.assertLess(picks.point_counts[0], len(points))
+        self.assertGreaterEqual(picks.original_point_counts[0], picks.point_counts[0])
+        self.assertAlmostEqual(
+            picks.crop_retained_fractions[0],
+            picks.point_counts[0] / picks.original_point_counts[0],
+        )
         self.assertLessEqual(picks.alignment_reference_image.shape[0], 128)
         self.assertEqual(picks.alignment_candidate_images.shape[0], 1)
         self.assertEqual(picks.site_localization_counts.shape, (1, 12))
@@ -1250,9 +1803,9 @@ class OrigamiAnalysisTests(unittest.TestCase):
             min_candidate_points=1000,
             max_candidate_points=2000,
         )
-        self.assertEqual(len(rejected_picks.regions), 24)
+        self.assertEqual(len(rejected_picks.regions), 0)
         self.assertEqual(rejected_picks.accepted_count, 0)
-        self.assertTrue(np.all(rejected_picks.point_counts == 132))
+        self.assertEqual(rejected_picks.point_counts.size, 0)
 
         result = analyze_origami_regions(
             points,

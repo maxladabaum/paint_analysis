@@ -1,41 +1,70 @@
 import json
 import unittest
+from dataclasses import replace
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from types import SimpleNamespace
 from unittest import mock
 
 import numpy as np
+import pandas as pd
 import tifffile
 from PIL import Image, PngImagePlugin
 from matplotlib.figure import Figure
+
+from origami_analysis import OrigamiPickResult
 
 from paint_analysis_gui import (
     DEFAULT_ORIGAMI_ALIGNMENT_MAX_PIXELS,
     DEFAULT_ORIGAMI_ALIGNMENT_PASSES,
     DEFAULT_ORIGAMI_CONNECT_DISTANCE_NM,
     DEFAULT_ORIGAMI_CORRELATION_THRESHOLD,
+    DEFAULT_ORIGAMI_MAX_POINTS,
     DEFAULT_ORIGAMI_MAX_SITE_SPACING_ERROR_NM,
+    DEFAULT_ORIGAMI_MIN_DENSITY,
+    DEFAULT_ORIGAMI_MIN_MONTE_CARLO_POSTERIOR,
     DEFAULT_ORIGAMI_MIN_POINTS,
     DEFAULT_ORIGAMI_MIN_SITE_PROMINENCE,
+    DEFAULT_ORIGAMI_PICK_BIN_NM,
     DEFAULT_ORIGAMI_SHOW_DETECTED_SITES_OVERLAY,
+    DEFAULT_ORIGAMI_SHOW_PROMINENCE_GEOMETRY,
+    DEFAULT_ORIGAMI_SHOW_SITE_DIAGNOSTICS,
     DEFAULT_ORIGAMI_SHOW_TEXT_STATISTICS,
     DEFAULT_ORIGAMI_SHOW_THEORETICAL_OVERLAY,
     DEFAULT_ORIGAMI_USE_CORRELATION_GATE,
+    DEFAULT_ORIGAMI_USE_CELL_PATTERN_GATE,
     FILTERED_MAP_TAB,
+    LoadedData,
     ORIGAMI_TAB,
     OrigamiToolbar,
+    ORIGAMI_ALIGNMENT_CACHE_KEYS,
+    ORIGAMI_SITE_CACHE_KEYS,
     PaintAnalysisApp,
     PicassoAimStatusProgress,
     TemporalVLineAnnotation,
+    classification_bias_diagnostics,
+    classified_template_overlay_indices,
+    classified_template_overlay_points,
+    digital_group_blob_contours,
+    digital_group_decision_blobs,
+    digital_group_decision_annotations,
+    digital_group_decision_overlay_points,
+    digital_group_site_memberships,
     custom_template_contours_nm,
+    custom_template_display_name,
     load_custom_template_image,
     load_custom_template_metadata,
+    logical_stroke_model_from_metadata,
+    load_development_session_cache,
     optimal_dynamic_render_pixel_nm,
+    origami_stage_cache_matches,
     origami_candidate_failure_reasons,
+    origami_source_fingerprint,
     origami_site_decision_label,
     parse_temporal_vline_annotation,
     responsive_column_count,
+    save_development_session_cache,
+    save_development_map_cache,
     theoretical_grid_in_footprint,
 )
 
@@ -62,6 +91,347 @@ class FakeAxis:
 
 
 class DynamicRenderTests(unittest.TestCase):
+    def test_step_one_cache_uses_exact_source_and_skips_an_unchanged_rerun(self) -> None:
+        first = np.asarray([[0.0, 0.0], [1.0, 1.0]])
+        second = np.asarray([[0.0, 0.0], [2.0, 2.0]])
+        self.assertEqual(origami_source_fingerprint(first), origami_source_fingerprint(first.copy()))
+        self.assertNotEqual(origami_source_fingerprint(first), origami_source_fingerprint(second))
+
+        signature = (10.0, 20.0, 0.8, 200, len(first), origami_source_fingerprint(first))
+        candidates = ([first], np.zeros((1, 1)), np.zeros((1, 1)), (0.0, 1.0, 0.0, 1.0), np.zeros((1, 1)))
+        app = SimpleNamespace(
+            origami_identification_running=False,
+            origami_source_points_nm=first,
+            origami_loaded_source_path=Path("source.hdf5"),
+            origami_staged_candidates=candidates,
+            origami_staged_candidate_signature=signature,
+            origami_active_step=0,
+            origami_identification_progress=FakeVariable(0.0),
+            origami_identification_progress_text=FakeVariable(""),
+            origami_step_progress={1: FakeVariable(0.0)},
+            origami_step_progress_text={1: FakeVariable("")},
+            origami_staged_status=FakeVariable(""),
+            status=FakeVariable(""),
+            _origami_candidate_stage_signature=lambda: signature,
+            _plot_origami_coarse_density=mock.Mock(),
+            _run_worker=mock.Mock(),
+        )
+
+        PaintAnalysisApp._run_origami_candidate_stage(app)
+
+        app._run_worker.assert_not_called()
+        app._plot_origami_coarse_density.assert_called_once_with()
+        self.assertEqual(app.origami_step_progress[1].get(), 100.0)
+
+    def test_step_four_cache_ignores_classification_template_names(self) -> None:
+        previous = {
+            key: f"stable-{index}"
+            for index, key in enumerate(
+                ORIGAMI_ALIGNMENT_CACHE_KEYS + ORIGAMI_SITE_CACHE_KEYS
+            )
+        }
+        current = dict(previous)
+        previous["custom_template_name"] = "L_L"
+        current["custom_template_name"] = "square"
+        previous["template_mode"] = "Custom image"
+        current["template_mode"] = "Custom image"
+
+        self.assertTrue(
+            origami_stage_cache_matches(
+                previous,
+                current,
+                ORIGAMI_ALIGNMENT_CACHE_KEYS + ORIGAMI_SITE_CACHE_KEYS,
+            )
+        )
+        current["_alignment_template_signature"] = "different-alignment"
+        self.assertFalse(
+            origami_stage_cache_matches(
+                previous,
+                current,
+                ORIGAMI_ALIGNMENT_CACHE_KEYS + ORIGAMI_SITE_CACHE_KEYS,
+            )
+        )
+
+    def test_classified_template_overlay_uses_alignment_and_active_logical_sites(self) -> None:
+        grid = np.column_stack((np.arange(8, dtype=float), np.zeros(8)))
+        params = {
+            "logical_model": {
+                "physical_shape": (2, 4),
+                "alignment_cells": (0, 1),
+                "bit_physical_cells": ((1, 2, 3), (3, 4), (6, 7)),
+                "active_bits": (True, False, True),
+            }
+        }
+
+        indices = classified_template_overlay_indices(grid, params)
+
+        np.testing.assert_array_equal(indices, [0, 1, 2, 3, 6, 7])
+
+        sparse_alignment = grid[[0, 1]]
+        calibrated_params = {
+            **params,
+            "spacing_x_nm": 10.0,
+            "spacing_y_nm": 20.0,
+        }
+        points = classified_template_overlay_points(sparse_alignment, calibrated_params)
+        full_grid = np.asarray(
+            [
+                [-15.0, -10.0], [-5.0, -10.0], [5.0, -10.0], [15.0, -10.0],
+                [-15.0, 10.0], [-5.0, 10.0], [5.0, 10.0], [15.0, 10.0],
+            ]
+        )
+        np.testing.assert_allclose(points, full_grid[[0, 1, 2, 3, 6, 7]])
+
+    def test_digital_group_decisions_replace_physical_site_labels(self) -> None:
+        grid = np.column_stack((np.arange(6, dtype=float), np.zeros(6)))
+        params = {
+            "digital_pixel_model": {
+                "bit_ids": ("slash", "bottom"),
+                "bit_physical_cells": ((0, 1, 2), (2, 4, 5)),
+                "physical_shape": (1, 6),
+            },
+            "digital_pixel_probabilities": ((0.82, 0.21),),
+        }
+
+        annotations = digital_group_decision_annotations(grid, params, 0)
+
+        self.assertIsNotNone(annotations)
+        assert annotations is not None
+        self.assertEqual([item[1] for item in annotations], [
+            "slash: ON p=0.82",
+            "bottom: OFF p=0.21",
+        ])
+        np.testing.assert_allclose(annotations[0][0], [1.0, 0.0])
+        np.testing.assert_allclose(annotations[1][0], [11.0 / 3.0, 0.0])
+
+        selected_points = digital_group_decision_overlay_points(grid, params, 0)
+        assert selected_points is not None
+        np.testing.assert_allclose(selected_points, grid[[0, 1, 2]])
+        blobs = digital_group_decision_blobs(grid, params, 0)
+        self.assertEqual([item[0] for item in blobs], ["slash", "bottom"])
+        self.assertEqual([item[2] for item in blobs], ["#16a34a", "#94a3b8"])
+        self.assertGreater(blobs[0][3], blobs[1][3])
+
+    def test_digital_group_decisions_fall_back_for_legacy_templates(self) -> None:
+        self.assertIsNone(
+            digital_group_decision_annotations(
+                np.zeros((4, 2)),
+                {"digital_pixel_probabilities": ((0.5,),)},
+                0,
+            )
+        )
+
+    def test_digital_group_blobs_outline_overlapping_analog_memberships(self) -> None:
+        grid = np.asarray(
+            [[0.0, 0.0], [10.0, 0.0], [20.0, 0.0], [20.0, 10.0]],
+            dtype=float,
+        )
+        model = {
+            "bit_ids": ("horizontal", "corner"),
+            "bit_physical_cells": ((0, 1, 2), (2, 3)),
+        }
+
+        outlines = digital_group_blob_contours(grid, model)
+
+        self.assertEqual([name for name, _contours in outlines], ["horizontal", "corner"])
+        self.assertTrue(all(contours for _name, contours in outlines))
+        horizontal_points = np.vstack(outlines[0][1])
+        corner_points = np.vstack(outlines[1][1])
+        self.assertLess(float(np.min(horizontal_points[:, 0])), 0.0)
+        self.assertGreater(float(np.max(horizontal_points[:, 0])), 20.0)
+        self.assertGreater(float(np.max(corner_points[:, 1])), 10.0)
+
+    def test_analog_sites_map_to_digital_groups_with_shared_membership(self) -> None:
+        group_ids, memberships = digital_group_site_memberships(
+            {
+                "bit_ids": ("slash", "bottom"),
+                "bit_physical_cells": ((0, 1, 2), (2, 3)),
+            },
+            5,
+        )
+
+        self.assertEqual(group_ids, ("slash", "bottom"))
+        self.assertEqual(memberships, ((0,), (0,), (0, 1), (1,), ()))
+
+    def test_result_overlays_include_only_active_groups_from_selected_template(self) -> None:
+        grid = np.asarray([[0.0, 0.0], [10.0, 0.0], [20.0, 0.0]])
+        model = {
+            "bit_ids": ("selected", "inactive"),
+            "bit_physical_cells": ((0, 1), (1, 2)),
+            "active_bits": (True, False),
+        }
+
+        outlines = digital_group_blob_contours(grid, model, active_only=True)
+        group_ids, memberships = digital_group_site_memberships(
+            model, len(grid), active_only=True
+        )
+
+        self.assertEqual([name for name, _contours in outlines], ["selected"])
+        self.assertEqual(group_ids, ("selected",))
+        self.assertEqual(memberships, ((0,), (0,), ()))
+
+        app = PaintAnalysisApp.__new__(PaintAnalysisApp)
+        app.origami_identification_params = {
+            "digital_pixel_model": {
+                "bit_ids": ("selected", "inactive"),
+                "active_bits": (True, True),
+            },
+            "logical_model": model,
+        }
+        self.assertIs(PaintAnalysisApp._active_origami_digital_pixel_model(app), model)
+        axis = Figure().subplots()
+        handles = PaintAnalysisApp._draw_digital_group_blobs(app, axis, grid)
+        self.assertEqual([handle.get_label() for handle in handles], ["selected"])
+
+    def test_digital_overlay_reconstructs_full_analog_lattice_and_draws_groups(self) -> None:
+        app = PaintAnalysisApp.__new__(PaintAnalysisApp)
+        app.origami_identification_params = {
+            "digital_pixel_model": {
+                "bit_ids": ("shared",),
+                "bit_physical_cells": ((0, 1, 2),),
+                "physical_shape": (2, 3),
+            }
+        }
+        result = SimpleNamespace(grid_points_nm=np.asarray([[0.0, 0.0], [10.0, 0.0]]))
+        settings = {"spacing_x_nm": 10.0, "spacing_y_nm": 20.0}
+
+        grid = PaintAnalysisApp._origami_digital_overlay_grid(app, result, settings)
+        axis = Figure().subplots()
+        handles = PaintAnalysisApp._draw_digital_group_blobs(app, axis, grid)
+
+        self.assertEqual(grid.shape, (6, 2))
+        self.assertEqual([handle.get_label() for handle in handles], ["shared"])
+        self.assertEqual(len(axis.collections), 1)
+
+    def test_individual_assignments_color_clusters_by_digital_group(self) -> None:
+        app = PaintAnalysisApp.__new__(PaintAnalysisApp)
+        app.origami_identification_params = {
+            "digital_pixel_model": {
+                "bit_ids": ("one_group",),
+                "bit_physical_cells": ((0, 1),),
+                "physical_shape": (1, 2),
+            }
+        }
+        app.origami_gallery_tile_hitboxes = []
+        app.origami_gallery_page_label = FakeVariable("Page 1/1")
+        result = SimpleNamespace(
+            origami_count=1,
+            aligned_points=[np.asarray([[-5.0, 0.0], [5.0, 0.0]])],
+            cluster_labels=[np.asarray([0, 1])],
+            cluster_centers_nm=[np.asarray([[-5.0, 0.0], [5.0, 0.0]])],
+            cluster_site_indices=[np.asarray([0, 1])],
+            source_point_counts=np.asarray([2]),
+            rows=1,
+            columns=2,
+            grid_points_nm=np.asarray([[-5.0, 0.0], [5.0, 0.0]]),
+            clustering_method="direct",
+            direct_min_site_localizations=1,
+            direct_min_site_evidence=0.0,
+            site_match_radius_nm=5.0,
+            g5m_sigma_min_nm=0.5,
+            g5m_sigma_max_nm=5.0,
+            g5m_min_locs=3,
+            g5m_max_rounds_without_best_bic=2,
+        )
+        settings = {
+            "rows": 1,
+            "columns": 2,
+            "spacing_x_nm": 10.0,
+            "spacing_y_nm": 10.0,
+            "pixel_size_nm": 1.0,
+            "padding_nm": 5.0,
+            "blur_nm": 0.0,
+        }
+        axis = Figure().subplots()
+
+        PaintAnalysisApp._plot_individual_origami_clusters(
+            app, axis, result, settings, np.asarray([0])
+        )
+
+        gallery = np.asarray(axis.images[0].get_array())
+        np.testing.assert_allclose(gallery[10, 5], gallery[10, 15])
+        self.assertEqual(
+            [text.get_text() for text in axis.get_legend().get_texts()],
+            ["one_group"],
+        )
+        self.assertIn("1 digital groups", axis.texts[0].get_text())
+
+    def test_symbolic_template_filenames_have_readable_display_names(self) -> None:
+        self.assertEqual(custom_template_display_name("/tmp/:.png.png"), "/")
+        self.assertEqual(custom_template_display_name("/tmp/:\\.png"), "\\")
+        self.assertEqual(custom_template_display_name("/tmp/almost_full.png"), "almost_full")
+        self.assertEqual(
+            custom_template_display_name("/tmp/filesystem-safe.png", {"display_name": "/"}),
+            "/",
+        )
+
+    def test_development_session_cache_restores_numeric_locs_and_invalidates_changed_source(self) -> None:
+        with TemporaryDirectory() as directory:
+            folder = Path(directory)
+            source = folder / "source.hdf5"
+            source.write_bytes(b"source-v1")
+            raw = pd.DataFrame(
+                {
+                    "frame": np.asarray([0, 1], dtype=np.uint32),
+                    "x": [1.0, 2.0],
+                    "y": [3.0, 4.0],
+                }
+            )
+            corrected = raw.assign(x=[0.5, 1.5])
+            drift = pd.DataFrame({"x": [0.5, 0.5], "y": [0.0, 0.0]})
+            loaded = LoadedData(
+                source,
+                raw,
+                [{"Frames": 2, "Pixelsize": 130.0}],
+                {"source": "test"},
+            )
+            settings = {
+                "method": "aim",
+                "segmentation": 1000,
+                "aim_intersect_nm": 20.0,
+                "aim_roi_nm": 60.0,
+                "rcc_lattice_pitch_nm": 0.0,
+                "drift_file": None,
+            }
+
+            cache_path = save_development_session_cache(
+                loaded,
+                corrected,
+                drift,
+                "Picasso AIM test",
+                settings,
+                folder / "cache",
+            )
+            restored = load_development_session_cache(source, settings, folder / "cache")
+
+            self.assertIsNotNone(cache_path)
+            self.assertIsNotNone(restored)
+            assert restored is not None
+            pd.testing.assert_frame_equal(restored["loaded"].locs, raw)
+            pd.testing.assert_frame_equal(restored["locs"], corrected)
+            pd.testing.assert_frame_equal(restored["drift"], drift)
+            self.assertEqual(restored["label"], "Picasso AIM test")
+
+            map_result = {
+                "result_type": "map",
+                "image": np.arange(12, dtype=float).reshape(3, 4),
+                "extent": (0.0, 40.0, 0.0, 30.0),
+                "viewport_nm": None,
+                "n_rendered": 2,
+                "disp_px_size_nm": 10.0,
+                "blur_method": "smooth",
+            }
+            assert cache_path is not None
+            self.assertTrue(save_development_map_cache(cache_path, map_result))
+            restored_with_map = load_development_session_cache(source, settings, folder / "cache")
+            assert restored_with_map is not None
+            np.testing.assert_array_equal(restored_with_map["cached_map"]["image"], map_result["image"])
+            self.assertEqual(restored_with_map["cached_map"]["extent"], map_result["extent"])
+            self.assertEqual(restored_with_map["cached_map"]["disp_px_size_nm"], 10.0)
+
+            source.write_bytes(b"source-v2-is-different")
+            self.assertIsNone(load_development_session_cache(source, settings, folder / "cache"))
+
     def test_aim_progress_accounts_for_all_3d_passes_and_never_exceeds_100_percent(self) -> None:
         updates: list[str] = []
         progress = PicassoAimStatusProgress(updates.append, phase_count=4)
@@ -136,6 +506,42 @@ class DynamicRenderTests(unittest.TestCase):
         self.assertGreater(float(loaded[-1, 1]), 0.0)
         self.assertEqual(float(loaded[0, 1]), 0.0)
 
+    def test_colored_logical_groups_have_equal_alignment_intensity(self) -> None:
+        metadata = {
+            "format": "paint-analysis-origami-template-v1",
+            "rows": 2,
+            "columns": 2,
+            "spacing_x_nm": 10.0,
+            "spacing_y_nm": 10.0,
+            "margin_nm": 5.0,
+            "width_nm": 20.0,
+            "height_nm": 20.0,
+            "width_px": 5,
+            "height_px": 4,
+            "logical_model": {
+                "format": "paint-analysis-logical-bits-v1",
+                "physical_rows": 2,
+                "physical_columns": 2,
+                "logical_bits": [
+                    {"id": "red bit", "physical_sites": [[1, 1]], "display_color": "#ff0000"},
+                    {"id": "green bit", "physical_sites": [[1, 2]], "display_color": "#00ff00"},
+                ],
+                "active_logical_bits": ["red bit", "green bit"],
+            },
+        }
+        rgb = np.zeros((4, 5, 3), dtype=np.uint8)
+        rgb[0, 1] = (255, 0, 0)
+        rgb[0, 3] = (0, 255, 0)
+        png_metadata = PngImagePlugin.PngInfo()
+        png_metadata.add_text("paint_analysis_template", json.dumps(metadata))
+        with TemporaryDirectory() as directory:
+            path = Path(directory) / "colored_groups.png"
+            Image.fromarray(rgb).save(path, pnginfo=png_metadata)
+            loaded = load_custom_template_image(path)
+
+        self.assertEqual(float(loaded[-1, 1]), float(loaded[-1, 3]))
+        self.assertGreater(float(loaded[-1, 1]), 0.0)
+
     def test_custom_template_loader_reads_embedded_picklist_calibration(self) -> None:
         metadata = {
             "format": "paint-analysis-origami-template-v1",
@@ -163,6 +569,263 @@ class DynamicRenderTests(unittest.TestCase):
         self.assertEqual((loaded["rows"], loaded["columns"]), (8, 12))
         self.assertAlmostEqual(loaded["pixel_size_x_nm"], 160.0 / 499.0)
         self.assertAlmostEqual(loaded["pixel_size_y_nm"], 80.0 / 249.0)
+
+    def test_logical_stroke_metadata_is_normalized_to_lattice_indices(self) -> None:
+        metadata = {
+            "rows": 8,
+            "columns": 12,
+            "logical_model": {
+                "format": "paint-analysis-logical-bits-v1",
+                "physical_rows": 8,
+                "physical_columns": 12,
+                "alignment_groups": [
+                    {"id": "alignment", "physical_sites": [[1, 1], [8, 12]]}
+                ],
+                "logical_bits": [
+                    {"id": "left.slash", "physical_sites": [[2, 2], [3, 3]]},
+                    {"id": "right.bottom", "physical_sites": [[8, 8], [8, 9]]},
+                ],
+                "active_logical_bits": ["left.slash"],
+            },
+        }
+        model = logical_stroke_model_from_metadata(metadata)
+        self.assertEqual(model["bit_ids"], ("left.slash", "right.bottom"))
+        self.assertEqual(model["bit_cells"], ((62, 73), (7, 8)))
+        self.assertEqual(model["alignment_cells"], (11, 84))
+        self.assertEqual(model["active_bits"], (True, False))
+
+    def test_loading_separate_shared_alignment_template_preserves_calibration(self) -> None:
+        app = PaintAnalysisApp.__new__(PaintAnalysisApp)
+        app._file_dialog_initial_dir = mock.Mock(return_value=Path("/tmp"))
+        app._remember_file_dialog_dir = mock.Mock()
+        app.origami_shared_alignment_template_name = FakeVariable("")
+        app.status = FakeVariable("")
+        metadata = {
+            "width_px": 500,
+            "height_px": 250,
+            "rows": 8,
+            "columns": 12,
+            "spacing_x_nm": 120.0 / 11.0,
+            "spacing_y_nm": 40.0 / 7.0,
+            "margin_nm": 20.0,
+            "pixel_size_x_nm": 160.0 / 499.0,
+            "pixel_size_y_nm": 80.0 / 249.0,
+        }
+        image = np.zeros((250, 500), dtype=float)
+        with (
+            mock.patch("paint_analysis_gui.filedialog.askopenfilename", return_value="/tmp/L_L.png"),
+            mock.patch("paint_analysis_gui.load_custom_template_image", return_value=image),
+            mock.patch("paint_analysis_gui.load_custom_template_metadata", return_value=metadata),
+        ):
+            PaintAnalysisApp._load_origami_shared_alignment_template(app)
+
+        self.assertEqual(app.origami_shared_alignment_template["name"], "L_L")
+        self.assertEqual(app.origami_shared_alignment_template["rows"], 8)
+        self.assertAlmostEqual(
+            app.origami_shared_alignment_template["template_pixel_size_x_nm"],
+            160.0 / 499.0,
+        )
+        self.assertIn("Shared alignment: L_L", app.origami_shared_alignment_template_name.get())
+
+    def test_clearing_shared_alignment_restores_independent_fitting(self) -> None:
+        app = PaintAnalysisApp.__new__(PaintAnalysisApp)
+        app.origami_shared_alignment_template = {"name": "L_L"}
+        app.origami_shared_alignment_template_name = FakeVariable("Shared alignment: L_L")
+        app.status = FakeVariable("")
+
+        PaintAnalysisApp._clear_origami_shared_alignment_template(app)
+
+        self.assertIsNone(app.origami_shared_alignment_template)
+        self.assertEqual(
+            app.origami_shared_alignment_template_name.get(),
+            "No alignment template loaded",
+        )
+        self.assertIn("Load one", app.status.get())
+
+    def test_loading_standalone_digital_pixel_json(self) -> None:
+        app = PaintAnalysisApp.__new__(PaintAnalysisApp)
+        app._file_dialog_initial_dir = mock.Mock(return_value=Path("/tmp"))
+        app._remember_file_dialog_dir = mock.Mock()
+        app.origami_shared_alignment_template = {"rows": 2, "columns": 3}
+        app.origami_custom_templates = []
+        app.origami_digital_pixel_schema_name = FakeVariable("")
+        app.status = FakeVariable("")
+        schema = {
+            "format": "paint-analysis-logical-bits-v1",
+            "physical_rows": 2,
+            "physical_columns": 3,
+            "alignment_groups": [],
+            "logical_bits": [
+                {"id": "bit_a", "physical_sites": [[1, 1], [1, 2]]},
+                {"id": "bit_b", "physical_sites": [[2, 2], [2, 3]]},
+            ],
+        }
+        with TemporaryDirectory() as temporary_directory:
+            path = Path(temporary_directory) / "digital_groups.json"
+            path.write_text(json.dumps(schema), encoding="utf-8")
+            with mock.patch(
+                "paint_analysis_gui.filedialog.askopenfilename",
+                return_value=str(path),
+            ):
+                PaintAnalysisApp._load_origami_digital_pixel_schema(app)
+
+        self.assertEqual(app.origami_digital_pixel_model["bit_ids"], ("bit_a", "bit_b"))
+        self.assertIn("2 digital groups", app.origami_digital_pixel_schema_name.get())
+
+    def test_shared_alignment_fits_once_and_preserves_each_digital_model(self) -> None:
+        empty = np.empty(0, dtype=float)
+        site_count = 4
+        picks = OrigamiPickResult(
+            regions=[],
+            aligned_regions=[],
+            accepted_mask=np.empty(0, dtype=bool),
+            point_counts=np.empty(0, dtype=int),
+            original_point_counts=np.empty(0, dtype=int),
+            crop_retained_fractions=empty,
+            bounds_nm=np.empty((0, 4)),
+            rectangle_corners_nm=np.empty((0, 4, 2)),
+            rectangle_angles_deg=empty,
+            rectangle_confidence=empty,
+            site_gap_contrast=empty,
+            on_site_fraction=empty,
+            site_mask_radius_nm=1.0,
+            template_points_nm=np.zeros((site_count, 2)),
+            lattice_site_localization_counts=np.empty((0, site_count)),
+            lattice_site_prominence=np.empty((0, site_count)),
+            lattice_supported_sites=np.empty((0, site_count), dtype=bool),
+            site_localization_counts=np.empty((0, site_count)),
+            site_prominence=np.empty((0, site_count)),
+            site_peak_positions_nm=np.empty((0, site_count, 2)),
+            site_boundary_reference_positions_nm=np.empty((0, site_count, 2)),
+            site_boundary_points_nm=np.empty((0, site_count, 32, 2)),
+            site_centroids_nm=np.empty((0, site_count, 2)),
+            supported_site_count=np.empty(0, dtype=int),
+            supported_row_count=np.empty(0, dtype=int),
+            supported_column_count=np.empty(0, dtype=int),
+            site_spacing_rms_nm=empty,
+            site_spacing_max_error_nm=empty,
+            grid_vs_blob_delta_bic=empty,
+            rectangle_matched_site_count=np.empty(0, dtype=int),
+            rectangle_fit_rms_nm=empty,
+            rectangle_width_nm=1.0,
+            rectangle_height_nm=1.0,
+            density_image=np.empty((0, 0)),
+            density_contrast=np.empty((0, 0)),
+            density_component_labels=np.empty((0, 0), dtype=int),
+            density_extent_nm=(0.0, 1.0, 0.0, 1.0),
+            density_threshold=0.1,
+            alignment_pixel_nm=1.0,
+            alignment_canvas_side_nm=1.0,
+            alignment_reference_image=np.empty((0, 0)),
+            alignment_candidate_images=np.empty((0, 0, 0)),
+        )
+
+        def digital_template(name: str, active: bool) -> dict[str, object]:
+            return {
+                "name": name,
+                "image": np.zeros((2, 2)),
+                "rows": 2,
+                "columns": 2,
+                "spacing_x_nm": 1.0,
+                "spacing_y_nm": 1.0,
+                "rectangle_margin_nm": 1.0,
+                "template_pixel_size_x_nm": 1.0,
+                "template_pixel_size_y_nm": 1.0,
+                "logical_model": {
+                    "bit_ids": ("bit",),
+                    "bit_cells": ((0,),),
+                    "bit_physical_cells": ((0,),),
+                    "alignment_cells": (),
+                    "physical_shape": (2, 2),
+                    "active_bits": (active,),
+                },
+            }
+
+        templates = [digital_template("off", False), digital_template("on", True)]
+        params = {
+            "custom_templates": templates,
+            "shared_alignment_template": {
+                **digital_template("L_L", False),
+                "name": "L_L",
+            },
+            "pick_bin_size_nm": 1.0,
+            "connect_distance_nm": 1.0,
+            "density_threshold": 0.1,
+            "min_candidate_points": 1,
+            "min_monte_carlo_probability": 0.0,
+            "use_cell_pattern_gate": False,
+            "digital_pixel_model": templates[0]["logical_model"],
+            "source_path": Path("source.hdf5"),
+        }
+        app = PaintAnalysisApp.__new__(PaintAnalysisApp)
+        app._identify_origami_with_params = mock.Mock(return_value=picks)
+        measured = PaintAnalysisApp._remeasure_origami_sites(
+            app,
+            replace(picks, template_points_nm=np.zeros((2, 2))),
+            {
+                "rows": 2,
+                "columns": 2,
+                "spacing_x_nm": 1.0,
+                "spacing_y_nm": 1.0,
+                "site_mask_radius_nm": 1.0,
+                "min_site_localizations": 1,
+                "min_site_evidence": 0.0,
+                "digital_pixel_model": templates[0]["logical_model"],
+            },
+            lambda _percent, _message: None,
+        )
+        self.assertEqual(measured.template_points_nm.shape, (4, 2))
+        self.assertEqual(measured.site_localization_counts.shape, (0, 4))
+        app._remeasure_origami_sites = mock.Mock(return_value=measured)
+        candidate_payload = (
+            [],
+            np.empty((0, 4)),
+            np.empty((0, 0)),
+            np.empty((0, 0), dtype=int),
+            (0.0, 1.0, 0.0, 1.0),
+            0.1,
+        )
+        with mock.patch(
+            "paint_analysis_gui.pick_origami_candidates",
+            return_value=candidate_payload,
+        ):
+            result_kind, payload = PaintAnalysisApp._identify_origami_worker(
+                app,
+                np.empty((0, 2)),
+                params,
+                lambda _percent, _message: None,
+            )
+
+        self.assertEqual(result_kind, "origami_multi_picks")
+        self.assertEqual(app._identify_origami_with_params.call_count, 1)
+        self.assertEqual(
+            app._identify_origami_with_params.call_args.args[1]["_inspection_stage"],
+            3,
+        )
+        app._remeasure_origami_sites.assert_called_once()
+        self.assertEqual(
+            [item["params"]["logical_model"]["active_bits"] for item in payload["templates"]],
+            [(False,), (True,)],
+        )
+
+        app._identify_origami_with_params.reset_mock()
+        app._remeasure_origami_sites.reset_mock()
+        params["_inspection_stage"] = 3
+        with mock.patch(
+            "paint_analysis_gui.pick_origami_candidates",
+            return_value=candidate_payload,
+        ):
+            preview_kind, preview_payload = PaintAnalysisApp._identify_origami_worker(
+                app,
+                np.empty((0, 2)),
+                params,
+                lambda _percent, _message: None,
+            )
+
+        self.assertEqual(preview_kind, "origami_stage_preview")
+        self.assertEqual(preview_payload["stage"], 3)
+        self.assertEqual(app._identify_origami_with_params.call_count, 1)
+        app._remeasure_origami_sites.assert_not_called()
 
     def test_importing_generated_template_restores_physical_geometry(self) -> None:
         app = PaintAnalysisApp.__new__(PaintAnalysisApp)
@@ -277,6 +940,60 @@ class DynamicRenderTests(unittest.TestCase):
         self.assertIn("type_a=12", app.status.get())
         self.assertIn("unclassified=3", app.status.get())
 
+    def test_classification_bias_diagnostics_groups_best_rejections_and_gates(self) -> None:
+        diagnostics = classification_bias_diagnostics(
+            ["type_a", "type_b"],
+            [8, 4],
+            [
+                {
+                    "template_name": "type_a",
+                    "failure_reasons": (
+                        "corr 0.2 < 0.4",
+                        "Monte Carlo template probability 0.3 < 0.5",
+                        "cell-pattern correlation 0.04 < 0.30",
+                    ),
+                },
+                {"template_name": "type_a", "failure_reasons": ("points 20 < 500",)},
+                {"template_name": "type_b", "failure_reasons": ("sites 3 < 5",)},
+            ],
+            4,
+        )
+
+        np.testing.assert_array_equal(diagnostics["assigned"], [8, 4])
+        np.testing.assert_array_equal(diagnostics["rejected_best"], [2, 1])
+        np.testing.assert_allclose(diagnostics["assignment_rates"], [0.8, 0.8])
+        self.assertEqual(int(diagnostics["failure_counts"][0, 0]), 1)
+        self.assertEqual(int(diagnostics["failure_counts"][0, 1]), 1)
+        self.assertEqual(int(diagnostics["failure_counts"][0, 2]), 1)
+        self.assertEqual(int(diagnostics["failure_counts"][0, 3]), 1)
+        self.assertEqual(int(diagnostics["failure_counts"][1, 4]), 1)
+        self.assertEqual(diagnostics["unresolved_unclassified"], 1)
+
+    def test_classification_diagnostics_plot_uses_recorded_best_template_failures(self) -> None:
+        figure = Figure()
+        app = SimpleNamespace(
+            origami_multi_template_results={"type_a": {}, "type_b": {}},
+            origami_multi_template_counts={"type_a": 8, "type_b": 4},
+            origami_multi_template_unclassified_count=3,
+            origami_multi_template_unclassified_details=[
+                {"template_name": "type_a", "failure_reasons": ("corr 0.2 < 0.4",)},
+                {"template_name": "type_a", "failure_reasons": ("points 20 < 500",)},
+                {"template_name": "type_b", "failure_reasons": ("sites 3 < 5",)},
+            ],
+            origami_figure=figure,
+            origami_canvas=SimpleNamespace(draw_idle=mock.Mock()),
+            origami_toolbar=SimpleNamespace(update=mock.Mock()),
+            _configure_origami_navigation_controls=mock.Mock(),
+            notebook=SimpleNamespace(select=mock.Mock()),
+            status=FakeVariable(""),
+        )
+
+        PaintAnalysisApp._plot_classification_diagnostics(app)
+
+        self.assertEqual(len(figure.axes), 4)  # counts, margins, failure heatmap, colorbar
+        self.assertEqual([patch.get_width() for patch in figure.axes[0].patches], [8, 4, 2, 1])
+        self.assertIn("lowest best-template pass rate", app.status.get())
+
     def test_selecting_a_classified_type_restores_its_fits_and_cached_overlay(self) -> None:
         picks = object()
         result = object()
@@ -294,11 +1011,12 @@ class DynamicRenderTests(unittest.TestCase):
                     "occupancy_threshold": 1,
                 }
             },
-            origami_plot_option=FakeVariable("Origami type counts"),
+            origami_plot_option=FakeVariable("Aligned density"),
             origami_pick_result=None,
             origami_identification_params=None,
             origami_result=None,
             _plot_identified_origamis=mock.Mock(),
+            render_origami_plot=mock.Mock(),
             _refresh_origami_action_states=mock.Mock(),
         )
 
@@ -307,8 +1025,228 @@ class DynamicRenderTests(unittest.TestCase):
         self.assertIs(app.origami_pick_result, picks)
         self.assertIs(app.origami_result, result)
         self.assertEqual(app.origami_result_source, "source — type_b")
+        self.assertEqual(app.origami_plot_option.get(), "Aligned density")
+        app.render_origami_plot.assert_called_once_with()
+        app._plot_identified_origamis.assert_not_called()
+
+    def test_classification_selector_recovers_from_stale_disabled_match_state(self) -> None:
+        combo = mock.Mock()
+        selected = FakeVariable("square")
+        app = SimpleNamespace(
+            origami_template_result_combo=combo,
+            origami_template_result_view=selected,
+            origami_multi_template_results={"square": {}, "LL": {}},
+        )
+
+        PaintAnalysisApp._sync_origami_classification_selector_state(app)
+
+        combo.configure.assert_called_once_with(values=("All templates", "square", "LL"))
+        combo.state.assert_called_once_with(["!disabled", "readonly"])
+        self.assertEqual(selected.get(), "square")
+
+    def test_classification_selector_falls_back_when_selected_type_is_missing(self) -> None:
+        combo = mock.Mock()
+        selected = FakeVariable("old template")
+        app = SimpleNamespace(
+            origami_template_result_combo=combo,
+            origami_template_result_view=selected,
+            origami_multi_template_results={"square": {}, "LL": {}},
+        )
+
+        PaintAnalysisApp._sync_origami_classification_selector_state(app)
+
+        self.assertEqual(selected.get(), "All templates")
+        combo.state.assert_called_once_with(["!disabled", "readonly"])
+
+    def test_selecting_all_templates_opens_combined_image_instead_of_histogram(self) -> None:
+        retained_picks = object()
+        retained_params = {"rows": 3}
+        app = SimpleNamespace(
+            origami_template_result_view=FakeVariable("All templates"),
+            origami_multi_template_results={"type_a": {}, "type_b": {}},
+            origami_plot_option=FakeVariable("Identified origami template matches"),
+            origami_pick_result=retained_picks,
+            origami_identification_params=retained_params,
+            origami_result=object(),
+            _plot_all_template_classifications=mock.Mock(),
+            _plot_origami_type_counts=mock.Mock(),
+            _refresh_origami_action_states=mock.Mock(),
+        )
+
+        PaintAnalysisApp._on_origami_template_result_selection(app)
+
+        self.assertIs(app.origami_pick_result, retained_picks)
+        self.assertIs(app.origami_identification_params, retained_params)
         self.assertEqual(app.origami_plot_option.get(), "Identified origami template matches")
-        app._plot_identified_origamis.assert_called_once_with()
+        app._plot_all_template_classifications.assert_called_once_with()
+        app._plot_origami_type_counts.assert_not_called()
+
+    def test_multi_template_completion_enables_roi_tile_actions(self) -> None:
+        buttons = [mock.Mock(), mock.Mock(), mock.Mock()]
+        app = SimpleNamespace(
+            origami_identification_running=True,
+            origami_pending_identification_snapshot=object(),
+            origami_identify_button=mock.Mock(),
+            origami_pick_result=None,
+            origami_identification_params=None,
+            origami_multi_template_counts={"type_a": 4, "type_b": 3},
+            origami_multi_template_results={
+                "type_a": {"picks": object(), "params": {"rows": 8}}
+            },
+            origami_loaded_roi_nm=(0.0, 100.0, 0.0, 80.0),
+            origami_tiled_button=buttons[0],
+            origami_n_tiles_button=buttons[1],
+            origami_random_roi_button=buttons[2],
+            origami_identification_progress_text=FakeVariable(""),
+            _refresh_origami_action_states=mock.Mock(),
+        )
+
+        PaintAnalysisApp._finish_origami_identification_progress(app, "done")
+
+        for button in buttons:
+            button.state.assert_called_once_with(["!disabled"])
+        self.assertFalse(app.origami_identification_running)
+        self.assertEqual(app.origami_identification_progress_text.get(), "done")
+
+    def test_all_template_view_keeps_spatial_plot_options_without_active_type(self) -> None:
+        combo = mock.Mock()
+        app = SimpleNamespace(
+            origami_pick_result=None,
+            origami_multi_template_results={"type_a": {}, "type_b": {}},
+            origami_result=None,
+            origami_all_plot_options=(
+                "Coarse identification density",
+                "Identified origami template matches",
+                "Origami type counts",
+                "Classification diagnostics",
+                "Individual origami gallery",
+            ),
+            origami_plot_combo=combo,
+            origami_refine_button=mock.Mock(),
+            origami_back_gallery_button=mock.Mock(),
+        )
+
+        PaintAnalysisApp._refresh_origami_action_states(app)
+
+        combo.configure.assert_called_once_with(
+            values=(
+                "Identified origami template matches",
+                "Origami type counts",
+                "Classification diagnostics",
+            )
+        )
+
+    def test_combined_classification_draws_each_type_and_unclassified_candidates(self) -> None:
+        figure = Figure()
+        axis = figure.add_subplot(111)
+        axis.set_xlim(-100.0, 100.0)
+        axis.set_ylim(-100.0, 100.0)
+
+        def picks(center_x: float) -> SimpleNamespace:
+            corners = np.asarray(
+                [[center_x - 10.0, -5.0], [center_x + 10.0, -5.0],
+                 [center_x + 10.0, 5.0], [center_x - 10.0, 5.0]]
+            )
+            return SimpleNamespace(
+                bounds_nm=np.asarray([[center_x - 10.0, center_x + 10.0, -5.0, 5.0]]),
+                accepted_mask=np.asarray([True]),
+                rectangle_corners_nm=np.asarray([corners]),
+                rectangle_width_nm=20.0,
+                rectangle_height_nm=10.0,
+                template_points_nm=np.asarray([[-5.0, 0.0], [5.0, 0.0]]),
+                site_localization_counts=np.asarray([[3, 0]]),
+                site_prominence=np.asarray([[0.5, 0.0]]),
+                site_centroids_nm=np.asarray([[[-5.0, 0.5], [np.nan, np.nan]]]),
+                site_peak_positions_nm=np.asarray([[[-5.0, 0.0], [np.nan, np.nan]]]),
+                site_boundary_reference_positions_nm=np.asarray(
+                    [[[-5.0, 2.0], [np.nan, np.nan]]]
+                ),
+                site_boundary_points_nm=np.asarray(
+                    [[[[-6.0, -1.0], [-4.0, -1.0], [-4.0, 1.0], [-6.0, 1.0]],
+                      [[np.nan, np.nan], [np.nan, np.nan], [np.nan, np.nan], [np.nan, np.nan]]]]
+                ),
+                point_counts=np.asarray([30]),
+                rectangle_confidence=np.asarray([0.8]),
+                supported_site_count=np.asarray([1]),
+                site_spacing_max_error_nm=np.asarray([2.0]),
+                site_gap_contrast=np.asarray([0.6]),
+            )
+
+        app = SimpleNamespace(
+            origami_footprint_artists=[],
+            origami_show_theoretical_overlay=FakeVariable(True),
+            origami_show_detected_sites_overlay=FakeVariable(False),
+            origami_show_site_diagnostics=FakeVariable(False),
+            origami_show_prominence_geometry=FakeVariable(False),
+            origami_show_text_statistics=FakeVariable(False),
+            origami_multi_template_results={
+                "type_a": {
+                    "picks": picks(-30.0),
+                    "params": {
+                        "alignment_template_image": np.eye(3),
+                        "digital_pixel_model": {
+                            "bit_ids": ("bit_a",),
+                            "bit_physical_cells": ((0, 1),),
+                            "physical_shape": (1, 2),
+                        },
+                        "digital_pixel_probabilities": ((0.75,),),
+                    },
+                },
+                "type_b": {
+                    "picks": picks(30.0),
+                    "params": {"alignment_template_image": np.fliplr(np.eye(3))},
+                },
+            },
+            origami_multi_template_counts={"type_a": 1, "type_b": 1},
+            origami_multi_template_unclassified_count=1,
+            origami_multi_template_unclassified_centers_nm=np.asarray([[0.0, 40.0]]),
+            origami_multi_template_unclassified_details=[
+                {
+                    "center_nm": np.asarray([0.0, 40.0]),
+                    "template_name": "type_b",
+                    "point_count": 24,
+                    "correlation": 0.35,
+                    "supported_sites": 1,
+                    "spacing_error_nm": 9.0,
+                    "site_gap_contrast": 0.2,
+                    "cell_match": 0.3,
+                    "classification_score": 0.31,
+                    "failure_reasons": ("corr 0.35 < 0.4", "sites 1 < 2"),
+                }
+            ],
+        )
+
+        shown, visible = PaintAnalysisApp._draw_all_template_classifications(app, axis)
+
+        self.assertEqual((shown, visible), (2, 2))
+        self.assertEqual(len(axis.collections), 5)
+        np.testing.assert_allclose(axis.collections[1].get_offsets(), [[-35.0, 0.0], [-25.0, 0.0]])
+        self.assertTrue(all(type(collection).__name__ == "PathCollection" for collection in axis.collections))
+        legend_labels = [text.get_text() for text in axis.get_legend().get_texts()]
+        self.assertEqual(legend_labels, ["type_a (1)", "type_b (1)", "Unclassified (1)"])
+
+        app.origami_show_text_statistics.set(True)
+        PaintAnalysisApp._draw_all_template_classifications(app, axis)
+        self.assertTrue(any("corr=" in text.get_text() for text in axis.texts))
+        unclassified_labels = [
+            text.get_text() for text in axis.texts if text.get_text().startswith("UNCLASSIFIED")
+        ]
+        self.assertEqual(len(unclassified_labels), 1)
+        self.assertIn("best type_b", unclassified_labels[0])
+        self.assertIn("FAIL: corr 0.35 < 0.4, sites 1 < 2", unclassified_labels[0])
+
+        base_collection_count = len(axis.collections)
+        app.origami_show_detected_sites_overlay.set(True)
+        PaintAnalysisApp._draw_all_template_classifications(app, axis)
+        self.assertGreater(len(axis.collections), base_collection_count)
+
+        detected_collection_count = len(axis.collections)
+        app.origami_show_site_diagnostics.set(True)
+        app.origami_show_prominence_geometry.set(True)
+        PaintAnalysisApp._draw_all_template_classifications(app, axis)
+        self.assertGreater(len(axis.collections), detected_collection_count)
+        self.assertTrue(any("bit_a: ON p=0.75" in text.get_text() for text in axis.texts))
+        self.assertTrue(any(type(collection).__name__ == "PolyCollection" for collection in axis.collections))
 
     def test_multi_template_plot_menu_includes_identification_counts_and_overlay_views(self) -> None:
         combo = mock.Mock()
@@ -320,6 +1258,7 @@ class DynamicRenderTests(unittest.TestCase):
                 "Coarse identification density",
                 "Identified origami template matches",
                 "Origami type counts",
+                "Classification diagnostics",
                 "Individual origami gallery",
                 "Aligned density",
             ),
@@ -335,6 +1274,7 @@ class DynamicRenderTests(unittest.TestCase):
                 "Coarse identification density",
                 "Identified origami template matches",
                 "Origami type counts",
+                "Classification diagnostics",
                 "Individual origami gallery",
                 "Aligned density",
             )
@@ -370,70 +1310,85 @@ class DynamicRenderTests(unittest.TestCase):
             row=0, column=4, columnspan=1, padx=(0, 8), pady=0, sticky="ew"
         )
 
-    def test_multi_template_identification_builds_fast_overlay_for_each_populated_type(self) -> None:
-        region_a = np.asarray([[0.0, 0.0], [1.0, 1.0]])
-        region_b = np.asarray([[10.0, 10.0], [11.0, 11.0]])
+    def test_active_template_fast_overlay_is_built_lazily_only_once(self) -> None:
+        app = SimpleNamespace(
+            origami_template_result_view=FakeVariable("type_a"),
+            origami_multi_template_results={"type_a": {}},
+            origami_multi_template_overlay_results={},
+            origami_pick_result=SimpleNamespace(accepted_count=2),
+            overlay_origamis=mock.Mock(),
+        )
 
-        def picks(regions: list[np.ndarray]) -> SimpleNamespace:
-            return SimpleNamespace(
-                accepted_count=len(regions),
-                accepted_aligned_regions=regions,
-                regions=regions,
-                accepted_mask=np.ones(len(regions), dtype=bool),
-                template_points_nm=np.asarray([[0.0, 0.0], [10.0, 0.0]]),
-            )
+        PaintAnalysisApp._auto_build_active_template_overlay(app)
+        PaintAnalysisApp._auto_build_active_template_overlay(app)
 
-        template_params = {
-            "rows": 1,
-            "columns": 2,
-            "spacing_x_nm": 10.0,
-            "spacing_y_nm": 10.0,
-            "site_mask_radius_nm": 5.0,
-            "min_site_localizations": 2,
-            "min_site_evidence": 0.2,
-        }
-        template_results = [
-            {"name": "type_a", "picks": picks([region_a]), "params": template_params},
-            {"name": "type_b", "picks": picks([region_b]), "params": template_params},
-            {"name": "empty", "picks": picks([]), "params": template_params},
-        ]
-        overlay_worker = mock.Mock(
-            side_effect=(
-                ("origami", {"result": "overlay_a"}),
-                ("origami", {"result": "overlay_b"}),
-            )
+        app.overlay_origamis.assert_called_once_with()
+        self.assertEqual(app.origami_multi_template_overlays_building, {"type_a"})
+
+        app.origami_multi_template_overlay_results["type_a"] = {"result": object()}
+        app.origami_multi_template_overlays_building.clear()
+        PaintAnalysisApp._auto_build_active_template_overlay(app)
+        app.overlay_origamis.assert_called_once_with()
+
+    def test_single_template_fast_overlay_is_rebuilt_once_after_identification(self) -> None:
+        app = SimpleNamespace(
+            origami_template_result_view=FakeVariable("All templates"),
+            origami_multi_template_results={},
+            origami_result=None,
+            origami_pick_result=SimpleNamespace(accepted_count=3),
+            origami_single_overlay_building=False,
+            overlay_origamis=mock.Mock(),
+        )
+
+        PaintAnalysisApp._auto_build_active_template_overlay(app)
+        PaintAnalysisApp._auto_build_active_template_overlay(app)
+
+        app.overlay_origamis.assert_called_once_with()
+        self.assertTrue(app.origami_single_overlay_building)
+
+    def test_completed_fast_overlay_preserves_the_selected_plot_view(self) -> None:
+        result = SimpleNamespace(
+            origami_count=2,
+            clustering_method="direct",
+            cluster_site_indices=[np.asarray([0]), np.asarray([1])],
+            alignment_rms_nm=np.asarray([1.0, 2.0]),
+            grid_match_fraction=np.asarray([0.8, 0.9]),
         )
         app = SimpleNamespace(
-            origami_loaded_source_label="corrected ROI",
-            _origami_identification_worker_progress=mock.Mock(),
-            _overlay_origami_worker=overlay_worker,
+            origami_template_result_view=FakeVariable("type_a"),
+            origami_multi_template_results={"type_a": {}},
+            origami_multi_template_overlay_results={},
+            origami_multi_template_overlays_building={"type_a"},
+            origami_plot_option=FakeVariable("Aligned density"),
+            origami_gallery_page=FakeVariable(3),
+            origami_density_cache_key=object(),
+            origami_density_cache=object(),
+            origami_last_rendered_plot_option="Individual origami gallery",
+            render_origami_plot=mock.Mock(),
+            status=FakeVariable(""),
         )
-        params = {
-            "source_path": Path("source.hdf5"),
-            "fast_overlay_settings": {
-                "g5m_sigma_min_nm": 0.5,
-                "g5m_sigma_max_nm": 5.0,
-                "g5m_min_locs": 3,
-                "g5m_bic_patience": 2,
-                "site_radius_nm": 5.0,
-                "allow_mirror": False,
-                "overlay_pixel_nm": 0.5,
-                "overlay_padding_nm": 10.0,
-                "overlay_blur_nm": 1.0,
-            },
+        payload = {
+            "result": result,
+            "source": "corrected ROI — type_a",
+            "source_count": 200,
+            "render_settings": {"pixel_size_nm": 0.5},
+            "occupancy_threshold": 1,
+            "template_name": "type_a",
         }
 
-        overlays = PaintAnalysisApp._build_multi_template_fast_overlays(
-            app,
-            template_results,
-            np.vstack((region_a, region_b)),
-            params,
-        )
+        PaintAnalysisApp._plot_origami_analysis(app, payload)
 
-        self.assertEqual(overlays, {"type_a": {"result": "overlay_a"}, "type_b": {"result": "overlay_b"}})
-        self.assertEqual(overlay_worker.call_count, 2)
-        self.assertEqual(overlay_worker.call_args_list[0].args[3]["source_label"], "corrected ROI — type_a")
-        self.assertEqual(overlay_worker.call_args_list[1].args[3]["source_label"], "corrected ROI — type_b")
+        self.assertEqual(app.origami_plot_option.get(), "Aligned density")
+        app.render_origami_plot.assert_called_once_with()
+        self.assertIs(app.origami_multi_template_overlay_results["type_a"]["result"], result)
+
+    def test_stale_overlay_from_previous_identification_is_ignored(self) -> None:
+        app = SimpleNamespace(origami_identification_generation=2)
+
+        PaintAnalysisApp._plot_origami_analysis(
+            app,
+            {"identification_generation": 1},
+        )
 
     def test_custom_template_overlay_contours_follow_hollow_l_shape(self) -> None:
         template = np.zeros((9, 9), dtype=float)
@@ -485,6 +1440,10 @@ class DynamicRenderTests(unittest.TestCase):
             origami_identification_params={
                 "template_mode": "Custom image",
                 "alignment_template_image": np.eye(3),
+                "classification_dispositions": (
+                    "classified as type_a",
+                    "classified as type_b",
+                ),
             },
             _active_origami_picks_and_params=lambda: None,
         )
@@ -514,19 +1473,110 @@ class DynamicRenderTests(unittest.TestCase):
         self.assertEqual((shown, total), (2, 2))
         self.assertEqual(len(axis.collections), 1)
         self.assertEqual(len(axis.collections[0].get_offsets()), 2 * len(grid))
-        self.assertTrue(any(text.get_text().startswith("FAIL:") for text in axis.texts))
+        self.assertTrue(any(text.get_text() == "OTHER TYPE: type_b" for text in axis.texts))
+        self.assertFalse(any("unclassified gate" in text.get_text() for text in axis.texts))
+
+    def test_template_competition_draws_each_model_and_negative_space_conflicts(self) -> None:
+        def make_picks(*, accepted: bool, supported: list[bool], counts: list[int]):
+            return SimpleNamespace(
+                regions=[np.asarray([[100.0, 200.0], [102.0, 198.0]])],
+                alignment_candidate_images=np.asarray(
+                    [[[0.0, 0.2, 0.0], [0.1, 1.0, 0.3], [0.0, 0.2, 0.0]]]
+                ),
+                alignment_canvas_side_nm=50.0,
+                rectangle_width_nm=30.0,
+                rectangle_height_nm=30.0,
+                template_points_nm=np.asarray([[-5.0, -5.0], [5.0, 5.0]]),
+                lattice_supported_sites=np.asarray([supported], dtype=bool),
+                lattice_site_localization_counts=np.asarray([counts], dtype=float),
+                accepted_mask=np.asarray([accepted], dtype=bool),
+                rectangle_confidence=np.asarray([0.72]),
+            )
+
+        common_params = {
+            "rows": 2,
+            "columns": 2,
+            "spacing_x_nm": 10.0,
+            "spacing_y_nm": 10.0,
+            "connect_distance_nm": 35.0,
+            "classification_monte_carlo_posterior": (0.75,),
+            "classification_scores": (1.2,),
+            "classification_winner_margins": (0.4,),
+            "classification_cell_pattern_correlation": (0.65,),
+            "classification_cell_agreement": (0.70,),
+        }
+        first_params = {
+            **common_params,
+            "classification_template_probabilities": (0.8,),
+            "classification_dispositions": ("classified as square",),
+        }
+        second_params = {
+            **common_params,
+            "classification_template_probabilities": (0.2,),
+            "classification_dispositions": ("classified as square",),
+        }
+        app = SimpleNamespace(
+            origami_multi_template_results={
+                "square": {
+                    "picks": make_picks(
+                        accepted=True,
+                        supported=[True, False, False, True],
+                        counts=[8, 0, 0, 7],
+                    ),
+                    "params": first_params,
+                },
+                "full": {
+                    "picks": make_picks(
+                        accepted=False,
+                        supported=[True, True, False, True],
+                        counts=[8, 5, 0, 7],
+                    ),
+                    "params": second_params,
+                },
+            },
+            origami_figure=Figure(),
+            origami_match_panel_combo=SimpleNamespace(state=mock.Mock()),
+            origami_match_roi=FakeVariable(0),
+            origami_match_roi_label=FakeVariable(""),
+            origami_canvas=SimpleNamespace(draw_idle=mock.Mock()),
+            origami_toolbar=SimpleNamespace(update=mock.Mock()),
+            _configure_origami_navigation_controls=mock.Mock(),
+            notebook=SimpleNamespace(select=mock.Mock()),
+            status=FakeVariable(""),
+        )
+
+        PaintAnalysisApp._plot_template_competition(
+            app,
+            app.origami_multi_template_results["square"]["picks"],
+            0,
+        )
+
+        self.assertEqual(len(app.origami_figure.axes), 2)
+        self.assertIn("class p 0.80", app.origami_figure.axes[0].get_title())
+        self.assertIn("class p 0.20", app.origami_figure.axes[1].get_title())
+        self.assertIn("pattern 0.65", app.origami_figure.axes[0].get_title())
+        self.assertTrue(any(collection.get_label() == "detected in black space"
+                            for collection in app.origami_figure.axes[1].collections))
+        self.assertIn("largest equal-prior probability is square", app.status.get())
 
     def test_origami_acceptance_defaults_match_validated_examples(self) -> None:
-        self.assertEqual(DEFAULT_ORIGAMI_MIN_POINTS, 100)
+        self.assertEqual(DEFAULT_ORIGAMI_PICK_BIN_NM, 10.0)
+        self.assertEqual(DEFAULT_ORIGAMI_MIN_DENSITY, 0.80)
+        self.assertEqual(DEFAULT_ORIGAMI_MIN_POINTS, 200)
+        self.assertEqual(DEFAULT_ORIGAMI_MAX_POINTS, 3000)
         self.assertEqual(DEFAULT_ORIGAMI_MAX_SITE_SPACING_ERROR_NM, 8.0)
         self.assertEqual(DEFAULT_ORIGAMI_ALIGNMENT_MAX_PIXELS, 128)
         self.assertEqual(DEFAULT_ORIGAMI_ALIGNMENT_PASSES, 3)
         self.assertEqual(DEFAULT_ORIGAMI_CONNECT_DISTANCE_NM, 20.0)
         self.assertEqual(DEFAULT_ORIGAMI_MIN_SITE_PROMINENCE, 0.10)
-        self.assertEqual(DEFAULT_ORIGAMI_CORRELATION_THRESHOLD, 0.40)
+        self.assertEqual(DEFAULT_ORIGAMI_CORRELATION_THRESHOLD, 0.30)
+        self.assertEqual(DEFAULT_ORIGAMI_MIN_MONTE_CARLO_POSTERIOR, 0.50)
         self.assertTrue(DEFAULT_ORIGAMI_USE_CORRELATION_GATE)
+        self.assertFalse(DEFAULT_ORIGAMI_USE_CELL_PATTERN_GATE)
         self.assertTrue(DEFAULT_ORIGAMI_SHOW_THEORETICAL_OVERLAY)
         self.assertFalse(DEFAULT_ORIGAMI_SHOW_DETECTED_SITES_OVERLAY)
+        self.assertFalse(DEFAULT_ORIGAMI_SHOW_SITE_DIAGNOSTICS)
+        self.assertFalse(DEFAULT_ORIGAMI_SHOW_PROMINENCE_GEOMETRY)
         self.assertFalse(DEFAULT_ORIGAMI_SHOW_TEXT_STATISTICS)
 
     def test_site_decision_labels_explain_each_gate(self) -> None:
@@ -576,6 +1626,7 @@ class DynamicRenderTests(unittest.TestCase):
         expected_modes = {
             "Loaded source data": "none",
             "Origami type counts": "none",
+            "Classification diagnostics": "none",
             "Coarse identification density": "roi",
             "Random ROI inspection": "roi",
             "Identified origami template matches": "roi",

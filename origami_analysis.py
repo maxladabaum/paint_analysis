@@ -5,12 +5,15 @@ from __future__ import annotations
 import math
 from functools import lru_cache
 from dataclasses import dataclass
-from typing import Callable
+from typing import Callable, Sequence
 
 import numpy as np
-from scipy.ndimage import gaussian_filter, label, map_coordinates, rotate, shift as ndimage_shift
+from scipy.ndimage import gaussian_filter, label, map_coordinates, maximum_filter, rotate, shift as ndimage_shift
 from scipy.optimize import linear_sum_assignment, nnls
 from scipy.signal import fftconvolve
+from scipy.sparse import csr_matrix
+from scipy.sparse.csgraph import connected_components
+from scipy.special import logsumexp
 from scipy.spatial import cKDTree
 
 
@@ -51,6 +54,8 @@ class OrigamiPickResult:
     aligned_regions: list[np.ndarray]
     accepted_mask: np.ndarray
     point_counts: np.ndarray
+    original_point_counts: np.ndarray
+    crop_retained_fractions: np.ndarray
     bounds_nm: np.ndarray
     rectangle_corners_nm: np.ndarray
     rectangle_angles_deg: np.ndarray
@@ -59,6 +64,9 @@ class OrigamiPickResult:
     on_site_fraction: np.ndarray
     site_mask_radius_nm: float
     template_points_nm: np.ndarray
+    lattice_site_localization_counts: np.ndarray
+    lattice_site_prominence: np.ndarray
+    lattice_supported_sites: np.ndarray
     site_localization_counts: np.ndarray
     site_prominence: np.ndarray
     site_peak_positions_nm: np.ndarray
@@ -114,6 +122,81 @@ class SparseSiteEvidenceResult:
     boundary_points_nm: np.ndarray
 
 
+def concatenate_origami_pick_results(results: list[OrigamiPickResult]) -> OrigamiPickResult:
+    """Combine same-template tile results into one world-coordinate pick result."""
+    if not results:
+        raise ValueError("At least one origami pick result is required.")
+    first = results[0]
+    for result in results[1:]:
+        if result.template_points_nm.shape != first.template_points_nm.shape or not np.allclose(
+            result.template_points_nm,
+            first.template_points_nm,
+            rtol=0.0,
+            atol=1e-9,
+        ):
+            raise ValueError("Tiled origami results must use the same theoretical template.")
+
+    def concatenate(attribute: str, *, axis: int = 0) -> np.ndarray:
+        arrays = [np.asarray(getattr(result, attribute)) for result in results]
+        populated = [array for array in arrays if array.ndim > axis and array.shape[axis] > 0]
+        return np.concatenate(populated, axis=axis) if populated else arrays[0].copy()
+
+    extents = np.asarray([result.density_extent_nm for result in results], dtype=float)
+    density_extent = (
+        float(np.min(extents[:, 0])),
+        float(np.max(extents[:, 1])),
+        float(np.min(extents[:, 2])),
+        float(np.max(extents[:, 3])),
+    )
+    return OrigamiPickResult(
+        regions=[region for result in results for region in result.regions],
+        aligned_regions=[region for result in results for region in result.aligned_regions],
+        accepted_mask=concatenate("accepted_mask"),
+        point_counts=concatenate("point_counts"),
+        original_point_counts=concatenate("original_point_counts"),
+        crop_retained_fractions=concatenate("crop_retained_fractions"),
+        bounds_nm=concatenate("bounds_nm"),
+        rectangle_corners_nm=concatenate("rectangle_corners_nm"),
+        rectangle_angles_deg=concatenate("rectangle_angles_deg"),
+        rectangle_confidence=concatenate("rectangle_confidence"),
+        site_gap_contrast=concatenate("site_gap_contrast"),
+        on_site_fraction=concatenate("on_site_fraction"),
+        site_mask_radius_nm=float(first.site_mask_radius_nm),
+        template_points_nm=np.asarray(first.template_points_nm, dtype=float).copy(),
+        lattice_site_localization_counts=concatenate("lattice_site_localization_counts"),
+        lattice_site_prominence=concatenate("lattice_site_prominence"),
+        lattice_supported_sites=concatenate("lattice_supported_sites"),
+        site_localization_counts=concatenate("site_localization_counts"),
+        site_prominence=concatenate("site_prominence"),
+        site_peak_positions_nm=concatenate("site_peak_positions_nm"),
+        site_boundary_reference_positions_nm=concatenate("site_boundary_reference_positions_nm"),
+        site_boundary_points_nm=concatenate("site_boundary_points_nm"),
+        site_centroids_nm=concatenate("site_centroids_nm"),
+        supported_site_count=concatenate("supported_site_count"),
+        supported_row_count=concatenate("supported_row_count"),
+        supported_column_count=concatenate("supported_column_count"),
+        site_spacing_rms_nm=concatenate("site_spacing_rms_nm"),
+        site_spacing_max_error_nm=concatenate("site_spacing_max_error_nm"),
+        grid_vs_blob_delta_bic=concatenate("grid_vs_blob_delta_bic"),
+        rectangle_matched_site_count=concatenate("rectangle_matched_site_count"),
+        rectangle_fit_rms_nm=concatenate("rectangle_fit_rms_nm"),
+        rectangle_width_nm=float(first.rectangle_width_nm),
+        rectangle_height_nm=float(first.rectangle_height_nm),
+        # Coarse grids have tile-local shapes and coordinates. The combined
+        # spatial view renders source points directly and intentionally omits
+        # a misleading stitched coarse contour.
+        density_image=np.empty((0, 0), dtype=float),
+        density_contrast=np.empty((0, 0), dtype=float),
+        density_component_labels=np.empty((0, 0), dtype=int),
+        density_extent_nm=density_extent,
+        density_threshold=float(first.density_threshold),
+        alignment_pixel_nm=float(first.alignment_pixel_nm),
+        alignment_canvas_side_nm=float(first.alignment_canvas_side_nm),
+        alignment_reference_image=np.asarray(first.alignment_reference_image).copy(),
+        alignment_candidate_images=concatenate("alignment_candidate_images"),
+    )
+
+
 @dataclass
 class TemplateClassificationResult:
     """One-to-one assignments of spatial candidates to competing templates."""
@@ -121,8 +204,817 @@ class TemplateClassificationResult:
     assignment_masks: list[np.ndarray]
     counts: np.ndarray
     unclassified_count: int
+    suppressed_duplicate_count: int
     group_centers_nm: np.ndarray
     winning_template_indices: np.ndarray
+    candidate_group_indices: list[np.ndarray]
+    winning_scores: np.ndarray
+    runner_up_template_indices: np.ndarray
+    runner_up_scores: np.ndarray
+    winning_score_margins: np.ndarray
+    template_probabilities: np.ndarray
+    raw_template_probabilities: np.ndarray
+
+
+def bidirectional_template_classification_scores(
+    correlations: np.ndarray,
+    on_site_fractions: np.ndarray,
+    supported_site_counts: np.ndarray,
+    template_site_count: int,
+    *,
+    off_site_empty_fractions: np.ndarray | None = None,
+    bright_site_probabilities: np.ndarray | None = None,
+    cell_pattern_correlations: np.ndarray | None = None,
+) -> np.ndarray:
+    """Score observed signal, expected bright sites, and expected black cells.
+
+    Correlation measures the raster fit. The harmonic precision/recall term
+    additionally penalizes localization signal in template-black space and
+    bright template sites that have no measured support. This prevents a
+    dense superset template from winning solely because it overlaps every
+    site in a sparser pattern.
+    """
+    correlations = np.asarray(correlations, dtype=float)
+    precision = np.asarray(on_site_fractions, dtype=float)
+    supported = np.asarray(supported_site_counts, dtype=float)
+    if template_site_count < 1:
+        raise ValueError("Template classification requires at least one theoretical site.")
+    if correlations.shape != precision.shape or correlations.shape != supported.shape:
+        raise ValueError("Correlation, on-site fraction, and supported-site arrays must match.")
+    precision = np.clip(precision, 0.0, 1.0)
+    recall = np.clip(supported / float(template_site_count), 0.0, 1.0)
+    if bright_site_probabilities is not None:
+        if off_site_empty_fractions is None:
+            raise ValueError("Bright-site probabilities require off-site empty fractions.")
+        bright_probability = np.asarray(bright_site_probabilities, dtype=float)
+        specificity = np.asarray(off_site_empty_fractions, dtype=float)
+        if bright_probability.shape != correlations.shape or specificity.shape != correlations.shape:
+            raise ValueError("Cell-probability arrays must match the correlation array.")
+        # Both terms come from one equal-prior candidate-specific brightness
+        # model.  Equal weighting therefore does not encode a preference for
+        # templates with either more bright cells or more black cells.
+        agreement_terms = (
+            np.clip(bright_probability, 0.0, 1.0)
+            * np.clip(specificity, 0.0, 1.0)
+        )
+        if cell_pattern_correlations is None:
+            agreement = np.sqrt(agreement_terms)
+        else:
+            pattern = np.asarray(cell_pattern_correlations, dtype=float)
+            if pattern.shape != correlations.shape:
+                raise ValueError("Cell-pattern correlations must match the correlation array.")
+            agreement = np.cbrt(agreement_terms * np.clip(pattern, 0.0, 1.0))
+    elif off_site_empty_fractions is None:
+        denominator = precision + recall
+        agreement = np.divide(
+            2.0 * precision * recall,
+            denominator,
+            out=np.zeros_like(denominator),
+            where=denominator > 0.0,
+        )
+    else:
+        specificity = np.asarray(off_site_empty_fractions, dtype=float)
+        if specificity.shape != correlations.shape:
+            raise ValueError("Off-site empty fractions must match the correlation array.")
+        specificity = np.clip(specificity, 0.0, 1.0)
+        # Treat all three directions as independent evidence.  Omitting
+        # precision over-rewards sparse templates because most of their black
+        # cells are easily empty; omitting specificity over-rewards dense
+        # templates because they cover most observed signal.  Their geometric
+        # mean requires a fit to explain observed localizations, expected
+        # bright cells, and expected black cells without a density prior.
+        agreement = np.cbrt(precision * recall * specificity)
+    # Correlation is useful for pose quality, but its dynamic range is biased
+    # toward dense superset templates: they can overlap nearly every bright
+    # feature in a sparse candidate. Make bidirectional site agreement the
+    # primary classification term and let correlation contribute only a
+    # bounded 25% modulation.
+    correlation_quality = np.clip(correlations, 0.0, 1.0)
+    return agreement * (0.75 + 0.25 * correlation_quality)
+
+
+def lattice_template_probability_agreement(
+    aligned_regions: list[np.ndarray],
+    template_points_nm: np.ndarray,
+    *,
+    rows: int,
+    columns: int,
+    spacing_x_nm: float,
+    spacing_y_nm: float,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Score template cells using adaptive equal-prior brightness probabilities.
+
+    For each candidate, localization counts on the complete lattice are split
+    into dark and bright intensity populations.  The posterior uses equal
+    class priors, so the cutoff is determined by the candidate's brightness
+    distribution rather than by the number of occupied cells in a template.
+    """
+    full_grid = ideal_grid_points(rows, columns, spacing_x_nm, spacing_y_nm)
+    template = np.asarray(template_points_nm, dtype=float)
+    if template.ndim != 2 or template.shape[1] != 2 or not len(template):
+        raise ValueError("Lattice classification requires at least one 2D template point.")
+    grid_tree = cKDTree(full_grid)
+    template_distances, template_cells = grid_tree.query(template, k=1)
+    mapping_tolerance_nm = 0.35 * min(float(spacing_x_nm), float(spacing_y_nm))
+    if np.any(template_distances > mapping_tolerance_nm):
+        raise ValueError("Custom-template sites do not map to the configured row/column lattice.")
+    occupied_cells = np.zeros(len(full_grid), dtype=bool)
+    occupied_cells[np.asarray(template_cells, dtype=int)] = True
+    black_cells = ~occupied_cells
+    region_count = len(aligned_regions)
+    cell_count = len(full_grid)
+    lengths = np.fromiter((len(region) for region in aligned_regions), dtype=np.int64, count=region_count)
+    counts = np.zeros((region_count, cell_count), dtype=float)
+    if region_count and int(np.sum(lengths)):
+        # The lattice is regular, so nearest row/column arithmetic replaces a
+        # separate KD-tree query for every candidate.  One bincount then builds
+        # the complete candidate-by-cell matrix.
+        all_points = np.concatenate([np.asarray(region, dtype=float) for region in aligned_regions if len(region)])
+        region_indices = np.repeat(np.arange(region_count, dtype=np.int64), lengths)
+        x0 = -0.5 * (columns - 1) * float(spacing_x_nm)
+        y0 = -0.5 * (rows - 1) * float(spacing_y_nm)
+        column_indices = np.rint((all_points[:, 0] - x0) / float(spacing_x_nm)).astype(np.int64)
+        row_indices = np.rint((all_points[:, 1] - y0) / float(spacing_y_nm)).astype(np.int64)
+        inside = (
+            (column_indices >= 0)
+            & (column_indices < columns)
+            & (row_indices >= 0)
+            & (row_indices < rows)
+        )
+        clipped_columns = np.clip(column_indices, 0, columns - 1)
+        clipped_rows = np.clip(row_indices, 0, rows - 1)
+        nearest_x = x0 + clipped_columns * float(spacing_x_nm)
+        nearest_y = y0 + clipped_rows * float(spacing_y_nm)
+        maximum_cell_distance_sq = 0.25 * (
+            float(spacing_x_nm) ** 2 + float(spacing_y_nm) ** 2
+        )
+        assigned = inside & (
+            np.square(all_points[:, 0] - nearest_x) + np.square(all_points[:, 1] - nearest_y)
+            <= maximum_cell_distance_sq
+        )
+        flat_cells = clipped_rows * columns + clipped_columns
+        flat_keys = region_indices[assigned] * cell_count + flat_cells[assigned]
+        counts = np.bincount(flat_keys, minlength=region_count * cell_count).reshape(region_count, cell_count)
+
+    on_template_counts = np.sum(counts[:, occupied_cells], axis=1)
+    on_site_fractions = np.divide(
+        on_template_counts,
+        lengths,
+        out=np.zeros(region_count, dtype=float),
+        where=lengths > 0,
+    )
+    intensity = np.log1p(counts)
+    if not region_count:
+        return np.empty(0), np.empty(0), on_site_fractions, np.empty(0)
+
+    low = np.min(intensity, axis=1)
+    high = np.max(intensity, axis=1)
+    separable = high > low + 1e-12
+    # Run all candidates' one-dimensional two-means fits together. The
+    # midpoint remains the equal-prior/equal-variance decision boundary.
+    for _ in range(24):
+        boundary = 0.5 * (low + high)
+        dark_group = intensity <= boundary[:, None]
+        dark_count = np.sum(dark_group, axis=1)
+        bright_count = cell_count - dark_count
+        valid = separable & (dark_count > 0) & (bright_count > 0)
+        next_low = np.divide(
+            np.sum(np.where(dark_group, intensity, 0.0), axis=1),
+            dark_count,
+            out=low.copy(),
+            where=valid,
+        )
+        next_high = np.divide(
+            np.sum(np.where(~dark_group, intensity, 0.0), axis=1),
+            bright_count,
+            out=high.copy(),
+            where=valid,
+        )
+        change = np.maximum(np.abs(next_low - low), np.abs(next_high - high))
+        low = np.where(valid, next_low, low)
+        high = np.where(valid, next_high, high)
+        if not np.any(change[valid] >= 1e-8):
+            break
+
+    separation = np.maximum(high - low, 1e-6)
+    boundary = 0.5 * (low + high)
+    dark_group = intensity <= boundary[:, None]
+    residual = np.where(dark_group, intensity - low[:, None], intensity - high[:, None])
+    pooled_variance = np.mean(np.square(residual), axis=1)
+    variance = np.maximum.reduce((pooled_variance, np.square(separation / 4.0), np.full(region_count, 1e-6)))
+    log_odds = np.clip(
+        separation[:, None] * (intensity - boundary[:, None]) / variance[:, None],
+        -20.0,
+        20.0,
+    )
+    bright_probability = 1.0 / (1.0 + np.exp(-log_odds))
+    bright_probability[~separable] = 0.5
+    bright_agreement = np.mean(bright_probability[:, occupied_cells], axis=1)
+    dark_agreement = (
+        np.mean(1.0 - bright_probability[:, black_cells], axis=1)
+        if np.any(black_cells)
+        else np.ones(region_count, dtype=float)
+    )
+    template_pattern = occupied_cells.astype(float)
+    template_pattern -= np.mean(template_pattern)
+    template_norm = float(np.linalg.norm(template_pattern))
+    centered_probability = bright_probability - np.mean(bright_probability, axis=1, keepdims=True)
+    probability_norm = np.linalg.norm(centered_probability, axis=1)
+    pattern_denominator = probability_norm * template_norm
+    if template_norm <= 1e-12:
+        # An all-bright template has no spatial black/bright contrast to
+        # correlate; leave the pattern term neutral rather than rejecting it.
+        pattern_correlation = np.ones(region_count, dtype=float)
+    else:
+        pattern_correlation = np.divide(
+            centered_probability @ template_pattern,
+            pattern_denominator,
+            out=np.zeros(region_count, dtype=float),
+            where=pattern_denominator > 1e-12,
+        )
+    return bright_agreement, dark_agreement, on_site_fractions, pattern_correlation
+
+
+def lattice_count_template_probability_agreement(
+    lattice_site_counts: np.ndarray,
+    template_points_nm: np.ndarray,
+    *,
+    rows: int,
+    columns: int,
+    spacing_x_nm: float,
+    spacing_y_nm: float,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Compare continuous per-cell counts with a template without hard site calls.
+
+    Each candidate gets its own equal-prior, equal-variance bright/dark model.
+    The resulting cell probabilities change smoothly when a cell gains or loses
+    a localization, unlike the prominence/support mask used for QC display.
+    """
+    counts = np.asarray(lattice_site_counts, dtype=float)
+    cell_count = int(rows) * int(columns)
+    if counts.ndim != 2 or counts.shape[1] != cell_count:
+        raise ValueError("Lattice-site counts must have one column per lattice cell.")
+    if not np.all(np.isfinite(counts)) or np.any(counts < 0.0):
+        raise ValueError("Lattice-site counts must be finite and nonnegative.")
+    full_grid = ideal_grid_points(rows, columns, spacing_x_nm, spacing_y_nm)
+    template = np.asarray(template_points_nm, dtype=float)
+    if template.ndim != 2 or template.shape[1] != 2 or not len(template):
+        raise ValueError("Lattice classification requires at least one 2D template point.")
+    distances, cells = cKDTree(full_grid).query(template, k=1)
+    tolerance_nm = 0.35 * min(float(spacing_x_nm), float(spacing_y_nm))
+    if np.any(distances > tolerance_nm):
+        raise ValueError("Custom-template sites do not map to the configured row/column lattice.")
+    occupied = np.zeros(cell_count, dtype=bool)
+    occupied[np.asarray(cells, dtype=int)] = True
+    black = ~occupied
+
+    intensity = np.log1p(counts)
+    candidate_count = len(counts)
+    if not candidate_count:
+        return np.empty(0), np.empty(0), np.empty(0)
+    low = np.min(intensity, axis=1)
+    high = np.max(intensity, axis=1)
+    separable = high > low + 1e-12
+    for _iteration in range(24):
+        boundary = 0.5 * (low + high)
+        dark_group = intensity <= boundary[:, None]
+        dark_count = np.sum(dark_group, axis=1)
+        bright_count = cell_count - dark_count
+        valid = separable & (dark_count > 0) & (bright_count > 0)
+        next_low = np.divide(
+            np.sum(np.where(dark_group, intensity, 0.0), axis=1),
+            dark_count,
+            out=low.copy(),
+            where=valid,
+        )
+        next_high = np.divide(
+            np.sum(np.where(~dark_group, intensity, 0.0), axis=1),
+            bright_count,
+            out=high.copy(),
+            where=valid,
+        )
+        change = np.maximum(np.abs(next_low - low), np.abs(next_high - high))
+        low = np.where(valid, next_low, low)
+        high = np.where(valid, next_high, high)
+        if not np.any(change[valid] >= 1e-8):
+            break
+
+    separation = np.maximum(high - low, 1e-6)
+    boundary = 0.5 * (low + high)
+    dark_group = intensity <= boundary[:, None]
+    residual = np.where(dark_group, intensity - low[:, None], intensity - high[:, None])
+    pooled_variance = np.mean(np.square(residual), axis=1)
+    variance = np.maximum.reduce(
+        (pooled_variance, np.square(separation / 4.0), np.full(candidate_count, 1e-6))
+    )
+    log_odds = np.clip(
+        separation[:, None] * (intensity - boundary[:, None]) / variance[:, None],
+        -20.0,
+        20.0,
+    )
+    bright_probability = 1.0 / (1.0 + np.exp(-log_odds))
+    bright_probability[~separable] = 0.5
+    bright_agreement = np.mean(bright_probability[:, occupied], axis=1)
+    dark_agreement = (
+        np.mean(1.0 - bright_probability[:, black], axis=1)
+        if np.any(black)
+        else np.ones(candidate_count, dtype=float)
+    )
+    expected = occupied.astype(float) - float(np.mean(occupied))
+    expected_norm = float(np.linalg.norm(expected))
+    if expected_norm <= 1e-12:
+        pattern_correlation = np.ones(candidate_count, dtype=float)
+    else:
+        observed = bright_probability - np.mean(bright_probability, axis=1, keepdims=True)
+        denominator = np.linalg.norm(observed, axis=1) * expected_norm
+        pattern_correlation = np.divide(
+            observed @ expected,
+            denominator,
+            out=np.zeros(candidate_count, dtype=float),
+            where=denominator > 1e-12,
+        )
+    return bright_agreement, dark_agreement, pattern_correlation
+
+
+def logical_bit_template_evidence(
+    lattice_site_counts: np.ndarray,
+    logical_bit_cells: Sequence[Sequence[int]],
+    active_logical_bits: Sequence[bool],
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Aggregate physical extension sites into tolerant arbitrary logical bits.
+
+    The physical lattice is still used for rigid registration.  Classification
+    is performed on one probability per multi-site stroke, so a missing or
+    blinking-heavy extension changes only a fraction of one logical bit.  Each
+    logical bit contributes once regardless of how many physical sites draw it.
+
+    Returns template-vs-unstructured posterior, log Bayes factor, per-candidate
+    logical-bit probabilities, and logical-pattern correlation.
+    """
+    counts = np.asarray(lattice_site_counts, dtype=float)
+    if counts.ndim != 2:
+        raise ValueError("Lattice-site counts must be a candidate-by-cell matrix.")
+    if not np.all(np.isfinite(counts)) or np.any(counts < 0.0):
+        raise ValueError("Lattice-site counts must be finite and nonnegative.")
+    bit_cells = [np.asarray(cells, dtype=int) for cells in logical_bit_cells]
+    active = np.asarray(active_logical_bits, dtype=bool)
+    if not bit_cells or active.shape != (len(bit_cells),):
+        raise ValueError("Logical templates require one active state per logical bit.")
+    for cells in bit_cells:
+        if not len(cells):
+            raise ValueError("Every logical bit must contain at least one physical site.")
+        if np.any(cells < 0) or np.any(cells >= counts.shape[1]):
+            raise ValueError("Logical-bit physical site is outside the lattice.")
+
+    candidate_count, cell_count = counts.shape
+    if not candidate_count:
+        return (
+            np.empty(0),
+            np.empty(0),
+            np.empty((0, len(bit_cells))),
+            np.empty(0),
+        )
+
+    # Reuse the candidate-specific equal-prior bright/dark separation, but do
+    # not threshold individual physical sites.  Averaging these probabilities
+    # within a stroke is the deliberate analog-to-logical conversion.
+    intensity = np.log1p(counts)
+    low = np.min(intensity, axis=1)
+    high = np.max(intensity, axis=1)
+    separable = high > low + 1e-12
+    for _iteration in range(24):
+        boundary = 0.5 * (low + high)
+        dark_group = intensity <= boundary[:, None]
+        dark_count = np.sum(dark_group, axis=1)
+        bright_count = cell_count - dark_count
+        valid = separable & (dark_count > 0) & (bright_count > 0)
+        next_low = np.divide(
+            np.sum(np.where(dark_group, intensity, 0.0), axis=1),
+            dark_count,
+            out=low.copy(),
+            where=valid,
+        )
+        next_high = np.divide(
+            np.sum(np.where(~dark_group, intensity, 0.0), axis=1),
+            bright_count,
+            out=high.copy(),
+            where=valid,
+        )
+        change = np.maximum(np.abs(next_low - low), np.abs(next_high - high))
+        low = np.where(valid, next_low, low)
+        high = np.where(valid, next_high, high)
+        if not np.any(change[valid] >= 1e-8):
+            break
+    separation = np.maximum(high - low, 1e-6)
+    boundary = 0.5 * (low + high)
+    dark_group = intensity <= boundary[:, None]
+    residual = np.where(dark_group, intensity - low[:, None], intensity - high[:, None])
+    variance = np.maximum.reduce(
+        (
+            np.mean(np.square(residual), axis=1),
+            np.square(separation / 4.0),
+            np.full(candidate_count, 1e-6),
+        )
+    )
+    log_odds = np.clip(
+        separation[:, None] * (intensity - boundary[:, None]) / variance[:, None],
+        -20.0,
+        20.0,
+    )
+    physical_bright_probability = 1.0 / (1.0 + np.exp(-log_odds))
+    physical_bright_probability[~separable] = 0.5
+
+    bit_probability = np.column_stack(
+        [np.mean(physical_bright_probability[:, cells], axis=1) for cells in bit_cells]
+    )
+    bit_probability = np.clip(bit_probability, 1e-4, 1.0 - 1e-4)
+    # Groups may overlap physically. A shared analog site is ON when any active
+    # logical group contains it, so that site cannot be used as dark evidence
+    # against an inactive group. Shared evidence is also divided among its
+    # memberships to avoid counting one localization cluster multiple times.
+    membership_count = np.zeros(cell_count, dtype=float)
+    for cells in bit_cells:
+        membership_count[cells] += 1.0
+    membership_count = np.maximum(membership_count, 1.0)
+    active_union = np.zeros(cell_count, dtype=bool)
+    for cells, is_active in zip(bit_cells, active):
+        if is_active:
+            active_union[cells] = True
+
+    expected_probability = np.full((candidate_count, len(bit_cells)), 0.5, dtype=float)
+    evidence_weight = np.zeros(len(bit_cells), dtype=float)
+    for bit_index, (cells, is_active) in enumerate(zip(bit_cells, active)):
+        informative_cells = cells if is_active else cells[~active_union[cells]]
+        if not len(informative_cells):
+            continue
+        if is_active:
+            expected_probability[:, bit_index] = np.mean(
+                physical_bright_probability[:, informative_cells], axis=1
+            )
+        else:
+            expected_probability[:, bit_index] = np.mean(
+                1.0 - physical_bright_probability[:, informative_cells], axis=1
+            )
+        evidence_weight[bit_index] = float(
+            np.mean(1.0 / membership_count[informative_cells])
+        )
+    expected_probability = np.clip(expected_probability, 1e-4, 1.0 - 1e-4)
+    # A non-overlapping logical bit contributes one observation regardless of
+    # how many physical sites draw it. Overlap reduces only the duplicated
+    # portion of its evidence.
+    log_bayes_factor = np.sum(
+        evidence_weight[None, :] * (np.log(expected_probability) - math.log(0.5)),
+        axis=1,
+    )
+    posterior = 1.0 / (1.0 + np.exp(-np.clip(log_bayes_factor, -40.0, 40.0)))
+
+    expected = active.astype(float) - float(np.mean(active))
+    expected_norm = float(np.linalg.norm(expected))
+    if expected_norm <= 1e-12:
+        pattern_correlation = np.ones(candidate_count, dtype=float)
+    else:
+        observed = bit_probability - np.mean(bit_probability, axis=1, keepdims=True)
+        denominator = np.linalg.norm(observed, axis=1) * expected_norm
+        pattern_correlation = np.divide(
+            observed @ expected,
+            denominator,
+            out=np.zeros(candidate_count, dtype=float),
+            where=denominator > 1e-12,
+        )
+    return posterior, log_bayes_factor, bit_probability, pattern_correlation
+
+
+# Backward-compatible name from the original fixed-stroke implementation.
+logical_stroke_template_evidence = logical_bit_template_evidence
+
+
+def lattice_template_on_site_fractions(
+    aligned_regions: list[np.ndarray],
+    template_points_nm: np.ndarray,
+    *,
+    rows: int,
+    columns: int,
+    spacing_x_nm: float,
+    spacing_y_nm: float,
+) -> np.ndarray:
+    """Measure signal assigned to the exact occupied cells of a grid template.
+
+    The ordinary site mask may intentionally be wider than one lattice pitch
+    so it remains tolerant during fit acceptance.  Such overlapping masks are
+    unsuitable for distinguishing custom patterns: a point on an explicitly
+    empty neighboring cell can otherwise count as on-template.  Nearest-cell
+    assignment keeps that tolerance while preserving the template's black
+    cells as negative evidence.
+    """
+    full_grid = ideal_grid_points(rows, columns, spacing_x_nm, spacing_y_nm)
+    template = np.asarray(template_points_nm, dtype=float)
+    if template.ndim != 2 or template.shape[1] != 2 or not len(template):
+        raise ValueError("Lattice classification requires at least one 2D template point.")
+
+    grid_tree = cKDTree(full_grid)
+    template_distances, template_cells = grid_tree.query(template, k=1)
+    mapping_tolerance_nm = 0.35 * min(float(spacing_x_nm), float(spacing_y_nm))
+    if np.any(template_distances > mapping_tolerance_nm):
+        raise ValueError("Custom-template sites do not map to the configured row/column lattice.")
+    occupied_cells = np.zeros(len(full_grid), dtype=bool)
+    occupied_cells[np.asarray(template_cells, dtype=int)] = True
+
+    # Every point inside a lattice cell can be assigned even at a cell corner;
+    # points farther away are in the footprint margin and count as off-template.
+    maximum_cell_distance_nm = 0.5 * math.hypot(float(spacing_x_nm), float(spacing_y_nm))
+    fractions = np.zeros(len(aligned_regions), dtype=float)
+    for index, region in enumerate(aligned_regions):
+        points = np.asarray(region, dtype=float)
+        if not len(points):
+            continue
+        distances, cells = grid_tree.query(points, k=1)
+        matches = (distances <= maximum_cell_distance_nm) & occupied_cells[np.asarray(cells, dtype=int)]
+        fractions[index] = float(np.mean(matches))
+    return fractions
+
+
+def detected_lattice_template_agreement(
+    lattice_supported_sites: np.ndarray,
+    template_points_nm: np.ndarray,
+    *,
+    rows: int,
+    columns: int,
+    spacing_x_nm: float,
+    spacing_y_nm: float,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Compare a template with the same detected-site mask shown in the UI."""
+    supported = np.asarray(lattice_supported_sites, dtype=bool)
+    cell_count = int(rows) * int(columns)
+    if supported.ndim != 2 or supported.shape[1] != cell_count:
+        raise ValueError("Detected lattice-site masks must have one column per lattice cell.")
+    full_grid = ideal_grid_points(rows, columns, spacing_x_nm, spacing_y_nm)
+    template = np.asarray(template_points_nm, dtype=float)
+    if template.ndim != 2 or template.shape[1] != 2 or not len(template):
+        raise ValueError("Lattice classification requires at least one 2D template point.")
+    distances, cells = cKDTree(full_grid).query(template, k=1)
+    tolerance_nm = 0.35 * min(float(spacing_x_nm), float(spacing_y_nm))
+    if np.any(distances > tolerance_nm):
+        raise ValueError("Custom-template sites do not map to the configured row/column lattice.")
+    expected = np.zeros(cell_count, dtype=bool)
+    expected[np.asarray(cells, dtype=int)] = True
+    black = ~expected
+    bright_agreement = np.mean(supported[:, expected], axis=1)
+    dark_agreement = (
+        np.mean(~supported[:, black], axis=1)
+        if np.any(black)
+        else np.ones(len(supported), dtype=float)
+    )
+    expected_centered = expected.astype(float) - float(np.mean(expected))
+    expected_norm = float(np.linalg.norm(expected_centered))
+    if expected_norm <= 1e-12:
+        pattern_correlation = np.ones(len(supported), dtype=float)
+    else:
+        observed = supported.astype(float)
+        observed -= np.mean(observed, axis=1, keepdims=True)
+        denominator = np.linalg.norm(observed, axis=1) * expected_norm
+        pattern_correlation = np.divide(
+            observed @ expected_centered,
+            denominator,
+            out=np.zeros(len(supported), dtype=float),
+            where=denominator > 1e-12,
+        )
+    return bright_agreement, dark_agreement, pattern_correlation
+
+
+@lru_cache(maxsize=128)
+def _monte_carlo_template_log_probabilities(
+    rows: int,
+    columns: int,
+    spacing_x_nm: float,
+    spacing_y_nm: float,
+    occupied_cells: tuple[int, ...],
+    simulation_count: int,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Build a deterministic reusable bank of generative template models."""
+    grid = ideal_grid_points(rows, columns, spacing_x_nm, spacing_y_nm)
+    sites = grid[np.asarray(occupied_cells, dtype=int)]
+    # Stable geometry-derived seed makes reruns reproducible without making
+    # different masks share identical nuisance samples.
+    seed = int(
+        (rows * 73_856_093)
+        ^ (columns * 19_349_663)
+        ^ sum((index + 1) * (cell + 17) for index, cell in enumerate(occupied_cells))
+    ) & 0xFFFFFFFF
+    rng = np.random.default_rng(seed)
+    detection_probability = 0.10 + 0.88 * rng.beta(3.0, 2.0, simulation_count)
+    background_probability = 0.001 + 0.18 * rng.beta(1.0, 14.0, simulation_count)
+    minimum_spacing = min(float(spacing_x_nm), float(spacing_y_nm))
+    localization_sigma_nm = rng.uniform(0.8, max(0.81, 0.32 * minimum_spacing), simulation_count)
+    registration_offset_nm = rng.normal(0.0, 0.10 * minimum_spacing, size=(simulation_count, 2))
+    probabilities = np.empty((simulation_count, len(grid)), dtype=float)
+    for simulation in range(simulation_count):
+        displaced_sites = sites + registration_offset_nm[simulation]
+        distance_sq = np.sum(
+            np.square(grid[:, None, :] - displaced_sites[None, :, :]),
+            axis=2,
+        )
+        influence = np.max(
+            np.exp(-distance_sq / (2.0 * localization_sigma_nm[simulation] ** 2)),
+            axis=1,
+        )
+        probabilities[simulation] = background_probability[simulation] + (
+            detection_probability[simulation] - background_probability[simulation]
+        ) * influence
+    probabilities = np.clip(probabilities, 1e-6, 1.0 - 1e-6)
+    return np.log(probabilities), np.log1p(-probabilities)
+
+
+@lru_cache(maxsize=32)
+def _monte_carlo_blob_log_probabilities(
+    rows: int,
+    columns: int,
+    spacing_x_nm: float,
+    spacing_y_nm: float,
+    simulation_count: int,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Build a reusable family of compact/elongated non-template blobs."""
+    grid = ideal_grid_points(rows, columns, spacing_x_nm, spacing_y_nm)
+    rng = np.random.default_rng(
+        int(rows * 83_492_791 + columns * 2_654_435_761) & 0xFFFFFFFF
+    )
+    span_x = max(float(np.ptp(grid[:, 0])), float(spacing_x_nm))
+    span_y = max(float(np.ptp(grid[:, 1])), float(spacing_y_nm))
+    scale = max(min(span_x, span_y), min(float(spacing_x_nm), float(spacing_y_nm)))
+    detection_probability = 0.15 + 0.83 * rng.beta(3.0, 2.0, simulation_count)
+    background_probability = 0.001 + 0.18 * rng.beta(1.0, 14.0, simulation_count)
+    major_sigma = rng.uniform(0.12 * scale, 0.75 * scale, simulation_count)
+    minor_sigma = major_sigma * rng.uniform(0.35, 1.0, simulation_count)
+    angles = rng.uniform(0.0, math.pi, simulation_count)
+    centers = np.column_stack(
+        (
+            rng.normal(0.0, 0.12 * span_x, simulation_count),
+            rng.normal(0.0, 0.12 * span_y, simulation_count),
+        )
+    )
+    probabilities = np.empty((simulation_count, len(grid)), dtype=float)
+    for simulation in range(simulation_count):
+        centered = grid - centers[simulation]
+        cosine = math.cos(float(angles[simulation]))
+        sine = math.sin(float(angles[simulation]))
+        major = centered[:, 0] * cosine + centered[:, 1] * sine
+        minor = -centered[:, 0] * sine + centered[:, 1] * cosine
+        influence = np.exp(
+            -0.5
+            * (
+                np.square(major / major_sigma[simulation])
+                + np.square(minor / minor_sigma[simulation])
+            )
+        )
+        probabilities[simulation] = background_probability[simulation] + (
+            detection_probability[simulation] - background_probability[simulation]
+        ) * influence
+    probabilities = np.clip(probabilities, 1e-6, 1.0 - 1e-6)
+    return np.log(probabilities), np.log1p(-probabilities)
+
+
+def monte_carlo_template_evidence(
+    lattice_supported_sites: np.ndarray,
+    template_points_nm: np.ndarray,
+    *,
+    rows: int,
+    columns: int,
+    spacing_x_nm: float,
+    spacing_y_nm: float,
+    simulation_count: int = 256,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Estimate tolerant template-vs-blob evidence from detected site clusters.
+
+    Samples span labeling efficiency, nonspecific detections, localization
+    spread, and small registration offsets. Evidence uses a tempered spatial
+    count likelihood: repeated localizations add information, while log-count
+    compression and a bounded effective sample size avoid treating every blink
+    as an independent molecule.
+
+    The returned probability is the equal-prior logistic transform of the
+    template-versus-null evidence. A value above 0.5 means the spatial
+    pattern is closer to the simulated template family than to a smooth blob
+    or an unstructured (zero-correlation) pattern.
+    """
+    if simulation_count < 16:
+        raise ValueError("Monte Carlo template classification requires at least 16 simulations.")
+    supported = np.asarray(lattice_supported_sites)
+    cell_count = int(rows) * int(columns)
+    if supported.ndim != 2 or supported.shape[1] != cell_count:
+        raise ValueError("Lattice-site evidence must have one column per lattice cell.")
+    full_grid = ideal_grid_points(rows, columns, spacing_x_nm, spacing_y_nm)
+    template = np.asarray(template_points_nm, dtype=float)
+    distances, cells = cKDTree(full_grid).query(template, k=1)
+    tolerance_nm = 0.35 * min(float(spacing_x_nm), float(spacing_y_nm))
+    if np.any(distances > tolerance_nm):
+        raise ValueError("Custom-template sites do not map to the configured row/column lattice.")
+    occupied_cells = tuple(sorted(set(int(cell) for cell in np.asarray(cells, dtype=int))))
+    log_bright, log_dark = _monte_carlo_template_log_probabilities(
+        int(rows),
+        int(columns),
+        float(spacing_x_nm),
+        float(spacing_y_nm),
+        occupied_cells,
+        int(simulation_count),
+    )
+    if np.issubdtype(supported.dtype, np.bool_):
+        observed = supported.astype(float)
+    else:
+        observed = np.asarray(supported, dtype=float)
+        if not np.all(np.isfinite(observed)) or np.any(observed < 0.0):
+            raise ValueError("Lattice-site evidence must be finite and nonnegative.")
+        # Retain graded evidence from localization clusters without allowing a
+        # single blinking-heavy site to dominate the complete spatial pattern.
+        observed = np.log1p(observed)
+    blob_log_bright, blob_log_dark = _monte_carlo_blob_log_probabilities(
+        int(rows), int(columns), float(spacing_x_nm), float(spacing_y_nm), int(simulation_count)
+    )
+    del log_dark, blob_log_dark
+
+    # Condition on the candidate's total signal and compare its spatial count
+    # distribution with every simulated nuisance realization. log1p above
+    # limits blinking-heavy sites; the square-root effective sample size lets
+    # additional localizations increase certainty without treating repeated
+    # blinks as independent molecules.
+    observed_total = np.sum(observed, axis=1, keepdims=True)
+    observed_distribution = np.divide(
+        observed,
+        observed_total,
+        out=np.zeros_like(observed),
+        where=observed_total > 0.0,
+    )
+    effective_count = np.clip(
+        np.sqrt(np.sum(np.asarray(supported, dtype=float), axis=1)),
+        1.0,
+        32.0,
+    )
+
+    def normalized_log_cell_probabilities(log_probabilities: np.ndarray) -> np.ndarray:
+        return log_probabilities - logsumexp(log_probabilities, axis=1, keepdims=True)
+
+    template_log_cells = normalized_log_cell_probabilities(log_bright)
+    blob_log_cells = normalized_log_cell_probabilities(blob_log_bright)
+    template_log_likelihood = effective_count[:, None] * (
+        observed_distribution @ template_log_cells.T
+    )
+    blob_log_likelihood = effective_count[:, None] * (
+        observed_distribution @ blob_log_cells.T
+    )
+    template_log_evidence = logsumexp(template_log_likelihood, axis=1) - math.log(simulation_count)
+    blob_log_evidence = logsumexp(blob_log_likelihood, axis=1) - math.log(simulation_count)
+    uniform_log_evidence = -effective_count * math.log(cell_count)
+    null_log_evidence = np.maximum(uniform_log_evidence, blob_log_evidence)
+    log_bayes_factor = template_log_evidence - null_log_evidence
+    posterior = 1.0 / (1.0 + np.exp(-np.clip(log_bayes_factor, -30.0, 30.0)))
+    no_spatial_information = observed_total[:, 0] <= 1e-12
+    log_bayes_factor[no_spatial_information] = -30.0
+    posterior[no_spatial_information] = 0.0
+    return posterior, log_bayes_factor
+
+
+def lattice_template_empty_cell_fractions(
+    aligned_regions: list[np.ndarray],
+    template_points_nm: np.ndarray,
+    *,
+    rows: int,
+    columns: int,
+    spacing_x_nm: float,
+    spacing_y_nm: float,
+    min_site_localizations: int,
+) -> np.ndarray:
+    """Return the mean emptiness of cells designated black by a template."""
+    if min_site_localizations < 1:
+        raise ValueError("Minimum site localizations must be positive.")
+    full_grid = ideal_grid_points(rows, columns, spacing_x_nm, spacing_y_nm)
+    template = np.asarray(template_points_nm, dtype=float)
+    if template.ndim != 2 or template.shape[1] != 2 or not len(template):
+        raise ValueError("Lattice classification requires at least one 2D template point.")
+    grid_tree = cKDTree(full_grid)
+    template_distances, template_cells = grid_tree.query(template, k=1)
+    mapping_tolerance_nm = 0.35 * min(float(spacing_x_nm), float(spacing_y_nm))
+    if np.any(template_distances > mapping_tolerance_nm):
+        raise ValueError("Custom-template sites do not map to the configured row/column lattice.")
+    occupied_cells = np.zeros(len(full_grid), dtype=bool)
+    occupied_cells[np.asarray(template_cells, dtype=int)] = True
+    black_cells = ~occupied_cells
+    if not np.any(black_cells):
+        return np.ones(len(aligned_regions), dtype=float)
+
+    maximum_cell_distance_nm = 0.5 * math.hypot(float(spacing_x_nm), float(spacing_y_nm))
+    fractions = np.ones(len(aligned_regions), dtype=float)
+    for index, region in enumerate(aligned_regions):
+        points = np.asarray(region, dtype=float)
+        if not len(points):
+            continue
+        distances, cells = grid_tree.query(points, k=1)
+        assigned_cells = np.asarray(cells[distances <= maximum_cell_distance_nm], dtype=int)
+        counts = np.bincount(assigned_cells, minlength=len(full_grid))
+        occupancy_evidence = np.clip(
+            counts.astype(float) / float(min_site_localizations),
+            0.0,
+            1.0,
+        )
+        fractions[index] = float(np.mean(1.0 - occupancy_evidence[black_cells]))
+    return fractions
 
 
 def classify_template_candidates(
@@ -131,6 +1023,7 @@ def classify_template_candidates(
     correlations: list[np.ndarray],
     *,
     match_distance_nm: float,
+    deduplication_distance_nm: float | None = None,
 ) -> TemplateClassificationResult:
     """Match duplicate detections across templates and select one accepted fit per object."""
     template_count = len(candidate_centers_by_template)
@@ -138,6 +1031,8 @@ def classify_template_candidates(
         raise ValueError("Multi-template classification requires at least two equally described templates.")
     if match_distance_nm <= 0:
         raise ValueError("Template candidate match distance must be positive.")
+    if deduplication_distance_nm is not None and deduplication_distance_nm <= 0:
+        raise ValueError("Template deduplication distance must be positive.")
 
     centers_by_template: list[np.ndarray] = []
     for centers, accepted, scores in zip(candidate_centers_by_template, accepted_masks, correlations):
@@ -150,13 +1045,34 @@ def classify_template_candidates(
             raise ValueError("Candidate centers, acceptance masks, and correlations must have matching lengths.")
         centers_by_template.append(centers)
 
-    # Each group contains at most one detection from a given template. Start
-    # with template zero, then use one-to-one distance matching for every
-    # additional template so nearby origamis cannot claim the same fit.
-    groups: list[dict[int, int]] = [{0: index} for index in range(len(centers_by_template[0]))]
-    group_centers: list[np.ndarray] = [center.copy() for center in centers_by_template[0]]
-    for template_index in range(1, template_count):
+    # The normal multi-template path evaluates the exact same physical
+    # candidates in the same order. Preserve those stable candidate IDs
+    # directly; spatial rematching can otherwise depend on template order.
+    shares_candidate_ids = all(
+        len(centers) == len(centers_by_template[0])
+        and np.allclose(centers, centers_by_template[0], rtol=0.0, atol=1e-9)
+        for centers in centers_by_template[1:]
+    )
+    if shares_candidate_ids:
+        groups = [
+            {template_index: candidate_index for template_index in range(template_count)}
+            for candidate_index in range(len(centers_by_template[0]))
+        ]
+        group_centers = [center.copy() for center in centers_by_template[0]]
+        candidate_group_indices = [
+            np.arange(len(groups), dtype=int) for _template_index in range(template_count)
+        ]
+        first_spatial_template = template_count
+    else:
+        # Compatibility fallback for callers that generated independent
+        # candidate sets. Production classification avoids this path.
+        groups = [{0: index} for index in range(len(centers_by_template[0]))]
+        group_centers = [center.copy() for center in centers_by_template[0]]
+        candidate_group_indices = [np.arange(len(centers_by_template[0]), dtype=int)]
+        first_spatial_template = 1
+    for template_index in range(first_spatial_template, template_count):
         centers = centers_by_template[template_index]
+        template_group_indices = np.full(len(centers), -1, dtype=int)
         matched_candidates: set[int] = set()
         if groups and len(centers):
             distances = np.linalg.norm(
@@ -168,6 +1084,7 @@ def classify_template_candidates(
                 if distances[group_index, candidate_index] > match_distance_nm:
                     continue
                 groups[int(group_index)][template_index] = int(candidate_index)
+                template_group_indices[int(candidate_index)] = int(group_index)
                 matched_candidates.add(int(candidate_index))
                 member_centers = [
                     centers_by_template[member_template][member_index]
@@ -176,11 +1093,36 @@ def classify_template_candidates(
                 group_centers[int(group_index)] = np.mean(member_centers, axis=0)
         for candidate_index, center in enumerate(centers):
             if candidate_index not in matched_candidates:
+                template_group_indices[candidate_index] = len(groups)
                 groups.append({template_index: candidate_index})
                 group_centers.append(center.copy())
+        candidate_group_indices.append(template_group_indices)
 
     assignment_masks = [np.zeros(len(centers), dtype=bool) for centers in centers_by_template]
+    raw_template_probabilities = np.zeros((len(groups), template_count), dtype=float)
+    template_probabilities = np.zeros((len(groups), template_count), dtype=float)
+    for group_index, group in enumerate(groups):
+        group_scores = np.full(template_count, -float("inf"), dtype=float)
+        eligible = np.zeros(template_count, dtype=bool)
+        for template_index, candidate_index in group.items():
+            group_scores[template_index] = float(correlations[template_index][candidate_index])
+            eligible[template_index] = bool(accepted_masks[template_index][candidate_index])
+        finite = np.isfinite(group_scores)
+        if np.any(finite):
+            shifted = group_scores[finite] - float(np.max(group_scores[finite]))
+            weights = np.exp(np.clip(shifted, -700.0, 0.0))
+            raw_template_probabilities[group_index, finite] = weights / float(np.sum(weights))
+        eligible &= finite
+        if np.any(eligible):
+            shifted = group_scores[eligible] - float(np.max(group_scores[eligible]))
+            weights = np.exp(np.clip(shifted, -700.0, 0.0))
+            template_probabilities[group_index, eligible] = weights / float(np.sum(weights))
     winning_template_indices = np.full(len(groups), -1, dtype=int)
+    winning_scores = np.full(len(groups), -float("inf"), dtype=float)
+    runner_up_template_indices = np.full(len(groups), -1, dtype=int)
+    runner_up_scores = np.full(len(groups), -float("inf"), dtype=float)
+    winning_score_margins = np.full(len(groups), np.nan, dtype=float)
+    winning_candidates: list[tuple[int, int] | None] = [None] * len(groups)
     for group_index, group in enumerate(groups):
         passing = [
             (float(correlations[template_index][candidate_index]), template_index, candidate_index)
@@ -192,14 +1134,57 @@ def classify_template_candidates(
         _score, template_index, candidate_index = max(passing)
         assignment_masks[template_index][candidate_index] = True
         winning_template_indices[group_index] = template_index
+        winning_scores[group_index] = _score
+        winning_candidates[group_index] = (template_index, candidate_index)
+        competing = sorted(
+            (
+                (float(correlations[other_template][other_candidate]), other_template)
+                for other_template, other_candidate in group.items()
+                if other_template != template_index
+                and bool(accepted_masks[other_template][other_candidate])
+                and np.isfinite(correlations[other_template][other_candidate])
+            ),
+            reverse=True,
+        )
+        if competing:
+            runner_up_scores[group_index], runner_up_template_indices[group_index] = competing[0]
+            winning_score_margins[group_index] = _score - runner_up_scores[group_index]
+        else:
+            winning_score_margins[group_index] = float("inf")
+
+    suppressed_duplicate_count = 0
+    if deduplication_distance_nm is not None:
+        retained_groups: list[int] = []
+        passing_groups = np.flatnonzero(winning_template_indices >= 0)
+        for group_index in passing_groups[np.argsort(-winning_scores[passing_groups], kind="stable")]:
+            if any(
+                np.linalg.norm(group_centers[int(group_index)] - group_centers[retained])
+                < deduplication_distance_nm
+                for retained in retained_groups
+            ):
+                winner = winning_candidates[int(group_index)]
+                assert winner is not None
+                assignment_masks[winner[0]][winner[1]] = False
+                winning_template_indices[int(group_index)] = -2
+                suppressed_duplicate_count += 1
+            else:
+                retained_groups.append(int(group_index))
 
     counts = np.asarray([np.count_nonzero(mask) for mask in assignment_masks], dtype=int)
     return TemplateClassificationResult(
         assignment_masks=assignment_masks,
         counts=counts,
-        unclassified_count=int(np.count_nonzero(winning_template_indices < 0)),
+        unclassified_count=int(np.count_nonzero(winning_template_indices == -1)),
+        suppressed_duplicate_count=suppressed_duplicate_count,
         group_centers_nm=np.asarray(group_centers, dtype=float).reshape(-1, 2),
         winning_template_indices=winning_template_indices,
+        candidate_group_indices=candidate_group_indices,
+        winning_scores=winning_scores,
+        runner_up_template_indices=runner_up_template_indices,
+        runner_up_scores=runner_up_scores,
+        winning_score_margins=winning_score_margins,
+        template_probabilities=template_probabilities,
+        raw_template_probabilities=raw_template_probabilities,
     )
 
 
@@ -615,7 +1600,22 @@ def density_map_for_origami_picking(
     y_edges = np.arange(y_min, y_max + bin_size_nm * 1.01, bin_size_nm)
     density, _x_edges, _y_edges = np.histogram2d(points_nm[:, 0], points_nm[:, 1], bins=(x_edges, y_edges))
     density = gaussian_filter(density.astype(float), sigma=1.0, mode="constant")
-    auto_max = 0.5 * float(np.max(density)) if density.size else 1.0
+    # A single aggregate should not redefine the detection threshold for every
+    # other object in a large ROI. Retain the historical behavior for tiny
+    # diagnostic maps, but use a robust high percentile for normal images.
+    if density.size >= 400:
+        local_peaks = density[
+            (density > 0.0)
+            & (density >= maximum_filter(density, size=3, mode="constant"))
+        ]
+        reference_peak = (
+            float(np.quantile(local_peaks, 0.90))
+            if len(local_peaks) >= 5
+            else float(np.max(density))
+        )
+    else:
+        reference_peak = float(np.max(density)) if density.size else 0.0
+    auto_max = 0.5 * reference_peak
     if auto_max <= 0:
         auto_max = 1.0
     contrast = np.clip(density / auto_max, 0.0, 1.0)
@@ -671,6 +1671,89 @@ def render_localization_preview(
     }
 
 
+def _regular_grid_active_components(
+    active_mask: np.ndarray,
+    *,
+    bin_size_nm: float,
+    connect_distance_nm: float,
+) -> tuple[np.ndarray, int]:
+    """Label active coarse bins without materializing every nearby-bin pair.
+
+    The bins lie on a regular lattice. First label directly adjacent bins, then
+    merge those compact components only where a longer permitted lattice offset
+    bridges a gap. This preserves the Euclidean connection rule while avoiding
+    the potentially enormous KD-tree pair list produced by dense/noisy maps.
+    """
+    active = np.asarray(active_mask, dtype=bool)
+    if active.ndim != 2:
+        raise ValueError("The coarse active-bin mask must be two-dimensional.")
+    if bin_size_nm <= 0.0 or connect_distance_nm <= 0.0:
+        raise ValueError("Coarse component distances must be positive.")
+    structure = np.zeros((3, 3), dtype=np.uint8)
+    structure[1, 1] = 1
+    tolerance = 1e-12 * max(1.0, float(connect_distance_nm))
+    for delta_x in range(-1, 2):
+        for delta_y in range(-1, 2):
+            if math.hypot(delta_x, delta_y) * bin_size_nm <= connect_distance_nm + tolerance:
+                structure[delta_x + 1, delta_y + 1] = 1
+    base_labels, base_count = label(active, structure=structure)
+    if base_count == 0:
+        return np.full(active.shape, -1, dtype=np.int32), 0
+
+    maximum_offset = int(math.floor((connect_distance_nm + tolerance) / bin_size_nm))
+    encoded_edges: list[np.ndarray] = []
+    size_x, size_y = active.shape
+    for delta_x in range(0, maximum_offset + 1):
+        for delta_y in range(-maximum_offset, maximum_offset + 1):
+            if delta_x == 0 and delta_y <= 0:
+                continue
+            if math.hypot(delta_x, delta_y) * bin_size_nm > connect_distance_nm + tolerance:
+                continue
+            if abs(delta_x) <= 1 and abs(delta_y) <= 1 and structure[delta_x + 1, delta_y + 1]:
+                continue
+            if delta_x >= size_x or abs(delta_y) >= size_y:
+                continue
+            left_x = slice(0, size_x - delta_x)
+            right_x = slice(delta_x, size_x)
+            if delta_y >= 0:
+                left_y = slice(0, size_y - delta_y)
+                right_y = slice(delta_y, size_y)
+            else:
+                left_y = slice(-delta_y, size_y)
+                right_y = slice(0, size_y + delta_y)
+            left = base_labels[left_x, left_y]
+            right = base_labels[right_x, right_y]
+            bridges = (left > 0) & (right > 0) & (left != right)
+            if not np.any(bridges):
+                continue
+            first = left[bridges].astype(np.int64) - 1
+            second = right[bridges].astype(np.int64) - 1
+            low = np.minimum(first, second)
+            high = np.maximum(first, second)
+            encoded_edges.append(np.unique(low * base_count + high))
+
+    if encoded_edges:
+        edge_codes = np.unique(np.concatenate(encoded_edges))
+        adjacency = csr_matrix(
+            (
+                np.ones(len(edge_codes), dtype=np.uint8),
+                (edge_codes // base_count, edge_codes % base_count),
+            ),
+            shape=(base_count, base_count),
+        )
+        component_count, base_components = connected_components(
+            adjacency,
+            directed=False,
+            return_labels=True,
+        )
+    else:
+        component_count = base_count
+        base_components = np.arange(base_count, dtype=np.int32)
+    output = np.full(active.shape, -1, dtype=np.int32)
+    output[active] = base_components[base_labels[active] - 1]
+    return output, int(component_count)
+
+
 def _pick_origami_regions(
     points_nm: np.ndarray,
     bin_size_nm: float,
@@ -678,11 +1761,17 @@ def _pick_origami_regions(
     density_threshold: float,
     *,
     component_connect_distance_nm: float | None = None,
+    progress_callback: Callable[[float, str], None] | None = None,
 ) -> tuple[list[np.ndarray], np.ndarray, np.ndarray, tuple[float, float, float, float], np.ndarray]:
     """Connect supported bins, then recover original points near each object."""
     density, contrast, extent, x_edges, y_edges = density_map_for_origami_picking(points_nm, bin_size_nm)
     component_labels = np.full(contrast.shape, -1, dtype=np.int32)
     active_indices = np.argwhere(contrast >= density_threshold)
+    if progress_callback is not None:
+        progress_callback(
+            25.0,
+            f"Density binning complete: {len(active_indices):,} active bins; connecting components…",
+        )
     if len(active_indices) == 0:
         return [], density, contrast, extent, component_labels
     cell_centers = np.column_stack(
@@ -704,33 +1793,17 @@ def _pick_origami_regions(
         if component_connect_distance_nm is None
         else max(float(connect_distance_nm), float(component_connect_distance_nm))
     )
-    pairs = cKDTree(cell_centers).query_pairs(component_connect_distance, output_type="ndarray")
-    parents = np.arange(len(cell_centers), dtype=np.int64)
-    ranks = np.zeros(len(cell_centers), dtype=np.uint8)
-
-    def find(item: int) -> int:
-        root = item
-        while parents[root] != root:
-            root = int(parents[root])
-        while parents[item] != item:
-            parent = int(parents[item])
-            parents[item] = root
-            item = parent
-        return root
-
-    for left_value, right_value in pairs:
-        left = find(int(left_value))
-        right = find(int(right_value))
-        if left == right:
-            continue
-        if ranks[left] < ranks[right]:
-            left, right = right, left
-        parents[right] = left
-        if ranks[left] == ranks[right]:
-            ranks[left] += 1
-
-    roots = np.asarray([find(index) for index in range(len(cell_centers))], dtype=np.int64)
-    _unique_roots, cell_components = np.unique(roots, return_inverse=True)
+    cell_components, _component_count = _regular_grid_active_components(
+        contrast >= density_threshold,
+        bin_size_nm=float(bin_size_nm),
+        connect_distance_nm=component_connect_distance,
+    )
+    cell_components = cell_components[active_indices[:, 0], active_indices[:, 1]]
+    if progress_callback is not None:
+        progress_callback(
+            60.0,
+            f"Connected {len(active_indices):,} active bins into {_component_count:,} components; recovering source points…",
+        )
     nearest_distance, nearest_cell = cKDTree(cell_centers).query(points_nm, k=1)
     assigned = nearest_distance <= connect_distance_nm
     point_components = cell_components[nearest_cell[assigned]]
@@ -740,10 +1813,102 @@ def _pick_origami_regions(
     boundaries = np.flatnonzero(np.diff(sorted_components)) + 1
     regions = [region for region in np.split(assigned_points[order], boundaries) if len(region)]
     present_components = np.unique(sorted_components)
-    for display_label, component in enumerate(present_components):
-        member_bins = active_indices[cell_components == component]
-        component_labels[member_bins[:, 0], member_bins[:, 1]] = display_label
+    component_to_display = np.full(_component_count, -1, dtype=np.int32)
+    component_to_display[present_components] = np.arange(
+        len(present_components), dtype=np.int32
+    )
+    # Assign every active bin in one indexed operation. Iterating over
+    # components repeatedly rescanned the entire active-bin array and became
+    # another large cost on noisy whole-image sources.
+    component_labels[active_indices[:, 0], active_indices[:, 1]] = (
+        component_to_display[cell_components]
+    )
+    if progress_callback is not None:
+        progress_callback(100.0, f"Recovered source points for {len(regions):,} coarse components.")
     return regions, density, contrast, extent, component_labels
+
+
+def pick_origami_candidates(
+    points_nm: np.ndarray,
+    *,
+    bin_size_nm: float,
+    connect_distance_nm: float,
+    density_threshold: float,
+    minimum_points: int = 1,
+    progress_callback: Callable[[float, str], None] | None = None,
+) -> tuple[list[np.ndarray], np.ndarray, np.ndarray, tuple[float, float, float, float], np.ndarray]:
+    """Generate physical candidates, omitting components that cannot meet a point minimum."""
+    points = np.asarray(points_nm, dtype=float)
+    if points.ndim != 2 or points.shape[1] != 2:
+        raise ValueError("Origami candidate generation requires an N x 2 coordinate array.")
+    points = points[np.all(np.isfinite(points), axis=1)]
+    if not len(points):
+        raise ValueError("There are no finite source points for origami candidate generation.")
+    if bin_size_nm <= 0.0 or connect_distance_nm <= 0.0:
+        raise ValueError("Pick-bin size and connection distance must be positive.")
+    if not 0.0 <= density_threshold <= 1.0:
+        raise ValueError("Minimum density contrast must be between 0 and 1.")
+    if minimum_points < 1:
+        raise ValueError("Minimum candidate points must be at least one.")
+    if progress_callback is not None:
+        progress_callback(5.0, "Binning source points for coarse candidate detection…")
+    candidates = _pick_origami_regions(
+        points,
+        float(bin_size_nm),
+        float(connect_distance_nm),
+        float(density_threshold),
+        component_connect_distance_nm=None,
+        progress_callback=(
+            (lambda percent, message: progress_callback(5.0 + 0.8 * percent, message))
+            if progress_callback is not None
+            else None
+        ),
+    )
+    if progress_callback is not None:
+        progress_callback(85.0, "Filtering small connected components…")
+    filtered = filter_origami_candidates(candidates, minimum_points)[0]
+    if progress_callback is not None:
+        progress_callback(100.0, f"Retained {len(filtered[0]):,} coarse candidates.")
+    return filtered
+
+
+def filter_origami_candidates(
+    candidates: tuple[
+        list[np.ndarray],
+        np.ndarray,
+        np.ndarray,
+        tuple[float, float, float, float],
+        np.ndarray,
+    ],
+    minimum_points: int,
+) -> tuple[
+    tuple[list[np.ndarray], np.ndarray, np.ndarray, tuple[float, float, float, float], np.ndarray],
+    int,
+]:
+    """Drop connected components that cannot possibly pass the post-crop minimum.
+
+    Alignment crops points from a component but never adds them. Therefore an
+    original component below ``minimum_points`` is guaranteed to fail and can
+    be removed before thumbnail rendering and pose search.
+    """
+    if minimum_points < 1:
+        raise ValueError("Minimum candidate points must be at least one.")
+    regions, density, contrast, extent, component_labels = candidates
+    keep_indices = [index for index, region in enumerate(regions) if len(region) >= minimum_points]
+    rejected_count = len(regions) - len(keep_indices)
+    if rejected_count == 0:
+        return candidates, 0
+    filtered_regions = [regions[index] for index in keep_indices]
+    filtered_labels = np.full_like(component_labels, -1)
+    for new_index, old_index in enumerate(keep_indices):
+        filtered_labels[component_labels == old_index] = new_index
+    return (
+        filtered_regions,
+        density,
+        contrast,
+        extent,
+        filtered_labels,
+    ), rejected_count
 
 
 def _fit_grid_rectangle(
@@ -1472,11 +2637,16 @@ def _rotation_candidates_from_polar(
     *,
     maximum_candidates: int = 4,
     minimum_separation_deg: float = 20.0,
+    image_polar_fft: np.ndarray | None = None,
 ) -> np.ndarray:
     """Return separated angular-correlation peaks for full-pose scoring."""
     if maximum_candidates < 1:
         raise ValueError("At least one rotation candidate is required.")
-    polar_fft = np.fft.rfft(_polar_image(image), axis=0)
+    polar_fft = (
+        np.asarray(image_polar_fft)
+        if image_polar_fft is not None
+        else np.fft.rfft(_polar_image(image), axis=0)
+    )
     correlation = np.fft.irfft(
         np.sum(polar_fft * np.conj(reference_polar_fft), axis=1),
         n=180,
@@ -1553,12 +2723,20 @@ def _full_pose_rotation_candidates(
     template_polar_fft: np.ndarray,
     *,
     rotational_period_deg: float = 180.0,
+    image_polar_fft: np.ndarray | None = None,
+    image_axis_info: tuple[float, float] | None = None,
 ) -> np.ndarray:
     """Combine data-driven rotation peaks with contamination-resistant coarse coverage."""
     if rotational_period_deg not in (180.0, 360.0):
         raise ValueError("Rotation-search period must be either 180 or 360 degrees.")
-    polar_angles = _rotation_candidates_from_polar(image, template_polar_fft)
-    image_axis, image_anisotropy = _principal_axis_angle(image)
+    polar_angles = _rotation_candidates_from_polar(
+        image,
+        template_polar_fft,
+        image_polar_fft=image_polar_fft,
+    )
+    image_axis, image_anisotropy = (
+        image_axis_info if image_axis_info is not None else _principal_axis_angle(image)
+    )
     template_axis, template_anisotropy = _principal_axis_angle(template)
     candidates = list(float(value) for value in polar_angles)
     if image_anisotropy >= 1.05 and template_anisotropy >= 1.05:
@@ -1796,6 +2974,7 @@ def _align_regions_by_image_correlation(
     sparse_min_site_localizations: int = 3,
     progress_callback: Callable[[float, str], None] | None = None,
     aligned_image_output: list[np.ndarray] | None = None,
+    candidate_image_cache: dict[tuple[object, ...], tuple[object, ...]] | None = None,
 ) -> tuple[list[np.ndarray], np.ndarray, np.ndarray, np.ndarray, np.ndarray, float, np.ndarray]:
     """Independently classify and rigidly align candidates to the theoretical grid image."""
     if requested_pixel_nm <= 0:
@@ -1809,19 +2988,50 @@ def _align_regions_by_image_correlation(
     # surrounding canvas to render the complete footprint around that median.
     canvas_side_nm = 2.0 * side_nm if uses_custom_template else side_nm
     pixel_nm = max(float(requested_pixel_nm), canvas_side_nm / max_patch_pixels)
-    centers = np.asarray([np.median(region, axis=0) for region in regions], dtype=float)
-    rendered_images: list[np.ndarray] = []
-    render_progress_every = max(1, len(regions) // 25)
-    for index, (region, center) in enumerate(zip(regions, centers), start=1):
-        rendered_images.append(
-            _render_candidate_image(region, center, canvas_side_nm, pixel_nm, max(pixel_nm, 1.0))
-        )
-        if progress_callback and (index == len(regions) or index % render_progress_every == 0):
-            progress_callback(
-                15.0 + 5.0 * index / max(len(regions), 1),
-                f"Rendering alignment thumbnails: {index:,}/{len(regions):,} candidates...",
+    cache_key = (
+        id(regions),
+        len(regions),
+        float(canvas_side_nm),
+        float(pixel_nm),
+        int(max_patch_pixels),
+    )
+    cached_candidates = candidate_image_cache.get(cache_key) if candidate_image_cache is not None else None
+    if cached_candidates is not None:
+        cached_regions = cached_candidates[0]
+        if len(cached_regions) != len(regions) or any(
+            cached_region is not region for cached_region, region in zip(cached_regions, regions)
+        ):
+            cached_candidates = None
+    if cached_candidates is None:
+        centers = np.asarray([np.median(region, axis=0) for region in regions], dtype=float)
+        rendered_images: list[np.ndarray] = []
+        render_progress_every = max(1, len(regions) // 25)
+        for index, (region, center) in enumerate(zip(regions, centers), start=1):
+            rendered_images.append(
+                _render_candidate_image(region, center, canvas_side_nm, pixel_nm, max(pixel_nm, 1.0))
             )
-    images = np.asarray(rendered_images, dtype=np.float32)
+            if progress_callback and (index == len(regions) or index % render_progress_every == 0):
+                progress_callback(
+                    15.0 + 5.0 * index / max(len(regions), 1),
+                    f"Rendering alignment thumbnails: {index:,}/{len(regions):,} candidates...",
+                )
+        images = np.asarray(rendered_images, dtype=np.float32)
+        candidate_polar_ffts = tuple(np.fft.rfft(_polar_image(image), axis=0) for image in images)
+        candidate_axis_info = tuple(_principal_axis_angle(image) for image in images)
+        if candidate_image_cache is not None:
+            candidate_image_cache[cache_key] = (
+                tuple(regions),
+                centers,
+                images,
+                candidate_polar_ffts,
+                candidate_axis_info,
+            )
+    else:
+        _cached_regions, centers, images, candidate_polar_ffts, candidate_axis_info = cached_candidates
+        centers = np.asarray(centers, dtype=float)
+        images = np.asarray(images, dtype=np.float32)
+        if progress_callback:
+            progress_callback(20.0, f"Reusing {len(regions):,} cached candidate thumbnails and polar transforms...")
     if len(images) == 0:
         return [], centers, np.empty(0), np.empty((0, 2)), np.empty(0), pixel_nm, np.empty((0, 0))
 
@@ -1870,6 +3080,8 @@ def _align_regions_by_image_correlation(
                     template,
                     template_polar_fft,
                     rotational_period_deg=360.0 if uses_custom_template else 180.0,
+                    image_polar_fft=candidate_polar_ffts[index],
+                    image_axis_info=candidate_axis_info[index],
                 )
             else:
                 refinement_step = 2.0 / (2.0 ** (iteration - 1))
@@ -2052,6 +3264,16 @@ def identify_origami_regions(
     template_pixel_size_x_nm: float | None = None,
     template_pixel_size_y_nm: float | None = None,
     progress_callback: Callable[[float, str], None] | None = None,
+    compute_grid_blob_bic: bool = True,
+    measure_sites: bool = True,
+    precomputed_candidates: tuple[
+        list[np.ndarray],
+        np.ndarray,
+        np.ndarray,
+        tuple[float, float, float, float],
+        np.ndarray,
+    ] | None = None,
+    candidate_image_cache: dict[tuple[object, ...], tuple[object, ...]] | None = None,
 ) -> OrigamiPickResult:
     points_nm = np.asarray(points_nm, dtype=float)
     if points_nm.ndim != 2 or points_nm.shape[1] != 2:
@@ -2100,15 +3322,38 @@ def identify_origami_regions(
             max(float(spacing_x_nm), float(spacing_y_nm))
             + math.sqrt(2.0) * float(pick_bin_size_nm)
         )
-    regions, density, contrast, extent, component_labels = _pick_origami_regions(
-        points_nm,
-        pick_bin_size_nm,
-        connect_distance_nm,
-        density_threshold,
-        component_connect_distance_nm=component_connect_distance_nm,
+    if precomputed_candidates is None:
+        raw_candidates = _pick_origami_regions(
+            points_nm,
+            pick_bin_size_nm,
+            connect_distance_nm,
+            density_threshold,
+            component_connect_distance_nm=component_connect_distance_nm,
+            progress_callback=(
+                (lambda percent, message: progress_callback(2.0 + 0.1 * percent, message))
+                if progress_callback is not None
+                else None
+            ),
+        )
+    else:
+        raw_candidates = precomputed_candidates
+        if progress_callback:
+            progress_callback(12.0, f"Reusing {len(raw_candidates[0]):,} cached spatial candidates...")
+    filtered_candidates, undersized_count = filter_origami_candidates(
+        raw_candidates,
+        min_candidate_points,
     )
+    regions, density, contrast, extent, component_labels = filtered_candidates
     if progress_callback:
-        progress_callback(15.0, f"Found {len(regions)} candidate regions; building bounded image thumbnails...")
+        skipped = (
+            f"; skipped {undersized_count:,} components below {min_candidate_points:,} points"
+            if undersized_count
+            else ""
+        )
+        progress_callback(
+            15.0,
+            f"Found {len(regions):,} viable candidate regions{skipped}; building bounded image thumbnails...",
+        )
     rectangle_width_nm = 0.0
     rectangle_height_nm = 0.0
     rectangle_corners: list[np.ndarray] = []
@@ -2118,7 +3363,12 @@ def identify_origami_regions(
     rectangle_fit_rms: list[float] = []
     aligned_candidate_images: list[np.ndarray] = []
     grid = np.empty((0, 2), dtype=float)
-    if rows is not None and columns is not None and spacing_x_nm is not None and spacing_y_nm is not None:
+    if (
+        rows is not None
+        and columns is not None
+        and spacing_x_nm is not None
+        and spacing_y_nm is not None
+    ):
         if rectangle_margin_nm < 0:
             raise ValueError("Rectangle margin cannot be negative.")
         rectangle_width_nm = max(spacing_x_nm, (columns - 1) * spacing_x_nm) + 2.0 * rectangle_margin_nm
@@ -2138,16 +3388,15 @@ def identify_origami_regions(
                 pixel_size_x_nm=template_pixel_size_x_nm,
                 pixel_size_y_nm=template_pixel_size_y_nm,
             )
-            site_row_ids = np.rint(
-                (grid[:, 1] - float(np.min(grid[:, 1]))) / float(spacing_y_nm)
-            ).astype(int)
-            site_column_ids = np.rint(
-                (grid[:, 0] - float(np.min(grid[:, 0]))) / float(spacing_x_nm)
-            ).astype(int)
         else:
             grid = full_grid
-            site_row_ids = np.arange(len(grid), dtype=int) // columns
-            site_column_ids = np.arange(len(grid), dtype=int) % columns
+        template_grid_distances, template_lattice_indices = cKDTree(full_grid).query(grid, k=1)
+        template_mapping_tolerance_nm = 0.35 * min(float(spacing_x_nm), float(spacing_y_nm))
+        if np.any(template_grid_distances > template_mapping_tolerance_nm):
+            raise ValueError("The alignment template does not map onto the configured lattice.")
+        template_lattice_indices = np.asarray(template_lattice_indices, dtype=int)
+        site_row_ids = template_lattice_indices // columns
+        site_column_ids = template_lattice_indices % columns
         aligned_regions, _centers, fitted_corners, fitted_angles, correlations, effective_alignment_pixel, reference = (
             _align_regions_by_image_correlation(
                 regions,
@@ -2169,6 +3418,7 @@ def identify_origami_regions(
                 template_pixel_size_y_nm=template_pixel_size_y_nm,
                 progress_callback=progress_callback,
                 aligned_image_output=aligned_candidate_images,
+                candidate_image_cache=candidate_image_cache,
             )
         )
         rectangle_corners = list(fitted_corners)
@@ -2189,7 +3439,13 @@ def identify_origami_regions(
             rectangle_matched_sites.append(0)
             rectangle_fit_rms.append(0.0)
 
-    if rows is not None and columns is not None and spacing_x_nm is not None and spacing_y_nm is not None:
+    if (
+        measure_sites
+        and rows is not None
+        and columns is not None
+        and spacing_x_nm is not None
+        and spacing_y_nm is not None
+    ):
         if progress_callback:
             progress_callback(
                 76.0,
@@ -2206,7 +3462,12 @@ def identify_origami_regions(
         site_gap_contrast = np.ones(len(aligned_regions), dtype=float)
         on_site_fraction = np.ones(len(aligned_regions), dtype=float)
     if progress_callback:
-        progress_callback(79.0, "Site-versus-gap density complete; evaluating individual candidates...")
+        progress_callback(
+            79.0,
+            "Site-versus-gap density complete; evaluating individual candidates..."
+            if measure_sites
+            else "Rigid alignment complete; site measurement deferred to Stage 4.",
+        )
 
     supported_site_counts = np.zeros(len(aligned_regions), dtype=int)
     supported_row_counts = np.zeros(len(aligned_regions), dtype=int)
@@ -2216,13 +3477,25 @@ def identify_origami_regions(
     grid_blob_delta_bic = np.full(len(aligned_regions), float("inf"), dtype=float)
     site_count_matrix = np.empty((len(aligned_regions), 0), dtype=int)
     site_prominence_matrix = np.empty((len(aligned_regions), 0), dtype=float)
+    lattice_site_count_matrix = np.empty((len(aligned_regions), 0), dtype=int)
+    lattice_site_prominence_matrix = np.empty((len(aligned_regions), 0), dtype=float)
+    lattice_supported_matrix = np.empty((len(aligned_regions), 0), dtype=bool)
     site_peak_positions = np.empty((len(aligned_regions), 0, 2), dtype=float)
     site_boundary_reference_positions = np.empty((len(aligned_regions), 0, 2), dtype=float)
     site_boundary_points = np.empty((len(aligned_regions), 0, 32, 2), dtype=float)
     site_centroids = np.empty((len(aligned_regions), 0, 2), dtype=float)
-    if rows is not None and columns is not None and spacing_x_nm is not None and spacing_y_nm is not None:
+    if (
+        measure_sites
+        and rows is not None
+        and columns is not None
+        and spacing_x_nm is not None
+        and spacing_y_nm is not None
+    ):
         site_count_matrix = np.zeros((len(aligned_regions), len(grid)), dtype=int)
         site_prominence_matrix = np.zeros((len(aligned_regions), len(grid)), dtype=float)
+        lattice_site_count_matrix = np.zeros((len(aligned_regions), len(full_grid)), dtype=int)
+        lattice_site_prominence_matrix = np.zeros((len(aligned_regions), len(full_grid)), dtype=float)
+        lattice_supported_matrix = np.zeros((len(aligned_regions), len(full_grid)), dtype=bool)
         site_peak_positions = np.full((len(aligned_regions), len(grid), 2), np.nan, dtype=float)
         site_boundary_reference_positions = np.full(
             (len(aligned_regions), len(grid), 2), np.nan, dtype=float
@@ -2235,18 +3508,24 @@ def identify_origami_regions(
         for index, region in enumerate(aligned_regions):
             site_evidence = sparse_site_evidence_diagnostics(
                 region,
-                grid,
+                full_grid,
                 site_radius_nm=site_mask_radius_nm,
             )
-            site_count_matrix[index] = site_evidence.counts
-            site_prominence_matrix[index] = site_evidence.prominence
-            site_peak_positions[index] = site_evidence.peak_positions_nm
-            site_boundary_reference_positions[index] = site_evidence.boundary_reference_positions_nm
-            site_boundary_points[index] = site_evidence.boundary_points_nm
-            supported = (
+            lattice_site_count_matrix[index] = site_evidence.counts
+            lattice_site_prominence_matrix[index] = site_evidence.prominence
+            lattice_supported = (
                 (site_evidence.counts >= int(min_site_localizations))
                 & (site_evidence.prominence >= float(min_site_evidence))
             )
+            lattice_supported_matrix[index] = lattice_supported
+            site_count_matrix[index] = site_evidence.counts[template_lattice_indices]
+            site_prominence_matrix[index] = site_evidence.prominence[template_lattice_indices]
+            site_peak_positions[index] = site_evidence.peak_positions_nm[template_lattice_indices]
+            site_boundary_reference_positions[index] = site_evidence.boundary_reference_positions_nm[
+                template_lattice_indices
+            ]
+            site_boundary_points[index] = site_evidence.boundary_points_nm[template_lattice_indices]
+            supported = lattice_supported[template_lattice_indices]
             site_centroids[index] = supported_site_centroids(
                 region,
                 grid,
@@ -2264,13 +3543,14 @@ def identify_origami_regions(
                 supported,
                 site_radius_nm=site_mask_radius_nm,
             )
-            grid_blob_delta_bic[index] = grid_vs_blob_delta_bic(
-                region,
-                grid,
-                rectangle_width_nm=rectangle_width_nm,
-                rectangle_height_nm=rectangle_height_nm,
-                pixel_nm=effective_alignment_pixel,
-            )
+            if compute_grid_blob_bic:
+                grid_blob_delta_bic[index] = grid_vs_blob_delta_bic(
+                    region,
+                    grid,
+                    rectangle_width_nm=rectangle_width_nm,
+                    rectangle_height_nm=rectangle_height_nm,
+                    pixel_nm=effective_alignment_pixel,
+                )
             completed_candidates = index + 1
             if progress_callback and (
                 completed_candidates == len(aligned_regions)
@@ -2285,6 +3565,13 @@ def identify_origami_regions(
         progress_callback(99.0, "Candidate measurements complete; applying acceptance limits...")
 
     point_counts = np.asarray([len(region) for region in aligned_regions], dtype=int)
+    original_point_counts = np.asarray([len(region) for region in regions], dtype=int)
+    crop_retained_fractions = np.divide(
+        point_counts,
+        original_point_counts,
+        out=np.zeros(len(point_counts), dtype=float),
+        where=original_point_counts > 0,
+    )
     confidence_array = np.asarray(rectangle_confidences, dtype=float)
     accepted_mask = (
         (point_counts >= min_candidate_points)
@@ -2312,6 +3599,8 @@ def identify_origami_regions(
         aligned_regions=aligned_regions,
         accepted_mask=accepted_mask,
         point_counts=point_counts,
+        original_point_counts=original_point_counts,
+        crop_retained_fractions=crop_retained_fractions,
         bounds_nm=bounds,
         rectangle_corners_nm=np.asarray(rectangle_corners, dtype=float) if rectangle_corners else np.empty((0, 4, 2)),
         rectangle_angles_deg=np.asarray(rectangle_angles, dtype=float),
@@ -2320,6 +3609,9 @@ def identify_origami_regions(
         on_site_fraction=np.asarray(on_site_fraction, dtype=float),
         site_mask_radius_nm=float(site_mask_radius_nm),
         template_points_nm=np.asarray(grid, dtype=float),
+        lattice_site_localization_counts=lattice_site_count_matrix,
+        lattice_site_prominence=lattice_site_prominence_matrix,
+        lattice_supported_sites=lattice_supported_matrix,
         site_localization_counts=site_count_matrix,
         site_prominence=site_prominence_matrix,
         site_peak_positions_nm=site_peak_positions,

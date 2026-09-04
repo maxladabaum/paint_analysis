@@ -64,6 +64,16 @@ Large CSV and HDF5 imports show determinate progress beneath the selected file
 name. CSV data is loaded in chunks into preallocated arrays to keep memory close
 to the final localization-table size.
 
+For development restarts, completing drift correction writes an app-owned HDF5
+session cache containing the loaded numeric localization table, corrected table,
+and drift trace. The next launch automatically restores the most recent valid
+session, and manually selecting the same source with the same drift settings uses
+the cache as well. Cache entries are keyed by the source path and correction
+settings and are rejected if the source file or an external drift file changes.
+They live under the machine-specific PaintAnalysis state directory, outside this
+repository. Set `PAINT_ANALYSIS_DISABLE_DEVELOPMENT_CACHE=1` before launch to
+disable automatic restoration.
+
 ## Render And Drift
 
 The map uses Picasso Render directly:
@@ -188,7 +198,10 @@ lattice is anchored to the validation ROI and extended across the acquisition;
 only tiles that fit completely inside the image are processed. Identification
 settings from the validated run are frozen for every tile, accepted origamis
 are aggregated, and one combined docking-site overlay/statistical analysis is
-produced. Processing is sequential by tile to bound image-working memory, while
+produced. Each tile is analyzed with a template-sized halo of neighboring source
+points, but only candidates centered in that tile's non-overlapping core are
+retained; origami crossing tile boundaries are therefore neither truncated nor
+counted twice. Processing is sequential by tile to bound image-working memory, while
 source points are spatially indexed once for efficient lookup. If the selected
 source uses linked events, linking must first be run with `Whole image`.
 
@@ -305,11 +318,55 @@ physical calibration. Custom
 templates use extra thumbnail canvas so off-center signal, including an L whose
 localization median lies near its elbow, is not cropped before pose fitting.
 
-For mixed samples, `Load Multiple Template Images…` accepts two or more
-Picklist Generator templates with embedded or sidecar calibration. Identification
-fits every spatial candidate against each template, matches duplicate detections
-one-to-one by position, and assigns the object to the highest-correlation fit
-among the templates whose normal acceptance gates pass. `Origami type counts`
+The Identify workflow has five ordered checkpoints. `Run Step 1`
+builds the coarse connected components, removes components below the configured
+minimum point limit as background noise, and opens their density/component map.
+Step 2 loads one calibrated alignment image such as `L_L.png`, fits it once per
+candidate, locks rotation and translation, and displays every fitted pose. Step 3
+loads one standalone Picklist Generator logical-bit JSON, measures physical sites
+on the locked candidates, and converts their evidence into the shared digital
+pixel groups. Step 4 loads two or more classification template images; their JSON
+metadata supplies each class's active-bit combination, while the separately
+loaded Step 3 schema supplies the common group definitions. It then applies the
+acceptance gates and fits every digital outcome without repeating pose fitting.
+The alignment image, group JSON, and class templates must use compatible physical
+grid dimensions. The alignment pattern may also be one of the classes. Step 5
+optionally applies the validated workflow to distributed tiles or the whole image.
+Each of the five steps has its own persistent progress bar and status line. Only
+the active step advances; completed steps remain at 100% so cached workflow state
+is visible while later steps run.
+
+The minimum-point cutoff is displayed in Steps 1 and 4; both controls edit the
+same value. Step 2 similarly displays the site radius, localizations-per-site
+floor, and supported-site count used by its sparse-pose selection. Those controls
+are synchronized with their later-step copies. A Step 1 candidate map is reused while
+its pick-bin, density, connection-distance, minimum-point, source, and point-count signature is
+unchanged. The original `Identify Origami` action remains a one-click shortcut
+through classification after all three inputs have been loaded.
+Logical-bit templates retain their physical lattice only for registration and
+measurement. The Picklist Generator now starts without predefined groups: the
+user selects and names arbitrary digital-bit and alignment-only site groups.
+The metadata format supports any grid dimensions, bit names, physical-site
+groups, evidence-site subsets, and alignment-only groups. Its colored PNG is
+converted to equal-intensity grayscale for alignment, so display color cannot
+bias a group. Every logical bit contributes
+once regardless of its physical size, and a missing extension changes only a
+fraction of one bit. The logical on/off likelihood determines the winning
+template. Older templates without logical metadata use the lightweight
+physical-cell agreement score. Adaptive bright/dark agreement remains available
+as a diagnostic and optional gate, but logical templates do not repeat
+physical-cell separation after their bit probabilities have been computed.
+Image correlation remains a secondary pose/quality measurement. A footprint-scaled
+non-maximum-suppression pass then removes weaker nearby fits when one physical
+origami was split into multiple coarse candidates. During one multi-template run,
+all templates reuse spatial candidates, thumbnails, polar transforms, and
+principal-axis measurements. Connected components below the configured minimum
+point count are discarded before thumbnail rendering because footprint fitting
+can only remove points; they therefore cannot become valid candidates.
+Display-only grid-vs-blob ΔBIC fitting is deferred in this
+mode because it does not affect acceptance or classification. The per-template
+probabilities shown for decisions are normalized only over fits that passed all
+gates; diagnostics retain separate raw pre-gate probabilities. `Origami type counts`
 plots the assigned count for every template plus an unclassified count. The
 `Classification view` selector switches the identification overview to one
 template at a time; building the fast overlay from that selection produces its
@@ -329,7 +386,7 @@ uploaded barcode. The Template and Overlay panels in the individual match
 inspector display the exact resampled raster and extracted sites used for scoring.
 
 `Correlation threshold` is the normalized image similarity to the complete
-synthetic grid template and defaults to `0.40`. `Use correlation acceptance
+synthetic grid template and defaults to `0.30`. `Use correlation acceptance
 gate` is enabled by default, so candidates below that value are rejected.
 Correlation remains visible as a QC metric and the gate can be disabled when
 full-grid similarity should not affect acceptance. `Site mask radius` defines
