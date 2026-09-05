@@ -17,15 +17,27 @@ from paint_analysis_gui import (
 class TiledOrigamiTests(unittest.TestCase):
     def test_independent_tile_pipeline_discards_validation_roi_caches(self) -> None:
         cached_object = object()
+        alignment_template = {"name": "L_L", "image": np.ones((3, 3))}
+        classification_templates = (
+            {"name": "full", "image": np.ones((3, 3))},
+            {"name": "square", "image": np.eye(3)},
+        )
+        digital_model = {"bit_ids": ("left", "right")}
         fresh = independent_origami_pipeline_params(
             {
                 "pick_bin_size_nm": 10.0,
+                "shared_alignment_template": alignment_template,
+                "custom_templates": classification_templates,
+                "digital_pixel_model": digital_model,
+                "min_rectangle_confidence": 0.3,
+                "min_monte_carlo_probability": 0.5,
                 "_inspection_stage": 4,
                 "_display_stage": 4,
                 "_precomputed_candidates": cached_object,
                 "_prealigned_picks": cached_object,
                 "_premeasured_picks": cached_object,
                 "_candidate_core_bounds_nm": (0.0, 1.0, 0.0, 1.0),
+                "_alignment_accepted_mask": (True, False),
             }
         )
 
@@ -33,6 +45,12 @@ class TiledOrigamiTests(unittest.TestCase):
         self.assertEqual(fresh["_inspection_stage"], 5)
         self.assertFalse(any(key.startswith("_pre") for key in fresh))
         self.assertNotIn("_candidate_core_bounds_nm", fresh)
+        self.assertNotIn("_alignment_accepted_mask", fresh)
+        self.assertIs(fresh["shared_alignment_template"], alignment_template)
+        self.assertIs(fresh["custom_templates"], classification_templates)
+        self.assertIs(fresh["digital_pixel_model"], digital_model)
+        self.assertEqual(fresh["min_rectangle_confidence"], 0.3)
+        self.assertEqual(fresh["min_monte_carlo_probability"], 0.5)
 
     def test_distributed_analysis_uses_multi_template_aware_validated_context(self) -> None:
         variable = lambda value: SimpleNamespace(get=lambda: value, set=mock.Mock())
@@ -55,6 +73,7 @@ class TiledOrigamiTests(unittest.TestCase):
             )
         )
         app.origami_tile_count = variable(1)
+        app.origami_loaded_roi_nm = (10.0, 20.0, 0.0, 10.0)
         app.origami_identification_generation = 4
         app.origami_g5m_sigma_min_nm = variable(1.0)
         app.origami_g5m_sigma_max_nm = variable(4.0)
@@ -80,6 +99,24 @@ class TiledOrigamiTests(unittest.TestCase):
         app._validated_origami_tile_context.assert_called_once_with()
         app._run_worker.assert_called_once()
         self.assertTrue(app.origami_identification_running)
+
+        limited_task = app._run_worker.call_args.args[0]
+        app._tiled_origami_worker = mock.Mock(return_value=("ignored", {}))
+        limited_task()
+        limited_indices = app._tiled_origami_worker.call_args.args[3]
+        np.testing.assert_array_equal(limited_indices, np.asarray([1]))
+
+        app.origami_identification_running = False
+        app._run_worker.reset_mock()
+        app._tiled_origami_worker.reset_mock()
+        app.analyze_tiled_origamis(use_tile_limit=False)
+
+        app._run_worker.assert_called_once()
+        whole_image_task = app._run_worker.call_args.args[0]
+        whole_image_task()
+        whole_image_indices = app._tiled_origami_worker.call_args.args[3]
+        np.testing.assert_array_equal(whole_image_indices, np.asarray([0, 1]))
+        self.assertEqual(app._validated_origami_tile_context.call_count, 2)
 
     def test_tiles_are_anchored_to_validated_roi_and_only_include_full_tiles(self) -> None:
         validation_roi = (20.0, 40.0, 30.0, 50.0)
@@ -301,8 +338,8 @@ class TiledOrigamiTests(unittest.TestCase):
 
         self.assertEqual(kind, "origami_tiled")
         self.assertEqual(identify.call_count, 2)
-        self.assertEqual(len(identify.call_args_list[0].args[0]), 4)
-        self.assertEqual(len(identify.call_args_list[1].args[0]), 4)
+        self.assertEqual(len(identify.call_args_list[0].args[0]), 2)
+        self.assertEqual(len(identify.call_args_list[1].args[0]), 2)
         concatenate.assert_called_once_with([first, second])
         self.assertEqual(len(align.call_args.args[0]), 2)
         self.assertIs(payload["picks"], combined_picks)
@@ -397,6 +434,10 @@ class TiledOrigamiTests(unittest.TestCase):
                         "params": {
                             "classification_scores": (0.8,),
                             "classification_dispositions": ("classified as square",),
+                            "classification_logical_bit_probabilities": ((0.2, 0.8),),
+                            "digital_group_localization_evidence": ((x_offset + 1.0, x_offset + 2.0),),
+                            "digital_group_prominences": ((0.6, 0.7),),
+                            "digital_pixel_probabilities": ((0.25, 0.75),),
                         },
                     },
                     {
@@ -445,13 +486,104 @@ class TiledOrigamiTests(unittest.TestCase):
             payload["templates"][0]["params"]["classification_scores"],
             (0.8, 0.8),
         )
+        self.assertEqual(
+            payload["templates"][0]["params"]["classification_logical_bit_probabilities"],
+            ((0.2, 0.8), (0.2, 0.8)),
+        )
+        self.assertEqual(
+            payload["templates"][0]["params"]["digital_group_localization_evidence"],
+            ((1.0, 2.0), (11.0, 12.0)),
+        )
+        self.assertEqual(
+            payload["templates"][0]["params"]["digital_group_prominences"],
+            ((0.6, 0.7), (0.6, 0.7)),
+        )
+        self.assertEqual(
+            payload["templates"][0]["params"]["digital_pixel_probabilities"],
+            ((0.25, 0.75), (0.25, 0.75)),
+        )
         self.assertEqual(app._identify_origami_worker.call_count, 2)
-        for worker_call in app._identify_origami_worker.call_args_list:
+        expected_tile_points = (
+            np.asarray([[2.0, 2.0], [3.0, 3.0]]),
+            np.asarray([[12.0, 2.0], [13.0, 3.0]]),
+        )
+        for worker_call, expected_points in zip(
+            app._identify_origami_worker.call_args_list, expected_tile_points
+        ):
+            np.testing.assert_allclose(worker_call.args[0], expected_points)
             tile_params = worker_call.args[1]
             self.assertEqual(tile_params["_inspection_stage"], 5)
             self.assertFalse(any(key.startswith("_pre") for key in tile_params))
             self.assertIn("_candidate_core_bounds_nm", tile_params)
         self.assertEqual(concatenate.call_count, 2)
+
+    def test_multi_template_tiled_worker_returns_unclassified_only_results(self) -> None:
+        app = PaintAnalysisApp.__new__(PaintAnalysisApp)
+        app._origami_identification_worker_progress = mock.Mock()
+        source = pd.DataFrame(
+            {"x": [2.0, 3.0, 12.0, 13.0], "y": [2.0, 3.0, 2.0, 3.0]}
+        )
+        tiles = [(0.0, 10.0, 0.0, 10.0), (10.0, 20.0, 0.0, 10.0)]
+        identification_params = {
+            "custom_templates": [{"name": "square"}, {"name": "full"}],
+            "_inspection_stage": 4,
+        }
+        source_params = {
+            "source": "Corrected localizations",
+            "source_path": "example.hdf5",
+            "active_filters": [],
+        }
+        overlay_params = {"source_path": "example.hdf5"}
+
+        def rejected_tile(x_offset: float) -> tuple[str, dict]:
+            return "origami_multi_picks", {
+                "templates": [
+                    {
+                        "name": name,
+                        "picks": SimpleNamespace(tile=(x_offset, name)),
+                        "params": {
+                            "classification_scores": (0.2,),
+                            "classification_dispositions": ("unclassified",),
+                        },
+                    }
+                    for name in ("square", "full")
+                ],
+                "counts": np.asarray([0, 0]),
+                "unclassified_count": 1,
+                "suppressed_duplicate_count": 0,
+                "unclassified_centers_nm": np.asarray([[x_offset + 4.0, 4.0]]),
+                "unclassified_details": [{
+                    "center_nm": np.asarray([x_offset + 4.0, 4.0]),
+                    "failure_reasons": ("correlation",),
+                }],
+            }
+
+        app._identify_origami_worker = mock.Mock(
+            side_effect=[rejected_tile(0.0), rejected_tile(10.0)]
+        )
+        combined_picks = (object(), object())
+        with mock.patch(
+            "paint_analysis_gui.concatenate_origami_pick_results",
+            side_effect=combined_picks,
+        ):
+            kind, payload = app._tiled_origami_worker(
+                source,
+                1.0,
+                tiles,
+                np.asarray([0, 1]),
+                identification_params,
+                source_params,
+                overlay_params,
+            )
+
+        self.assertEqual(kind, "origami_multi_picks")
+        np.testing.assert_array_equal(payload["counts"], [0, 0])
+        self.assertEqual(payload["accepted_count"], 0)
+        self.assertEqual(payload["unclassified_count"], 2)
+        self.assertEqual(payload["candidate_count"], 2)
+        self.assertEqual(len(payload["unclassified_details"]), 2)
+        self.assertIs(payload["templates"][0]["picks"], combined_picks[0])
+        self.assertIs(payload["templates"][1]["picks"], combined_picks[1])
 
 
 if __name__ == "__main__":

@@ -11,6 +11,9 @@ from origami_analysis import (
     analyze_origami_regions,
     bidirectional_template_classification_scores,
     detected_lattice_template_agreement,
+    digital_group_template_evidence,
+    digital_group_localization_responsibilities,
+    direct_digital_group_localization_evidence,
     cluster_aligned_origami_sites,
     custom_template_site_points,
     fit_picasso_g5m_components,
@@ -40,6 +43,254 @@ from origami_analysis import (
 
 
 class OrigamiAnalysisTests(unittest.TestCase):
+    def test_sparse_alignment_quality_ignores_brightness_away_from_alignment_marks(self) -> None:
+        grid = np.asarray(
+            ((0.0, 0.0), (10.0, 0.0), (20.0, 0.0), (0.0, 10.0), (0.0, 20.0))
+        )
+        alignment_signal = np.repeat(grid, 4, axis=0)
+        unrelated_group = np.asarray(((20.0, 20.0),))
+        baseline = origami_analysis._sparse_pose_quality(
+            np.vstack((alignment_signal, unrelated_group)),
+            grid,
+            site_radius_nm=3.0,
+            required_sites=5,
+            minimum_site_localizations=3,
+            saturate_site_counts=True,
+        )
+        very_bright_unrelated = origami_analysis._sparse_pose_quality(
+            np.vstack((alignment_signal, np.repeat(unrelated_group, 500, axis=0))),
+            grid,
+            site_radius_nm=3.0,
+            required_sites=5,
+            minimum_site_localizations=3,
+            saturate_site_counts=True,
+        )
+
+        self.assertAlmostEqual(baseline, very_bright_unrelated)
+
+    def test_sparse_alignment_quality_penalizes_expected_marks_over_dark_regions(self) -> None:
+        grid = np.asarray(
+            (
+                (-30.0, 20.0), (-20.0, 20.0), (-10.0, 20.0), (0.0, 20.0),
+                (-30.0, 10.0), (-30.0, 0.0), (-30.0, -10.0), (-30.0, -20.0),
+            )
+        )
+        localizations = np.repeat(grid, 8, axis=0)
+        angle = np.deg2rad(4.0)
+        rotation = np.asarray(
+            [[np.cos(angle), -np.sin(angle)], [np.sin(angle), np.cos(angle)]]
+        )
+        incorrectly_rotated = localizations @ rotation.T
+
+        correct_quality = origami_analysis._sparse_pose_quality(
+            localizations,
+            grid,
+            site_radius_nm=7.5,
+            required_sites=5,
+            minimum_site_localizations=5,
+            saturate_site_counts=True,
+        )
+        wrong_quality = origami_analysis._sparse_pose_quality(
+            incorrectly_rotated,
+            grid,
+            site_radius_nm=7.5,
+            required_sites=5,
+            minimum_site_localizations=5,
+            saturate_site_counts=True,
+        )
+
+        # Both poses remain inside the old 7.5 nm binary masks.  The continuous
+        # bright/dark evidence must still prefer the centered alignment.
+        self.assertGreater(correct_quality, wrong_quality + 0.25)
+
+    def test_sparse_alignment_recovers_subdegree_pose_with_bright_nonalignment_groups(self) -> None:
+        rng = np.random.default_rng(29)
+        alignment_grid = np.asarray(
+            (
+                (-30.0, 20.0), (-20.0, 20.0), (-10.0, 20.0), (0.0, 20.0),
+                (-30.0, 10.0), (-30.0, 0.0), (-30.0, -10.0), (-30.0, -20.0),
+            )
+        )
+        expected_angle = 31.7
+        angle = np.deg2rad(expected_angle)
+        rotation = np.asarray(
+            [[np.cos(angle), -np.sin(angle)], [np.sin(angle), np.cos(angle)]]
+        )
+        alignment_signal = np.vstack(
+            [rng.normal(site, 1.1, size=(12, 2)) for site in alignment_grid]
+        )
+        nonalignment_sites = np.asarray(
+            ((0.0, -20.0), (10.0, -10.0), (20.0, 0.0), (20.0, 10.0))
+        )
+        bright_nonalignment_signal = np.vstack(
+            [rng.normal(site, 1.2, size=(60, 2)) for site in nonalignment_sites]
+        )
+        candidate = np.vstack((alignment_signal, bright_nonalignment_signal)) @ rotation.T
+
+        _aligned, _centers, _corners, angles, _correlations, _pixel_nm, _reference = (
+            _align_regions_by_image_correlation(
+                [candidate],
+                rectangle_width_nm=100.0,
+                rectangle_height_nm=80.0,
+                requested_pixel_nm=1.0,
+                iterations=3,
+                template_points_nm=alignment_grid,
+                sparse_pose_site_count=5,
+                sparse_site_radius_nm=7.5,
+                sparse_min_site_localizations=5,
+            )
+        )
+
+        angle_error = abs(((float(angles[0]) - expected_angle + 90.0) % 180.0) - 90.0)
+        self.assertLess(angle_error, 0.5)
+
+    def test_full_lattice_refinement_recovers_more_than_ten_degree_ll_error(self) -> None:
+        rng = np.random.default_rng(3)
+        full_grid = ideal_grid_points(8, 12, 10.0, 6.0)
+        alignment_indices = np.unique(
+            np.concatenate((np.arange(12), np.arange(0, 96, 12)))
+        )
+        alignment_grid = full_grid[alignment_indices]
+        occupied_indices = np.unique(
+            np.concatenate(
+                (
+                    alignment_indices,
+                    np.asarray((30, 31, 42, 43, 55, 67)),
+                )
+            )
+        )
+        points = np.vstack(
+            [rng.normal(full_grid[index], 0.8, size=(8, 2)) for index in occupied_indices]
+        )
+        ll_error_deg = 14.0
+        angle = np.deg2rad(ll_error_deg)
+        rotation = np.asarray(
+            [[np.cos(angle), -np.sin(angle)], [np.sin(angle), np.cos(angle)]]
+        )
+        askew = points @ rotation.T + np.asarray([2.0, -1.5])
+
+        correction, offset, _score = origami_analysis._refine_pose_by_full_lattice(
+            askew,
+            full_grid,
+            alignment_grid,
+            site_radius_nm=7.5,
+            minimum_site_localizations=5,
+        )
+
+        recovered_correction = float(
+            np.rad2deg(np.arctan2(correction[1, 0], correction[0, 0]))
+        )
+        self.assertAlmostEqual(recovered_correction, -ll_error_deg, delta=0.75)
+        corrected = askew @ correction.T + offset
+        nearest_distances, _indices = origami_analysis.cKDTree(full_grid).query(corrected)
+        self.assertLess(float(np.median(nearest_distances)), 1.5)
+
+    def test_lattice_centroid_refinement_equalizes_bright_and_dim_sites(self) -> None:
+        rng = np.random.default_rng(44)
+        full_grid = ideal_grid_points(8, 12, 10.0, 6.0)
+        occupied = np.asarray((0, 1, 2, 3, 12, 24, 36, 48, 30, 31, 42, 55, 67))
+        points = np.vstack(
+            [
+                rng.normal(full_grid[index], 0.7, size=(200 if order == 0 else 8, 2))
+                for order, index in enumerate(occupied)
+            ]
+        )
+        error_deg = 2.7
+        angle = np.deg2rad(error_deg)
+        rotation = np.asarray(
+            [[np.cos(angle), -np.sin(angle)], [np.sin(angle), np.cos(angle)]]
+        )
+        askew = points @ rotation.T + np.asarray([1.4, -0.8])
+        askew = np.vstack((askew, rng.uniform((-50.0, -30.0), (50.0, 30.0), size=(60, 2))))
+
+        correction, _offset, retained, rms = (
+            origami_analysis._refine_pose_from_lattice_centroids(
+                askew,
+                full_grid,
+                site_radius_nm=5.0,
+                minimum_site_localizations=5,
+            )
+        )
+
+        recovered = float(np.rad2deg(np.arctan2(correction[1, 0], correction[0, 0])))
+        self.assertAlmostEqual(recovered, -error_deg, delta=0.35)
+        self.assertGreaterEqual(retained, 10)
+        self.assertLess(rms, 0.75)
+
+    def test_localizations_are_measured_directly_against_digital_groups(self) -> None:
+        grid = np.asarray(((0.0, 0.0), (10.0, 0.0), (20.0, 0.0)))
+        groups = ((0, 1), (1, 2))
+        region = np.asarray(
+            [(0.0, 0.0)] * 4 + [(10.0, 0.0)] * 2 + [(20.0, 0.0)] * 2
+        )
+        evidence = direct_digital_group_localization_evidence(
+            [region], grid, groups, assignment_radius_nm=2.0
+        )
+
+        # The shared position contributes to both logical groups; no
+        # intermediate three-element analog-site count vector is produced.
+        np.testing.assert_allclose(evidence, ((3.0, 2.0),), atol=1e-8)
+
+    def test_digital_group_responsibilities_expose_exclusive_and_shared_assignments(self) -> None:
+        grid = np.asarray(((0.0, 0.0), (10.0, 0.0), (20.0, 0.0)))
+        groups = ((0, 1), (1, 2))
+        points = np.asarray(
+            ((0.0, 0.0), (10.0, 0.0), (20.0, 0.0), (50.0, 0.0))
+        )
+
+        responsibilities = digital_group_localization_responsibilities(
+            points,
+            grid,
+            groups,
+            assignment_radius_nm=2.0,
+        )
+
+        np.testing.assert_allclose(
+            responsibilities,
+            ((1.0, 0.0), (1.0, 1.0), (0.0, 1.0), (0.0, 0.0)),
+            atol=1e-8,
+        )
+
+    def test_digital_template_scoring_uses_one_feature_per_group(self) -> None:
+        evidence = np.asarray(((9.0, 1.0, 7.0), (1.0, 9.0, 7.0)))
+        groups = ((0, 1), (2, 3), (4, 5))
+        left_p, left_score, probabilities, _correlation = digital_group_template_evidence(
+            evidence, (True, False, True), groups
+        )
+        right_p, right_score, _probabilities, _correlation = digital_group_template_evidence(
+            evidence, (False, True, True), groups
+        )
+
+        self.assertEqual(probabilities.shape, evidence.shape)
+        self.assertGreater(left_score[0], right_score[0])
+        self.assertGreater(right_score[1], left_score[1])
+        self.assertGreater(left_p[0], right_p[0])
+
+    def test_direct_group_model_can_represent_uniform_all_on_template(self) -> None:
+        evidence = np.asarray(((6.0, 6.0, 6.0, 6.0),))
+        posterior, score, probabilities, _correlation = digital_group_template_evidence(
+            evidence,
+            (True, True, True, True),
+            ((0,), (1,), (2,), (3,)),
+        )
+
+        self.assertTrue(np.all(probabilities[0] > 0.9))
+        self.assertGreater(score[0], 0.0)
+        self.assertGreater(posterior[0], 0.5)
+
+    def test_direct_group_probability_obeys_visible_support_threshold(self) -> None:
+        evidence = np.asarray(((5.0, 25.0),))
+        _posterior, _score, probabilities, _correlation = digital_group_template_evidence(
+            evidence,
+            (True, True),
+            ((0,), (1,)),
+            minimum_support_per_position=20.0,
+            minimum_group_prominence=0.1,
+        )
+
+        self.assertLess(probabilities[0, 0], 0.5)
+        self.assertGreater(probabilities[0, 1], 0.5)
+
     def test_logical_stroke_evidence_aggregates_physical_sites_per_bit(self) -> None:
         bit_cells = ((0, 1, 2, 3, 4), (5, 6, 7, 8, 9), (10, 11, 12, 13, 14))
         counts = np.zeros((1, 20), dtype=float)
@@ -546,6 +797,32 @@ class OrigamiAnalysisTests(unittest.TestCase):
         self.assertGreater(classification.raw_template_probabilities[0, 1], 0.5)
         self.assertEqual(classification.runner_up_template_indices[0], -1)
         self.assertTrue(np.isinf(classification.winning_score_margins[0]))
+
+    def test_multi_template_probability_gate_is_applied_after_competition(self) -> None:
+        centers = [np.asarray([[0.0, 0.0]]) for _ in range(3)]
+        accepted = [np.asarray([True]) for _ in range(3)]
+        scores = [np.asarray([1.0]), np.asarray([0.9]), np.asarray([0.8])]
+
+        rejected = classify_template_candidates(
+            centers,
+            accepted,
+            scores,
+            match_distance_nm=10.0,
+            minimum_winner_probability=0.4,
+        )
+        accepted_result = classify_template_candidates(
+            centers,
+            accepted,
+            scores,
+            match_distance_nm=10.0,
+            minimum_winner_probability=0.35,
+        )
+
+        self.assertAlmostEqual(rejected.raw_template_probabilities[0, 0], 0.3671654)
+        self.assertEqual(rejected.unclassified_count, 1)
+        np.testing.assert_array_equal(rejected.counts, [0, 0, 0])
+        self.assertEqual(accepted_result.unclassified_count, 0)
+        np.testing.assert_array_equal(accepted_result.counts, [1, 0, 0])
 
     def test_shared_candidate_classification_is_template_order_invariant(self) -> None:
         centers = np.asarray([[0.0, 0.0], [100.0, 20.0]])

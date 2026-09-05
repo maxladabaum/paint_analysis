@@ -9,7 +9,7 @@ from typing import Callable, Sequence
 
 import numpy as np
 from scipy.ndimage import gaussian_filter, label, map_coordinates, maximum_filter, rotate, shift as ndimage_shift
-from scipy.optimize import linear_sum_assignment, nnls
+from scipy.optimize import linear_sum_assignment, minimize, nnls
 from scipy.signal import fftconvolve
 from scipy.sparse import csr_matrix
 from scipy.sparse.csgraph import connected_components
@@ -684,6 +684,253 @@ def logical_bit_template_evidence(
     return posterior, log_bayes_factor, bit_probability, pattern_correlation
 
 
+def direct_digital_group_localization_evidence(
+    aligned_regions: Sequence[np.ndarray],
+    lattice_points_nm: np.ndarray,
+    digital_group_cells: Sequence[Sequence[int]],
+    *,
+    assignment_radius_nm: float,
+) -> np.ndarray:
+    """Measure digital groups directly from aligned localization coordinates.
+
+    The lattice coordinates describe the spatial footprint of each user-defined
+    group, but no localization is first assigned to an individual lattice site.
+    Instead, each localization receives an independent Gaussian affinity to
+    every group from its distance to that group's footprint. A localization at
+    a physical position shared by multiple logical groups contributes to every
+    such group: shared analog positions encode membership in each logical bit
+    and must not make those bits compete for a conserved weight.
+
+    Values are returned as localization support per member position. This makes
+    groups containing different numbers of positions comparable without turning
+    those positions into independently classified analog bits.
+    """
+    grid = np.asarray(lattice_points_nm, dtype=float)
+    if grid.ndim != 2 or grid.shape[1:] != (2,):
+        raise ValueError("Lattice points must be an N-by-2 coordinate array.")
+    radius = float(assignment_radius_nm)
+    if not np.isfinite(radius) or radius <= 0.0:
+        raise ValueError("Digital-group assignment radius must be positive.")
+    groups = [np.unique(np.asarray(cells, dtype=int)) for cells in digital_group_cells]
+    if not groups:
+        raise ValueError("At least one digital group is required.")
+    for cells in groups:
+        if not len(cells):
+            raise ValueError("Every digital group must contain at least one position.")
+        if np.any(cells < 0) or np.any(cells >= len(grid)):
+            raise ValueError("Digital-group position is outside the template lattice.")
+
+    evidence = np.zeros((len(aligned_regions), len(groups)), dtype=float)
+    group_trees = [cKDTree(grid[cells]) for cells in groups]
+    radius_squared = radius * radius
+    for region_index, region_value in enumerate(aligned_regions):
+        region = np.asarray(region_value, dtype=float)
+        if region.ndim != 2 or region.shape[1:] != (2,) or not len(region):
+            continue
+        responsibilities = _digital_group_responsibilities_from_trees(
+            region,
+            group_trees,
+            radius,
+            radius_squared,
+        )
+        evidence[region_index] = np.sum(responsibilities, axis=0) / np.asarray(
+            [len(cells) for cells in groups], dtype=float
+        )
+    return evidence
+
+
+def _digital_group_responsibilities_from_trees(
+    region: np.ndarray,
+    group_trees: Sequence[cKDTree],
+    radius: float,
+    radius_squared: float,
+) -> np.ndarray:
+    affinity = np.zeros((len(region), len(group_trees)), dtype=float)
+    for group_index, tree in enumerate(group_trees):
+        distance, _nearest = tree.query(region, k=1)
+        inside = distance <= radius
+        affinity[inside, group_index] = np.exp(
+            -0.5 * np.square(distance[inside]) / radius_squared
+        )
+    return affinity
+
+
+def digital_group_localization_responsibilities(
+    aligned_region: np.ndarray,
+    lattice_points_nm: np.ndarray,
+    digital_group_cells: Sequence[Sequence[int]],
+    *,
+    assignment_radius_nm: float,
+) -> np.ndarray:
+    """Return the exact per-localization group weights used by Step 3."""
+    region = np.asarray(aligned_region, dtype=float)
+    grid = np.asarray(lattice_points_nm, dtype=float)
+    if region.ndim != 2 or region.shape[1:] != (2,):
+        raise ValueError("Aligned localizations must be an N-by-2 array.")
+    if grid.ndim != 2 or grid.shape[1:] != (2,):
+        raise ValueError("Lattice points must be an N-by-2 array.")
+    radius = float(assignment_radius_nm)
+    if not np.isfinite(radius) or radius <= 0.0:
+        raise ValueError("Digital-group assignment radius must be positive.")
+    groups = [np.unique(np.asarray(cells, dtype=int)) for cells in digital_group_cells]
+    if not groups or any(not len(cells) for cells in groups):
+        raise ValueError("Every digital group must contain at least one position.")
+    if any(np.any(cells < 0) or np.any(cells >= len(grid)) for cells in groups):
+        raise ValueError("Digital-group position is outside the template lattice.")
+    trees = [cKDTree(grid[cells]) for cells in groups]
+    return _digital_group_responsibilities_from_trees(
+        region, trees, radius, radius * radius
+    )
+
+
+def digital_group_template_evidence(
+    digital_group_evidence: np.ndarray,
+    active_digital_groups: Sequence[bool],
+    digital_group_cells: Sequence[Sequence[int]],
+    *,
+    minimum_support_per_position: float = 0.0,
+    minimum_group_prominence: float = 0.0,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Score a template using only one measured feature per digital group."""
+    evidence = np.asarray(digital_group_evidence, dtype=float)
+    active = np.asarray(active_digital_groups, dtype=bool)
+    groups = [set(np.asarray(cells, dtype=int).tolist()) for cells in digital_group_cells]
+    if evidence.ndim != 2:
+        raise ValueError("Digital-group evidence must be a candidate-by-group matrix.")
+    if evidence.shape[1] != len(groups) or active.shape != (len(groups),):
+        raise ValueError("Digital-group evidence and template states have different sizes.")
+    if not groups or any(not cells for cells in groups):
+        raise ValueError("Every digital group must contain at least one position.")
+    if not np.all(np.isfinite(evidence)) or np.any(evidence < 0.0):
+        raise ValueError("Digital-group evidence must be finite and nonnegative.")
+    minimum_support = float(minimum_support_per_position)
+    minimum_prominence = float(minimum_group_prominence)
+    if not np.isfinite(minimum_support) or minimum_support < 0.0:
+        raise ValueError("Minimum digital-group support must be finite and nonnegative.")
+    if not np.isfinite(minimum_prominence) or not 0.0 <= minimum_prominence <= 1.0:
+        raise ValueError("Minimum digital-group prominence must be between zero and one.")
+    candidate_count, group_count = evidence.shape
+    if not candidate_count:
+        return (
+            np.empty(0),
+            np.empty(0),
+            np.empty((0, group_count)),
+            np.empty(0),
+        )
+
+    # When the user supplies a visible support threshold, calibrate every group
+    # independently against that common physical evidence scale.  Candidate-
+    # relative normalization made strong/easy groups define the ON threshold
+    # for weak/hard groups and created a systematic template bias.
+    if minimum_support > 0.0:
+        calibration_slope = math.log(19.0)
+        log_odds = calibration_slope * (
+            evidence / max(minimum_support, 1e-12) - 1.0
+        )
+        group_probability = 1.0 / (1.0 + np.exp(-np.clip(log_odds, -20.0, 20.0)))
+    else:
+        # Backward-compatible scale-free behavior for callers without a
+        # support calibration (primarily legacy files and QC calculations).
+        group_probability = None
+
+    # Candidate-local separation now operates on the digital groups themselves.
+    # Direct group assignment has a meaningful zero, so anchor the OFF state at
+    # zero rather than forcing the dimmest observed group to be OFF. The latter
+    # would make a uniformly populated all-ON template impossible to represent.
+    intensity = np.log1p(evidence)
+    low = np.zeros(candidate_count, dtype=float)
+    high = np.max(intensity, axis=1)
+    separable = high > low + 1e-12
+    for _iteration in range(24):
+        boundary = 0.5 * (low + high)
+        dark = intensity <= boundary[:, None]
+        bright_count = np.sum(~dark, axis=1)
+        valid = separable & (bright_count > 0)
+        next_high = np.divide(
+            np.sum(np.where(~dark, intensity, 0.0), axis=1),
+            bright_count,
+            out=high.copy(),
+            where=valid,
+        )
+        change = np.abs(next_high - high)
+        high = np.where(valid, next_high, high)
+        if not np.any(change[valid] >= 1e-8):
+            break
+    separation = np.maximum(high - low, 1e-6)
+    boundary = 0.5 * (low + high)
+    dark = intensity <= boundary[:, None]
+    residual = np.where(dark, intensity - low[:, None], intensity - high[:, None])
+    variance = np.maximum.reduce(
+        (
+            np.mean(np.square(residual), axis=1),
+            np.square(separation / 4.0),
+            np.full(candidate_count, 1e-6),
+        )
+    )
+    log_odds = np.clip(
+        separation[:, None] * (intensity - boundary[:, None]) / variance[:, None],
+        -20.0,
+        20.0,
+    )
+    relative_probability = 1.0 / (1.0 + np.exp(-log_odds))
+    relative_probability[~separable] = 0.5
+    if group_probability is None:
+        group_probability = relative_probability
+    group_probability = np.clip(group_probability, 1e-4, 1.0 - 1e-4)
+
+    # Apply the user-visible Step 3 gates to the same probabilities consumed
+    # by Step 4. Below-threshold evidence is smoothly capped below 0.5, rather
+    # than being displayed as ON despite failing the configured minimum.
+    raw_group_prominence = np.maximum(0.0, 2.0 * group_probability - 1.0)
+    if minimum_support > 0.0:
+        support_ceiling = np.where(
+            evidence >= minimum_support,
+            1.0,
+            0.5 * np.clip(evidence / minimum_support, 0.0, 1.0),
+        )
+        group_probability = np.minimum(group_probability, support_ceiling)
+    if minimum_prominence > 0.0:
+        prominence_ceiling = np.where(
+            raw_group_prominence >= minimum_prominence,
+            1.0,
+            0.5 * np.clip(raw_group_prominence / minimum_prominence, 0.0, 1.0),
+        )
+        group_probability = np.minimum(group_probability, prominence_ceiling)
+    group_probability = np.clip(group_probability, 1e-4, 1.0 - 1e-4)
+
+    # An inactive group cannot provide independent dark evidence where its
+    # footprint overlaps an active group. This overlap correction uses only
+    # the group definitions, never per-position localization measurements.
+    active_union: set[int] = set()
+    for cells, is_active in zip(groups, active):
+        if is_active:
+            active_union.update(cells)
+    evidence_weight = np.ones(group_count, dtype=float)
+    for group_index, (cells, is_active) in enumerate(zip(groups, active)):
+        if not is_active:
+            evidence_weight[group_index] = len(cells - active_union) / len(cells)
+    agreement = np.where(active[None, :], group_probability, 1.0 - group_probability)
+    log_bayes_factor = np.sum(
+        evidence_weight[None, :] * (np.log(agreement) - math.log(0.5)), axis=1
+    )
+    posterior = 1.0 / (1.0 + np.exp(-np.clip(log_bayes_factor, -40.0, 40.0)))
+
+    expected = active.astype(float) - float(np.mean(active))
+    expected_norm = float(np.linalg.norm(expected))
+    if expected_norm <= 1e-12:
+        pattern_correlation = np.ones(candidate_count, dtype=float)
+    else:
+        observed = group_probability - np.mean(group_probability, axis=1, keepdims=True)
+        denominator = np.linalg.norm(observed, axis=1) * expected_norm
+        pattern_correlation = np.divide(
+            observed @ expected,
+            denominator,
+            out=np.zeros(candidate_count, dtype=float),
+            where=denominator > 1e-12,
+        )
+    return posterior, log_bayes_factor, group_probability, pattern_correlation
+
+
 # Backward-compatible name from the original fixed-stroke implementation.
 logical_stroke_template_evidence = logical_bit_template_evidence
 
@@ -1024,6 +1271,7 @@ def classify_template_candidates(
     *,
     match_distance_nm: float,
     deduplication_distance_nm: float | None = None,
+    minimum_winner_probability: float | None = None,
 ) -> TemplateClassificationResult:
     """Match duplicate detections across templates and select one accepted fit per object."""
     template_count = len(candidate_centers_by_template)
@@ -1033,6 +1281,8 @@ def classify_template_candidates(
         raise ValueError("Template candidate match distance must be positive.")
     if deduplication_distance_nm is not None and deduplication_distance_nm <= 0:
         raise ValueError("Template deduplication distance must be positive.")
+    if minimum_winner_probability is not None and not 0.0 <= minimum_winner_probability <= 1.0:
+        raise ValueError("Minimum winner probability must be between zero and one.")
 
     centers_by_template: list[np.ndarray] = []
     for centers, accepted, scores in zip(candidate_centers_by_template, accepted_masks, correlations):
@@ -1132,6 +1382,16 @@ def classify_template_candidates(
         if not passing:
             continue
         _score, template_index, candidate_index = max(passing)
+        # This probability is normalized across every loaded template with
+        # equal priors.  Applying the gate here lets templates compete first
+        # and prevents the subsequent duplicate suppression from discarding
+        # a neighbor on behalf of a fit that will ultimately be rejected.
+        if (
+            minimum_winner_probability is not None
+            and raw_template_probabilities[group_index, template_index] + 1e-9
+            < minimum_winner_probability
+        ):
+            continue
         assignment_masks[template_index][candidate_index] = True
         winning_template_indices[group_index] = template_index
         winning_scores[group_index] = _score
@@ -2866,8 +3126,18 @@ def _sparse_pose_quality(
     site_radius_nm: float,
     required_sites: int,
     minimum_site_localizations: int,
+    saturate_site_counts: bool = False,
 ) -> float:
-    """Score a pose by distributed grid consensus, centroid precision, and contamination."""
+    """Score a pose using both present and missing alignment-site evidence.
+
+    The count-based coverage terms alone are nearly flat while a bright stroke
+    remains anywhere inside a comparatively large site mask.  That made poses
+    a few degrees apart look equivalent.  ``site_evidence`` samples only the
+    closest ``minimum_site_localizations`` at every expected alignment mark,
+    so extra brightness cannot compensate for putting the mark beside the
+    localization ridge.  Its complement is an explicit missing-site penalty.
+    One weakest mark is ignored to tolerate a genuinely absent extension.
+    """
     points = np.asarray(aligned_region, dtype=float)
     grid = np.asarray(grid_points_nm, dtype=float)
     if not len(points) or not len(grid):
@@ -2883,26 +3153,74 @@ def _sparse_pose_quality(
     required_coverage = min(len(supported_indices) / max(required_sites, 1), 1.0)
     total_coverage = len(supported_indices) / max(len(grid), 1)
     centroid_precision = 0.0
+    site_evidence = np.zeros(len(grid), dtype=float)
+    evidence_sigma_nm = max(0.75, min(float(site_radius_nm) / 3.0, 2.5))
     if len(supported_indices):
         residuals: list[float] = []
         for site_index in supported_indices:
-            assigned = points[(sites == site_index) & (distances <= site_radius_nm)]
+            assigned_mask = (sites == site_index) & (distances <= site_radius_nm)
+            assigned = points[assigned_mask]
             if len(assigned):
                 residuals.append(float(np.linalg.norm(np.mean(assigned, axis=0) - grid[site_index])))
         if residuals:
             centroid_precision = float(
                 np.mean(np.clip(1.0 - np.asarray(residuals) / site_radius_nm, 0.0, 1.0))
             )
-    inlier_fraction = float(np.mean(distances <= site_radius_nm))
+    # Use only the strongest K localization samples at each alignment mark.
+    # This is deliberately brightness-saturated: 500 localizations several
+    # nanometers away must not beat three localizations centered on the mark.
+    required_localizations = max(1, int(minimum_site_localizations))
+    for site_index in range(len(grid)):
+        assigned_distances = distances[
+            (sites == site_index) & (distances <= site_radius_nm)
+        ]
+        if not len(assigned_distances):
+            continue
+        weights = np.exp(
+            -0.5 * np.square(assigned_distances / evidence_sigma_nm)
+        )
+        strongest = np.sort(weights)[-required_localizations:]
+        site_evidence[site_index] = float(
+            np.sum(strongest) / required_localizations
+        )
+    continuous_support = float(np.mean(site_evidence))
+    missing = 1.0 - site_evidence
+    # Missing one extension should not ruin an otherwise decisive L-shaped
+    # alignment, but systematic darkness caused by a rotated pose must count.
+    allowed_missing_sites = 1 if len(missing) >= 5 else 0
+    if allowed_missing_sites:
+        missing_for_score = np.sort(missing)[:-allowed_missing_sites]
+    else:
+        missing_for_score = missing
+    missing_penalty = float(np.mean(missing_for_score)) if len(missing_for_score) else 0.0
+    # Saturate each alignment site independently. A digital group containing
+    # hundreds of localizations must not outweigh an alignment mark merely by
+    # contributing more points near a competing pose.
+    if saturate_site_counts:
+        inlier_support = float(
+            np.mean(
+                np.clip(
+                    counts / max(float(minimum_site_localizations), 1.0),
+                    0.0,
+                    1.0,
+                )
+            )
+        )
+    else:
+        # Legacy full-grid alignment uses the dominant connected object's
+        # inlier fraction to reject a separate nearby distractor.
+        inlier_support = float(np.mean(distances <= site_radius_nm))
     # Required coverage dominates so genuinely sparse origami remain viable.
     # Extra distributed sites and precise centroids break ties, while the modest
-    # inlier term prevents a nearby object from steering the pose without
-    # punishing diffuse signal belonging to the target.
+    # soft per-site term rewards partially supported marks without restoring a
+    # localization-count weighting.
     return float(
-        2.0 * required_coverage
-        + 0.75 * total_coverage
-        + 0.35 * centroid_precision
-        + 0.20 * inlier_fraction
+        1.5 * required_coverage
+        + 0.5 * total_coverage
+        + 0.6 * centroid_precision
+        + 1.0 * continuous_support
+        + 0.2 * inlier_support
+        - 0.9 * missing_penalty
     )
 
 
@@ -2953,6 +3271,287 @@ def _refine_sparse_grid_pose(
     return refined, accumulated_rotation, accumulated_offset
 
 
+def _refine_pose_by_alignment_site_contrast(
+    aligned_region: np.ndarray,
+    grid_points_nm: np.ndarray,
+    *,
+    site_radius_nm: float,
+    minimum_site_localizations: int,
+    maximum_angle_correction_deg: float = 4.0,
+) -> tuple[np.ndarray, np.ndarray, float]:
+    """Fine-tune a provisional pose by rewarding bright expected marks and dark misses.
+
+    This final, bounded refinement works in localization coordinates, avoiding
+    the angular quantization of the rendered alignment thumbnail.  Only the
+    uploaded alignment sites are queried; signal from other digital groups is
+    neither rewarded nor treated as expected background.
+    """
+    points = np.asarray(aligned_region, dtype=float)
+    grid = np.asarray(grid_points_nm, dtype=float)
+    if not len(points) or not len(grid):
+        return np.eye(2, dtype=float), np.zeros(2, dtype=float), -float("inf")
+    tree = cKDTree(points)
+    sample_count = min(max(1, int(minimum_site_localizations)), len(points))
+    sigma_nm = max(0.75, min(float(site_radius_nm) / 3.0, 2.5))
+    translation_bound_nm = max(0.5, min(float(site_radius_nm) / 2.0, 4.0))
+    allowed_missing_sites = 1 if len(grid) >= 5 else 0
+
+    def evidence_score(parameters: np.ndarray) -> float:
+        angle_deg, offset_x, offset_y = (float(value) for value in parameters)
+        angle = np.deg2rad(angle_deg)
+        correction = np.asarray(
+            [[np.cos(angle), -np.sin(angle)], [np.sin(angle), np.cos(angle)]],
+            dtype=float,
+        )
+        offset = np.asarray([offset_x, offset_y], dtype=float)
+        # If corrected = points @ correction.T + offset, these are the
+        # equivalent query positions in the uncorrected point coordinates.
+        query_sites = (grid - offset) @ correction
+        distances, _indices = tree.query(query_sites, k=sample_count)
+        distances = np.asarray(distances, dtype=float)
+        if distances.ndim == 1:
+            distances = distances[:, None]
+        weights = np.exp(-0.5 * np.square(distances / sigma_nm))
+        weights[distances > site_radius_nm] = 0.0
+        evidence = np.mean(weights, axis=1)
+        if allowed_missing_sites:
+            evidence = np.sort(evidence)[allowed_missing_sites:]
+        bright_support = float(np.mean(evidence)) if len(evidence) else 0.0
+        missing_penalty = float(np.mean(1.0 - evidence)) if len(evidence) else 1.0
+        # Writing both terms explicitly makes a dark expected mark reduce the
+        # objective instead of merely failing to add positive correlation.
+        return bright_support - 0.9 * missing_penalty
+
+    initial = np.zeros(3, dtype=float)
+    initial_score = evidence_score(initial)
+    result = minimize(
+        lambda values: -evidence_score(np.asarray(values, dtype=float)),
+        initial,
+        method="Powell",
+        bounds=(
+            (-float(maximum_angle_correction_deg), float(maximum_angle_correction_deg)),
+            (-translation_bound_nm, translation_bound_nm),
+            (-translation_bound_nm, translation_bound_nm),
+        ),
+        options={"xtol": 0.02, "ftol": 1e-4, "maxiter": 35},
+    )
+    values = np.asarray(result.x, dtype=float) if result.success else initial
+    final_score = evidence_score(values)
+    if not np.isfinite(final_score) or final_score <= initial_score + 1e-6:
+        values = initial
+        final_score = initial_score
+    angle = np.deg2rad(float(values[0]))
+    correction = np.asarray(
+        [[np.cos(angle), -np.sin(angle)], [np.sin(angle), np.cos(angle)]],
+        dtype=float,
+    )
+    return correction, np.asarray(values[1:3], dtype=float), float(final_score)
+
+
+def _refine_pose_by_full_lattice(
+    aligned_region: np.ndarray,
+    full_grid_points_nm: np.ndarray,
+    alignment_points_nm: np.ndarray,
+    *,
+    site_radius_nm: float,
+    minimum_site_localizations: int,
+    angular_block_deg: float = 12.0,
+    maximum_angle_correction_deg: float = 60.0,
+) -> tuple[np.ndarray, np.ndarray, float]:
+    """Refine an L_L pose against occupied sites on the complete physical lattice.
+
+    Empty lattice cells are neutral because their digital state is unknown.
+    The angular search grows by blocks while its best solution remains on the
+    current boundary, allowing recovery from L_L errors well above ten degrees.
+    """
+    points = np.asarray(aligned_region, dtype=float)
+    full_grid = np.asarray(full_grid_points_nm, dtype=float)
+    alignment_grid = np.asarray(alignment_points_nm, dtype=float)
+    if not len(points) or not len(full_grid):
+        return np.eye(2, dtype=float), np.zeros(2, dtype=float), -float("inf")
+    tree = cKDTree(points)
+    sample_count = min(max(1, int(minimum_site_localizations)), len(points))
+    sigma_nm = max(0.75, min(float(site_radius_nm) / 3.0, 2.5))
+    translation_bound_nm = max(0.5, min(float(site_radius_nm) / 2.0, 4.0))
+
+    def site_evidence(grid: np.ndarray, values: np.ndarray) -> np.ndarray:
+        angle_deg, offset_x, offset_y = (float(value) for value in values)
+        angle = np.deg2rad(angle_deg)
+        correction = np.asarray(
+            [[np.cos(angle), -np.sin(angle)], [np.sin(angle), np.cos(angle)]],
+            dtype=float,
+        )
+        query_sites = (grid - np.asarray([offset_x, offset_y])) @ correction
+        distances, _indices = tree.query(query_sites, k=sample_count)
+        distances = np.asarray(distances, dtype=float)
+        if distances.ndim == 1:
+            distances = distances[:, None]
+        weights = np.exp(-0.5 * np.square(distances / sigma_nm))
+        weights[distances > site_radius_nm] = 0.0
+        return np.mean(weights, axis=1)
+
+    def score(values: np.ndarray) -> float:
+        full_evidence = site_evidence(full_grid, values)
+        # A capped sum rewards every occupied analog position without assuming
+        # that any of the other 12x8 positions should be dark or bright.
+        occupied_lattice_score = float(np.sum(full_evidence) / np.sqrt(len(full_grid)))
+        alignment_evidence = site_evidence(alignment_grid, values)
+        if len(alignment_evidence) >= 5:
+            alignment_evidence = np.sort(alignment_evidence)[1:]
+        alignment_support = float(np.mean(alignment_evidence)) if len(alignment_evidence) else 0.0
+        alignment_missing = (
+            float(np.mean(1.0 - alignment_evidence)) if len(alignment_evidence) else 1.0
+        )
+        return occupied_lattice_score + 0.35 * (alignment_support - 0.9 * alignment_missing)
+
+    # Grow the coarse search only when evidence continues improving at an edge.
+    # Every angle gets a small translation search as well: otherwise an L_L
+    # translation error can make the correct angular basin look artificially
+    # weak before the continuous optimizer ever sees it.
+    zero_pose = np.zeros(3, dtype=float)
+    initial_score = score(zero_pose)
+    tested: dict[float, tuple[float, float, float]] = {}
+    coarse_offsets = (
+        -0.5 * translation_bound_nm,
+        0.0,
+        0.5 * translation_bound_nm,
+    )
+    lower = -float(angular_block_deg)
+    upper = float(angular_block_deg)
+    while True:
+        for angle in np.arange(lower, upper + 0.001, 1.0):
+            key = float(round(angle, 6))
+            if key not in tested:
+                best_trial = (-float("inf"), 0.0, 0.0)
+                for offset_x in coarse_offsets:
+                    for offset_y in coarse_offsets:
+                        trial_score = score(
+                            np.asarray([angle, offset_x, offset_y], dtype=float)
+                        )
+                        if trial_score > best_trial[0]:
+                            best_trial = (trial_score, offset_x, offset_y)
+                tested[key] = best_trial
+        best_angle = max(tested, key=lambda value: tested[value][0])
+        expanded = False
+        if best_angle <= lower + 1.0 and abs(lower) < maximum_angle_correction_deg:
+            lower = max(-maximum_angle_correction_deg, lower - angular_block_deg)
+            expanded = True
+        if best_angle >= upper - 1.0 and upper < maximum_angle_correction_deg:
+            upper = min(maximum_angle_correction_deg, upper + angular_block_deg)
+            expanded = True
+        if not expanded:
+            break
+
+    local_lower = max(-maximum_angle_correction_deg, best_angle - 2.0)
+    local_upper = min(maximum_angle_correction_deg, best_angle + 2.0)
+    _coarse_score, coarse_x, coarse_y = tested[best_angle]
+    result = minimize(
+        lambda values: -score(np.asarray(values, dtype=float)),
+        np.asarray([best_angle, coarse_x, coarse_y], dtype=float),
+        method="Powell",
+        bounds=(
+            (local_lower, local_upper),
+            (-translation_bound_nm, translation_bound_nm),
+            (-translation_bound_nm, translation_bound_nm),
+        ),
+        options={"xtol": 0.02, "ftol": 1e-4, "maxiter": 35},
+    )
+    values = np.asarray(result.x, dtype=float) if result.success else np.zeros(3, dtype=float)
+    final_score = score(values)
+    if not np.isfinite(final_score) or final_score <= initial_score + 1e-4:
+        values = np.zeros(3, dtype=float)
+        final_score = initial_score
+    angle = np.deg2rad(float(values[0]))
+    correction = np.asarray(
+        [[np.cos(angle), -np.sin(angle)], [np.sin(angle), np.cos(angle)]],
+        dtype=float,
+    )
+    return correction, np.asarray(values[1:3], dtype=float), float(final_score)
+
+
+def _refine_pose_from_lattice_centroids(
+    aligned_region: np.ndarray,
+    full_grid_points_nm: np.ndarray,
+    *,
+    site_radius_nm: float,
+    minimum_site_localizations: int,
+    iterations: int = 5,
+) -> tuple[np.ndarray, np.ndarray, int, float]:
+    """Refine a nearly aligned pose from equal-weight robust analog-site centers."""
+    original = np.asarray(aligned_region, dtype=float)
+    grid = np.asarray(full_grid_points_nm, dtype=float)
+    if not len(original) or not len(grid):
+        return np.eye(2, dtype=float), np.zeros(2, dtype=float), 0, float("inf")
+    refined = original.copy()
+    accumulated_rotation = np.eye(2, dtype=float)
+    accumulated_offset = np.zeros(2, dtype=float)
+    grid_tree = cKDTree(grid)
+    retained_count = 0
+    retained_rms = float("inf")
+    for _iteration in range(max(0, int(iterations))):
+        distances, sites = grid_tree.query(refined, k=1)
+        observed_centroids: list[np.ndarray] = []
+        expected_sites: list[np.ndarray] = []
+        for site_index in range(len(grid)):
+            assigned = refined[
+                (sites == site_index) & (distances <= float(site_radius_nm))
+            ]
+            if len(assigned) < int(minimum_site_localizations):
+                continue
+            # A trimmed center resists background localizations while retaining
+            # subnanometer precision for a dense analog pixel.
+            median = np.median(assigned, axis=0)
+            radial = np.linalg.norm(assigned - median, axis=1)
+            keep_count = max(
+                int(minimum_site_localizations), int(np.ceil(0.8 * len(assigned)))
+            )
+            keep = np.argsort(radial)[:keep_count]
+            observed_centroids.append(np.mean(assigned[keep], axis=0))
+            expected_sites.append(grid[site_index])
+        if len(observed_centroids) < 3:
+            break
+        observed = np.asarray(observed_centroids, dtype=float)
+        expected = np.asarray(expected_sites, dtype=float)
+        residuals = np.linalg.norm(observed - expected, axis=1)
+        residual_median = float(np.median(residuals))
+        mad = float(np.median(np.abs(residuals - residual_median)))
+        robust_limit = min(
+            0.9 * float(site_radius_nm),
+            residual_median + max(1.0, 2.5 * 1.4826 * mad),
+        )
+        inliers = residuals <= robust_limit
+        if int(np.count_nonzero(inliers)) < 3:
+            inliers = np.argsort(residuals)[: min(3, len(residuals))]
+            observed = observed[inliers]
+            expected = expected[inliers]
+        else:
+            observed = observed[inliers]
+            expected = expected[inliers]
+        observed_center = np.mean(observed, axis=0)
+        expected_center = np.mean(expected, axis=0)
+        covariance = (observed - observed_center).T @ (expected - expected_center)
+        left, _singular_values, right_transpose = np.linalg.svd(covariance)
+        correction = right_transpose.T @ left.T
+        if np.linalg.det(correction) < 0:
+            right_transpose[-1, :] *= -1.0
+            correction = right_transpose.T @ left.T
+        offset = expected_center - observed_center @ correction.T
+        corrected_centroids = observed @ correction.T + offset
+        retained_count = len(observed)
+        retained_rms = float(
+            np.sqrt(np.mean(np.sum(np.square(corrected_centroids - expected), axis=1)))
+        )
+        refined = refined @ correction.T + offset
+        accumulated_rotation = correction @ accumulated_rotation
+        accumulated_offset = accumulated_offset @ correction.T + offset
+        correction_angle = abs(
+            float(np.rad2deg(np.arctan2(correction[1, 0], correction[0, 0])))
+        )
+        if correction_angle < 0.01 and float(np.linalg.norm(offset)) < 0.02:
+            break
+    return accumulated_rotation, accumulated_offset, retained_count, retained_rms
+
+
 def _align_regions_by_image_correlation(
     regions: list[np.ndarray],
     *,
@@ -2972,6 +3571,7 @@ def _align_regions_by_image_correlation(
     sparse_pose_site_count: int = 0,
     sparse_site_radius_nm: float = 7.5,
     sparse_min_site_localizations: int = 3,
+    refinement_grid_points_nm: np.ndarray | None = None,
     progress_callback: Callable[[float, str], None] | None = None,
     aligned_image_output: list[np.ndarray] | None = None,
     candidate_image_cache: dict[tuple[object, ...], tuple[object, ...]] | None = None,
@@ -3139,6 +3739,7 @@ def _align_regions_by_image_correlation(
                             site_radius_nm=sparse_site_radius_nm,
                             required_sites=sparse_pose_site_count,
                             minimum_site_localizations=sparse_min_site_localizations,
+                            saturate_site_counts=uses_custom_template,
                         )
                         if not uses_custom_template and pose_quality < best_pose_quality - 1e-12:
                             continue
@@ -3171,11 +3772,13 @@ def _align_regions_by_image_correlation(
                             )
                         )
                         pose_quality = score
-                    selection_quality = (
-                        pose_quality + score
-                        if uses_custom_template and sparse_pose_site_count > 0
-                        else pose_quality
-                    )
+                    # Once a sparse alignment template is available, choose
+                    # the pose exclusively from its site-consensus geometry.
+                    # Adding whole-candidate image correlation here lets very
+                    # bright non-alignment digital groups pull an L_L template
+                    # toward their strokes. Keep raster correlation only as a
+                    # deterministic tie-breaker and reported QC measurement.
+                    selection_quality = pose_quality
                     if selection_quality > best_pose_quality or (
                         abs(selection_quality - best_pose_quality) <= 1e-12 and score > best_score
                     ):
@@ -3198,6 +3801,89 @@ def _align_regions_by_image_correlation(
                     20.0 + 52.0 * completed_alignment_work / total_alignment_work,
                     f"Theoretical-template alignment pass {iteration + 1}/{iterations}: "
                     f"candidate {index + 1:,}/{len(images):,}...",
+                )
+
+    # The raster search above finds the correct pose basin efficiently, but
+    # its effective pixel size can leave a residual angular error.  Finish in
+    # localization coordinates, where expected alignment marks landing in
+    # dark regions explicitly lower the score.
+    if sparse_pose_site_count > 0 and template_points_nm is not None and len(template_points_nm):
+        for index, (region, center) in enumerate(zip(regions, centers)):
+            raw_angle = np.deg2rad(-float(angles[index]))
+            raw_rotation = np.asarray(
+                [[np.cos(raw_angle), -np.sin(raw_angle)], [np.sin(raw_angle), np.cos(raw_angle)]],
+                dtype=float,
+            )
+            shift_nm = np.asarray(shifts[index], dtype=float) * pixel_nm
+            provisional = (region - center) @ raw_rotation.T - shift_nm
+            correction, correction_offset, _contrast_score = (
+                _refine_pose_by_alignment_site_contrast(
+                    provisional,
+                    np.asarray(template_points_nm, dtype=float),
+                    site_radius_nm=sparse_site_radius_nm,
+                    minimum_site_localizations=sparse_min_site_localizations,
+                )
+            )
+            corrected = provisional @ correction.T + correction_offset
+            combined_rotation = correction @ raw_rotation
+            corrected_shift_nm = shift_nm @ correction.T - correction_offset
+            if refinement_grid_points_nm is not None and len(refinement_grid_points_nm):
+                lattice_correction, lattice_offset, _lattice_score = (
+                    _refine_pose_by_full_lattice(
+                        corrected,
+                        np.asarray(refinement_grid_points_nm, dtype=float),
+                        np.asarray(template_points_nm, dtype=float),
+                        site_radius_nm=sparse_site_radius_nm,
+                        minimum_site_localizations=sparse_min_site_localizations,
+                    )
+                )
+                corrected = corrected @ lattice_correction.T + lattice_offset
+                combined_rotation = lattice_correction @ combined_rotation
+                corrected_shift_nm = (
+                    corrected_shift_nm @ lattice_correction.T - lattice_offset
+                )
+                centroid_correction, centroid_offset, _site_count, _site_rms = (
+                    _refine_pose_from_lattice_centroids(
+                        corrected,
+                        np.asarray(refinement_grid_points_nm, dtype=float),
+                        site_radius_nm=sparse_site_radius_nm,
+                        minimum_site_localizations=sparse_min_site_localizations,
+                    )
+                )
+                corrected = corrected @ centroid_correction.T + centroid_offset
+                combined_rotation = centroid_correction @ combined_rotation
+                corrected_shift_nm = (
+                    corrected_shift_nm @ centroid_correction.T - centroid_offset
+                )
+            angles[index] = -float(
+                np.rad2deg(
+                    np.arctan2(combined_rotation[1, 0], combined_rotation[0, 0])
+                )
+            )
+            shifts[index] = corrected_shift_nm / pixel_nm
+            corrected_image = _render_candidate_image(
+                corrected,
+                np.zeros(2, dtype=float),
+                canvas_side_nm,
+                pixel_nm,
+                max(pixel_nm, 1.0),
+            )
+            aligned_images[index] = corrected_image
+            if uses_custom_template:
+                correlations[index] = float(
+                    np.clip(np.dot(corrected_image.ravel(), template.ravel()), -1.0, 1.0)
+                )
+            else:
+                denominator = max(
+                    float(np.linalg.norm(corrected_image) * np.linalg.norm(template)),
+                    1e-12,
+                )
+                correlations[index] = float(
+                    np.clip(
+                        np.dot(corrected_image.ravel(), template.ravel()) / denominator,
+                        -1.0,
+                        1.0,
+                    )
                 )
 
     if aligned_image_output is not None:
@@ -3407,6 +4093,7 @@ def identify_origami_regions(
                 sparse_pose_site_count=min_supported_sites,
                 sparse_site_radius_nm=site_mask_radius_nm,
                 sparse_min_site_localizations=min_site_localizations,
+                refinement_grid_points_nm=full_grid,
                 iterations=alignment_iterations,
                 template_points_nm=grid,
                 template_image=alignment_template_image,
