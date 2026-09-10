@@ -2315,6 +2315,68 @@ def _render_candidate_image(
     return image / norm if norm > 0 else image
 
 
+def alignment_corner_counts(regions, template_points_nm, radius_nm):
+    """Count support at template marks nearest each bounding-box corner."""
+    sites = np.asarray(template_points_nm, dtype=float).reshape(-1, 2)
+    if not len(sites):
+        return np.empty((len(regions), 0), dtype=int)
+    low, high = sites.min(axis=0), sites.max(axis=0)
+    corners = np.asarray([low, [high[0], low[1]], high, [low[0], high[1]]])
+    indices = np.unique(cKDTree(sites).query(corners)[1])
+    required = sites[indices]
+    counts = np.zeros((len(regions), len(required)), dtype=int)
+    for index, points in enumerate(regions):
+        if len(points):
+            counts[index] = cKDTree(points).query_ball_point(required, radius_nm, return_length=True)
+    return counts
+
+
+def alignment_dark_boundary(reference, canvas_side_nm):
+    """Pixel-edge rectangle used by the correlation's exterior mask, in nm."""
+    reference = np.asarray(reference, dtype=float)
+    if reference.ndim != 2 or not reference.size or np.ptp(reference) <= 0:
+        return np.empty((0, 2))
+    signal = reference - reference.min()
+    y, x = np.nonzero(signal >= 0.35 * signal.max())
+    height, width = reference.shape
+    x0, x1 = (np.asarray([x.min(), x.max() + 1]) / width - 0.5) * canvas_side_nm
+    y0, y1 = (np.asarray([y.min(), y.max() + 1]) / height - 0.5) * canvas_side_nm
+    return np.asarray([[x0, y0], [x1, y0], [x1, y1], [x0, y1], [x0, y0]])
+
+
+def _boundary_template_correlation(image: np.ndarray, template: np.ndarray) -> float:
+    """Match bright marks and exterior darkness, ignoring unmarked interior.
+
+    The outermost bright pixels define a rectangle in template coordinates.
+    Only bright marks and pixels outside that rectangle enter the cosine score;
+    exterior reference values are zero, so exterior signal increases the
+    denominator without increasing agreement. The 35% contrast cutoff matches
+    template component detection. Undo rendering's global centering/scaling
+    before masking so ignored interior signal cannot affect normalization.
+    """
+    reference = np.asarray(template, dtype=float)
+    candidate = np.asarray(image, dtype=float)
+    if reference.shape != candidate.shape:
+        raise ValueError("Alignment image and template shapes must match.")
+    reference = reference - np.min(reference)
+    candidate = candidate - np.min(candidate)
+    peak = float(np.max(reference))
+    if peak <= 0.0:
+        return 0.0
+    bright = reference >= 0.35 * peak
+    coordinates = np.nonzero(bright)
+    bounds = tuple(slice(int(axis.min()), int(axis.max()) + 1) for axis in coordinates)
+    exterior = np.ones(reference.shape, dtype=bool)
+    exterior[bounds] = False
+    expected = reference[bright]
+    observed = candidate[bright]
+    observed_norm = np.sqrt(np.sum(observed**2) + np.sum(candidate[exterior]**2))
+    denominator = float(np.linalg.norm(expected) * observed_norm)
+    if denominator <= 0.0:
+        return 0.0
+    return float(np.clip(np.dot(observed, expected) / denominator, 0.0, 1.0))
+
+
 def prepare_custom_alignment_template(
     template_image: np.ndarray,
     *,
@@ -3122,8 +3184,7 @@ def _score_complete_image_pose(
         cval=0.0,
         prefilter=False,
     )
-    denominator = max(float(np.linalg.norm(aligned) * np.linalg.norm(template)), 1e-12)
-    score = float(np.clip(np.dot(aligned.ravel(), template.ravel()) / denominator, -1.0, 1.0))
+    score = _boundary_template_correlation(aligned, template)
     return score, float(shift_x), float(shift_y), aligned
 
 
@@ -3758,7 +3819,7 @@ def _align_regions_by_image_correlation(
                             pixel_nm,
                             max(pixel_nm, 1.0),
                         )
-                        score = float(np.clip(np.dot(candidate_image.ravel(), template.ravel()), -1.0, 1.0))
+                        score = _boundary_template_correlation(candidate_image, template)
                     else:
                         candidate_image = ndimage_shift(
                             rotated_image,
@@ -3768,17 +3829,7 @@ def _align_regions_by_image_correlation(
                             cval=0.0,
                             prefilter=False,
                         )
-                        denominator = max(
-                            float(np.linalg.norm(candidate_image) * np.linalg.norm(template)),
-                            1e-12,
-                        )
-                        score = float(
-                            np.clip(
-                                np.dot(candidate_image.ravel(), template.ravel()) / denominator,
-                                -1.0,
-                                1.0,
-                            )
-                        )
+                        score = _boundary_template_correlation(candidate_image, template)
                         pose_quality = score
                     # Once a sparse alignment template is available, choose
                     # the pose exclusively from its site-consensus geometry.
@@ -3877,22 +3928,7 @@ def _align_regions_by_image_correlation(
                 max(pixel_nm, 1.0),
             )
             aligned_images[index] = corrected_image
-            if uses_custom_template:
-                correlations[index] = float(
-                    np.clip(np.dot(corrected_image.ravel(), template.ravel()), -1.0, 1.0)
-                )
-            else:
-                denominator = max(
-                    float(np.linalg.norm(corrected_image) * np.linalg.norm(template)),
-                    1e-12,
-                )
-                correlations[index] = float(
-                    np.clip(
-                        np.dot(corrected_image.ravel(), template.ravel()) / denominator,
-                        -1.0,
-                        1.0,
-                    )
-                )
+            correlations[index] = _boundary_template_correlation(corrected_image, template)
 
     if aligned_image_output is not None:
         aligned_image_output.extend(image.copy() for image in aligned_images)
@@ -4280,6 +4316,9 @@ def identify_origami_regions(
         & (supported_column_counts >= min_supported_columns)
         & (site_spacing_max_errors <= max_site_spacing_error_nm)
     )
+    if alignment_template_image is not None:
+        corner_counts = alignment_corner_counts(aligned_regions, grid, site_mask_radius_nm)
+        accepted_mask &= np.all(corner_counts >= min_site_localizations, axis=1)
     bounds = np.asarray(
         [
             [

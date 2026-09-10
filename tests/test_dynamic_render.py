@@ -2021,6 +2021,7 @@ class DynamicRenderTests(unittest.TestCase):
             ]),
             accepted_mask=np.asarray([True, False]),
             template_points_nm=grid,
+            aligned_regions=[np.repeat(grid, 5, axis=0), np.repeat(grid, 5, axis=0)],
             rectangle_corners_nm=np.asarray(
                 [
                     accepted_corners,

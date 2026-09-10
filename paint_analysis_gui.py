@@ -38,6 +38,8 @@ from matplotlib.widgets import RectangleSelector
 from origami_analysis import (
     OrigamiAnalysisResult,
     OrigamiPickResult,
+    alignment_corner_counts,
+    alignment_dark_boundary,
     align_picked_origamis,
     bidirectional_template_classification_scores,
     classify_template_candidates,
@@ -1027,6 +1029,32 @@ def logical_bit_model_from_metadata(metadata: dict[str, Any]) -> dict[str, Any] 
 # Compatibility name retained for callers and older tests that used the first
 # fixed-stroke implementation.
 logical_stroke_model_from_metadata = logical_bit_model_from_metadata
+
+
+def required_corner_mask(picks, params, index=None):
+    if params.get("alignment_template_image") is None:
+        return np.ones(len(picks.point_counts) if index is None else 1, dtype=bool)
+    regions = picks.aligned_regions if index is None else [picks.aligned_regions[index]]
+    counts = alignment_corner_counts(
+        regions, alignment_template_overlay_points(picks.template_points_nm, params),
+        float(params.get("site_mask_radius_nm", DEFAULT_ORIGAMI_SITE_MASK_RADIUS_NM)),
+    )
+    return np.all(counts >= int(params.get("min_site_localizations", DEFAULT_ORIGAMI_MIN_SITE_LOCALIZATIONS)), axis=1)
+
+
+def draw_alignment_dark_boundary(axis, picks, transform=None):
+    if picks is None:
+        return []
+    boundary = alignment_dark_boundary(
+        getattr(picks, "alignment_reference_image", np.empty((0, 0))),
+        getattr(picks, "alignment_canvas_side_nm", 0.0),
+    )
+    if len(boundary):
+        if transform is not None:
+            boundary = transform(boundary)
+        return axis.plot(boundary[:, 0], boundary[:, 1], color="#22d3ee", linestyle="--",
+                  linewidth=1.0, zorder=6.4, label="Exterior darkness boundary")
+    return []
 
 
 def origami_candidate_failure_reasons(
@@ -4098,7 +4126,7 @@ class PaintAnalysisApp(tk.Tk):
         WidgetTooltip(fit_correlation_gate, "Shared with Step 4. Disable to keep correlation as a QC measurement only.")
         ttk.Label(
             template_group,
-            text="Fits and locks each candidate's position and rotation. Correlation and point limits apply now. Failed fits appear with dashed outlines when text statistics is enabled. Site coverage and spacing limits apply during Step 4 acceptance. Shared controls update in both steps.",
+            text="Fits and locks each candidate's position and rotation. Correlation, point limits, and required corner coverage apply now. Each outer corner mark requires Pose min locs / site within Pose site radius. Failed fits appear with dashed outlines when text statistics is enabled. Site coverage and spacing limits apply during Step 4 acceptance. Shared controls update in both steps.",
             wraplength=245,
         ).grid(row=20, column=0, columnspan=2, sticky="w", pady=(5, 0))
         self.origami_run_alignment_button = ttk.Button(
@@ -7272,7 +7300,7 @@ class PaintAnalysisApp(tk.Tk):
         picks: OrigamiPickResult,
         params: dict[str, Any],
     ) -> OrigamiPickResult:
-        """Gate fitted poses using measured counts and correlation, before site detection."""
+        """Gate fitted poses on counts, correlation, and corner support before site detection."""
         counts = np.asarray(picks.point_counts, dtype=int)
         accepted = (
             (counts >= int(params.get("min_candidate_points", 0)))
@@ -7283,6 +7311,7 @@ class PaintAnalysisApp(tk.Tk):
             accepted &= np.isfinite(correlation) & (
                 correlation >= float(params.get("min_rectangle_confidence", 0.0))
             )
+        accepted &= required_corner_mask(picks, params)
         return replace(picks, accepted_mask=accepted)
 
     def _remeasure_origami_sites(
@@ -7514,6 +7543,7 @@ class PaintAnalysisApp(tk.Tk):
                     <= float(params.get("max_site_spacing_error_nm", float("inf")))
                 )
             )
+        accepted &= required_corner_mask(picks, params)
         return replace(picks, accepted_mask=np.asarray(accepted, dtype=bool))
 
     def _identify_origami_worker(
@@ -8081,6 +8111,8 @@ class PaintAnalysisApp(tk.Tk):
                 spacing_error_nm=float(attempted_picks.site_spacing_max_error_nm[candidate_index]),
                 params=attempted_params,
             )
+            if not required_corner_mask(attempted_picks, attempted_params, candidate_index)[0]:
+                failure_reasons.append("required corner support missing")
             alignment_mask = np.asarray(
                 attempted_params.get("_alignment_accepted_mask", ()), dtype=bool
             )
@@ -11285,6 +11317,7 @@ class PaintAnalysisApp(tk.Tk):
                         theoretical_grid_in_footprint(displayed_overlay_grid, corners)
                     )
                 if show_alignment and len(alignment_grid):
+                    self.origami_footprint_artists.extend(draw_alignment_dark_boundary(axis, picks, lambda points: theoretical_grid_in_footprint(points, picks.rectangle_corners_nm[region_index])))
                     alignment_positions.append(
                         theoretical_grid_in_footprint(alignment_grid, corners)
                     )
@@ -12902,6 +12935,7 @@ class PaintAnalysisApp(tk.Tk):
                     )
                     theoretical_colors.extend([color] * len(displayed_overlay_grid))
                 if show_alignment and len(alignment_grid):
+                    self.origami_footprint_artists.extend(draw_alignment_dark_boundary(axis, picks, lambda points: theoretical_grid_in_footprint(points, picks.rectangle_corners_nm[region_index])))
                     alignment_positions.append(
                         theoretical_grid_in_footprint(
                             alignment_grid,
@@ -13134,6 +13168,8 @@ class PaintAnalysisApp(tk.Tk):
                         spacing_error_nm=float(picks.site_spacing_max_error_nm[region_index]),
                         params=params,
                     )
+                    if not required_corner_mask(picks, params, region_index)[0]:
+                        failure_reasons.append("required corner support missing")
                     dispositions = params.get("classification_dispositions", ())
                     disposition = (
                         str(dispositions[region_index])
@@ -14084,12 +14120,11 @@ class PaintAnalysisApp(tk.Tk):
                 color = cmap(norm(on / measured)) if measured else "#9ca3af"
                 axis.add_collection(PolyCollection(contours, facecolors=[color],
                                                    edgecolors="#374151", linewidths=0.8))
-                if self.origami_show_text_statistics.get():
-                    cells = np.asarray(cells_by_id[group_id], dtype=int)
-                    center = np.mean(grid[cells], axis=0)
-                    label = f"{group_id}\n{100 * on / measured:.0f}% ({on}/{measured})" if measured else f"{group_id}\nNo data"
-                    axis.text(*center, label, ha="center", va="center", fontsize=8,
-                              color="black", bbox=dict(facecolor="white", alpha=0.75, edgecolor="none"))
+                cells = np.asarray(cells_by_id[group_id], dtype=int)
+                center = np.mean(grid[cells], axis=0)
+                label = f"{group_id}\n{100 * on / measured:.0f}% ({on}/{measured})" if measured else f"{group_id}\nNo data"
+                axis.text(*center, label, ha="center", va="center", fontsize=8,
+                          color="black", bbox=dict(facecolor="white", alpha=0.75, edgecolor="none"))
             axis.set_xlim(float(grid[:, 0].min()) - radius * 2, float(grid[:, 0].max()) + radius * 2)
             axis.set_ylim(float(grid[:, 1].min()) - radius * 2, float(grid[:, 1].max()) + radius * 2)
             axis.set_aspect("equal")
@@ -14865,6 +14900,7 @@ class PaintAnalysisApp(tk.Tk):
         if model is not None:
             params["digital_pixel_model"] = model
         if enabled("alignment_overlay"):
+            draw_alignment_dark_boundary(axis, active[0] if active is not None else None)
             sites = alignment_template_overlay_points(np.empty((0, 2)), params)
             if len(sites):
                 axis.scatter(sites[:, 0], sites[:, 1], s=35, marker="s", facecolors="none", edgecolors="#22d3ee", linewidths=0.8, zorder=6.1)
@@ -14924,6 +14960,7 @@ class PaintAnalysisApp(tk.Tk):
         if model is not None:
             params["digital_pixel_model"] = model
         if enabled("origami_show_alignment_overlay"):
+            draw_alignment_dark_boundary(axis, active[0] if active is not None else None, transform)
             sites = alignment_template_overlay_points(np.empty((0, 2)), params)
             if len(sites):
                 sites = transform(sites)

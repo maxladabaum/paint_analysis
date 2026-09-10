@@ -31,7 +31,7 @@ class SpatialHeatmapTests(unittest.TestCase):
         self.assertEqual(digital_group_presence_counts(self.grid, self.params, [False]*3),
                          {'a': [0, 0], 'b': [0, 0]})
 
-    def test_spatial_plot_geometry_color_and_text_control(self):
+    def test_spatial_plot_geometry_color_and_always_visible_values(self):
         app = SimpleNamespace(
             origami_template_result_view=Mock(get=lambda: 'full_align'),
             origami_multi_template_results={'full_align': {
@@ -50,7 +50,8 @@ class SpatialHeatmapTests(unittest.TestCase):
         self.assertAlmostEqual(centers[1] - centers[0], 20.1, delta=0.1)
         app.origami_show_text_statistics.get = lambda: False
         PaintAnalysisApp._plot_digital_pixel_spatial_heatmap(app)
-        self.assertEqual(len(app.origami_figure.axes[0].texts), 0)
+        labels = [text.get_text() for text in app.origami_figure.axes[0].texts]
+        self.assertEqual(labels, ['a\n50% (1/2)', 'b\n0% (0/1)'])
 
         app.origami_multi_template_results['empty'] = {
             'params': self.params, 'picks': SimpleNamespace(accepted_mask=np.zeros(3, dtype=bool))}
@@ -58,6 +59,8 @@ class SpatialHeatmapTests(unittest.TestCase):
         PaintAnalysisApp._plot_digital_pixel_spatial_heatmap(app)
         self.assertEqual(len(app.origami_figure.axes), 3)  # Two cohorts and shared color scale.
         self.assertIn('0 assigned', app.origami_figure.axes[1].get_title())
+        self.assertTrue(all('No data' in text.get_text()
+                            for text in app.origami_figure.axes[1].texts))
 
     def test_full_align_aggregate_is_not_copied_to_every_site(self):
         params = {

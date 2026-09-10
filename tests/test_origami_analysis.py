@@ -1781,12 +1781,7 @@ class OrigamiAnalysisTests(unittest.TestCase):
         self.assertEqual(picks.site_centroids_nm.shape, (1, 12, 2))
         candidate = picks.alignment_candidate_images[0]
         template = picks.alignment_reference_image
-        displayed_score = float(
-            np.sum(
-                (candidate / np.linalg.norm(candidate))
-                * (template / np.linalg.norm(template))
-            )
-        )
+        displayed_score = origami_analysis._boundary_template_correlation(candidate, template)
         self.assertAlmostEqual(displayed_score, float(picks.rectangle_confidence[0]), places=6)
         self.assertEqual(progress_updates[-1][0], 100.0)
         self.assertTrue(any("Rendering alignment thumbnails" in message for _percent, message in progress_updates))
@@ -1816,7 +1811,7 @@ class OrigamiAnalysisTests(unittest.TestCase):
         self.assertLessEqual(len(residuals), 14)
         self.assertLess(float(np.max(residuals)), 7.5)
 
-    def test_image_classifier_rejects_non_origami_candidates(self) -> None:
+    def test_boundary_correlation_ranks_grid_above_non_origami_candidates(self) -> None:
         rng = np.random.default_rng(72)
         grid = ideal_grid_points(3, 4, 20.0, 20.0)
         regions = []
@@ -1837,15 +1832,10 @@ class OrigamiAnalysisTests(unittest.TestCase):
         )
         self.assertEqual(len(aligned), 15)
         self.assertTrue(np.all(correlations[:12] > 0.55))
-        self.assertTrue(np.all(correlations[12:] < 0.55))
+        self.assertGreater(float(np.min(correlations[:12])), float(np.max(correlations[12:])))
         self.assertGreaterEqual(pixel_nm, np.hypot(100.0, 80.0) / 128.0)
         self.assertEqual(len(scoring_images), len(regions))
-        displayed_score = float(
-            np.sum(
-                (scoring_images[0] / np.linalg.norm(scoring_images[0]))
-                * (_reference / np.linalg.norm(_reference))
-            )
-        )
+        displayed_score = origami_analysis._boundary_template_correlation(scoring_images[0], _reference)
         self.assertAlmostEqual(displayed_score, float(correlations[0]), places=8)
 
     def test_partial_grid_uses_best_complete_pose_instead_of_strongest_polar_peak(self) -> None:
