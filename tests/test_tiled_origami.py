@@ -139,6 +139,17 @@ class TiledOrigamiTests(unittest.TestCase):
 
         self.assertEqual(len(tiles), 100)
 
+    def test_partial_edge_tiles_cover_image_once_and_preserve_validation_roi(self) -> None:
+        tiles = fully_fitting_roi_tiles(23.0, 17.0, (3.0, 13.0, 2.0, 8.0), include_partial_edges=True)
+        self.assertIn((3.0, 13.0, 2.0, 8.0), tiles)
+        self.assertIn((0.0, 3.0, 0.0, 2.0), tiles)
+        self.assertIn((13.0, 23.0, 14.0, 17.0), tiles)
+        self.assertAlmostEqual(sum((x1-x0)*(y1-y0) for x0,x1,y0,y1 in tiles), 23*17)
+        for x in np.arange(0, 23, 0.5):
+            for y in np.arange(0, 17, 0.5):
+                self.assertEqual(sum(x0 <= x < x1 and y0 <= y < y1 for x0,x1,y0,y1 in tiles), 1)
+        self.assertEqual(fully_fitting_roi_tiles(4, 3, (0, 10, 0, 10), include_partial_edges=True), [(0, 4, 0, 3)])
+
     def test_rejects_zero_area_validation_roi(self) -> None:
         with self.assertRaisesRegex(ValueError, "positive width and height"):
             fully_fitting_roi_tiles(100.0, 100.0, (10.0, 10.0, 20.0, 40.0))
@@ -248,8 +259,8 @@ class TiledOrigamiTests(unittest.TestCase):
         app._origami_identification_worker_progress = mock.Mock()
         source = pd.DataFrame(
             {
-                "x": [2.0, 3.0, 12.0, 13.0],
-                "y": [2.0, 3.0, 2.0, 3.0],
+                "x": [2.0, 3.0, 12.0, 13.0, 21.0, 25.0],
+                "y": [2.0, 3.0, 2.0, 3.0, 13.0, 15.0],
             }
         )
         tiles = [(0.0, 10.0, 0.0, 10.0), (10.0, 20.0, 0.0, 10.0)]
@@ -345,7 +356,11 @@ class TiledOrigamiTests(unittest.TestCase):
         self.assertIs(payload["picks"], combined_picks)
         self.assertIs(payload["result"], analysis_result)
         np.testing.assert_allclose(payload["points_nm"], source[["x", "y"]].to_numpy())
-        self.assertEqual(len(payload["locs"]), 4)
+        self.assertEqual(len(payload["locs"]), 6)
+        # Edge points remain in the overview without entering any tile's classifier.
+        np.testing.assert_allclose(payload["points_nm"], source[["x", "y"]].to_numpy())
+        self.assertEqual(len(payload["locs"]), 6)
+
 
     def test_tiled_completion_replaces_validation_roi_plot_caches(self) -> None:
         def variable(value: object) -> SimpleNamespace:
@@ -406,9 +421,9 @@ class TiledOrigamiTests(unittest.TestCase):
         app = PaintAnalysisApp.__new__(PaintAnalysisApp)
         app._origami_identification_worker_progress = mock.Mock()
         source = pd.DataFrame(
-            {"x": [2.0, 3.0, 12.0, 13.0], "y": [2.0, 3.0, 2.0, 3.0]}
+            {"x": [2.0, 3.0, 12.0, 13.0, 21.0, 25.0], "y": [2.0, 3.0, 2.0, 3.0, 13.0, 15.0]}
         )
-        tiles = [(0.0, 10.0, 0.0, 10.0), (10.0, 20.0, 0.0, 10.0)]
+        tiles = [(0.0, 4.0, 0.0, 10.0), (4.0, 14.0, 0.0, 10.0)]
         templates = [{"name": "square"}, {"name": "full"}]
         validation_cache = object()
         identification_params = {
@@ -479,7 +494,7 @@ class TiledOrigamiTests(unittest.TestCase):
         np.testing.assert_array_equal(payload["counts"], [4, 6])
         self.assertEqual(payload["unclassified_count"], 2)
         self.assertEqual(payload["accepted_count"], 10)
-        self.assertEqual(len(payload["points_nm"]), 4)
+        self.assertEqual(len(payload["points_nm"]), 6)
         self.assertIs(payload["templates"][0]["picks"], combined_square)
         self.assertIs(payload["templates"][1]["picks"], combined_full)
         self.assertEqual(
@@ -516,6 +531,10 @@ class TiledOrigamiTests(unittest.TestCase):
             self.assertFalse(any(key.startswith("_pre") for key in tile_params))
             self.assertIn("_candidate_core_bounds_nm", tile_params)
         self.assertEqual(concatenate.call_count, 2)
+        # Edge points remain in the overview without entering any tile's classifier.
+        np.testing.assert_allclose(payload["points_nm"], source[["x", "y"]].to_numpy())
+        self.assertEqual(len(payload["locs"]), 6)
+
 
     def test_multi_template_tiled_worker_returns_unclassified_only_results(self) -> None:
         app = PaintAnalysisApp.__new__(PaintAnalysisApp)

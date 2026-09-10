@@ -1275,8 +1275,8 @@ def classify_template_candidates(
 ) -> TemplateClassificationResult:
     """Match duplicate detections across templates and select one accepted fit per object."""
     template_count = len(candidate_centers_by_template)
-    if template_count < 2 or len(accepted_masks) != template_count or len(correlations) != template_count:
-        raise ValueError("Multi-template classification requires at least two equally described templates.")
+    if template_count < 1 or len(accepted_masks) != template_count or len(correlations) != template_count:
+        raise ValueError("Classification requires at least one equally described template.")
     if match_distance_nm <= 0:
         raise ValueError("Template candidate match distance must be positive.")
     if deduplication_distance_nm is not None and deduplication_distance_nm <= 0:
@@ -1448,12 +1448,20 @@ def classify_template_candidates(
     )
 
 
-def ideal_grid_points(rows: int, columns: int, spacing_x_nm: float, spacing_y_nm: float) -> np.ndarray:
+def ideal_grid_points(rows: int, columns: int, spacing_x_nm: float, spacing_y_nm: float, column_offsets_nm: Sequence[float] | None = None) -> np.ndarray:
     if rows < 1 or columns < 1:
         raise ValueError("Grid rows and columns must both be at least 1.")
     if spacing_x_nm <= 0 or spacing_y_nm <= 0:
         raise ValueError("Grid spacing must be greater than zero.")
     x = (np.arange(columns, dtype=float) - (columns - 1) / 2.0) * spacing_x_nm
+    if column_offsets_nm is not None and len(column_offsets_nm):
+        offsets = np.asarray(column_offsets_nm, dtype=float)
+        if offsets.shape != (columns,) or not np.all(np.isfinite(offsets)):
+            raise ValueError("Column offsets must contain one finite value per column.")
+        x += offsets
+        if np.any(np.diff(x) <= 0):
+            raise ValueError("Column positions must be strictly increasing.")
+        x -= (x[0] + x[-1]) / 2.0
     y = (np.arange(rows, dtype=float) - (rows - 1) / 2.0) * spacing_y_nm
     xx, yy = np.meshgrid(x, y)
     return np.column_stack([xx.ravel(), yy.ravel()])
@@ -3946,6 +3954,7 @@ def identify_origami_regions(
     alignment_pixel_nm: float = 1.0,
     alignment_max_patch_pixels: int = 128,
     alignment_iterations: int = 3,
+    column_offsets_nm: Sequence[float] | None = None,
     alignment_template_image: np.ndarray | None = None,
     template_pixel_size_x_nm: float | None = None,
     template_pixel_size_y_nm: float | None = None,
@@ -4061,7 +4070,9 @@ def identify_origami_regions(
         rectangle_height_nm = max(spacing_y_nm, (rows - 1) * spacing_y_nm) + 2.0 * rectangle_margin_nm
         active_width_nm = max(spacing_x_nm, (columns - 1) * spacing_x_nm)
         active_height_nm = max(spacing_y_nm, (rows - 1) * spacing_y_nm)
-        full_grid = ideal_grid_points(rows, columns, spacing_x_nm, spacing_y_nm)
+        full_grid = ideal_grid_points(rows, columns, spacing_x_nm, spacing_y_nm, column_offsets_nm)
+        active_width_nm = max(spacing_x_nm, float(np.ptp(full_grid[:, 0])))
+        rectangle_width_nm = active_width_nm + 2.0 * rectangle_margin_nm
         if alignment_template_image is not None:
             grid = custom_template_site_points(
                 alignment_template_image,
