@@ -31,7 +31,7 @@ def test_step_two_gate_rejects_missing_corner_despite_high_correlation():
     complete = np.repeat(sites, 5, axis=0)
     picks = Picks(np.array([20, 15]), np.array([.99, .99]), np.ones(2, bool),
                   [complete, complete[5:]], sites)
-    params = dict(alignment_template_image=np.ones((5, 5)),
+    params = dict(require_corner_support=True, alignment_template_image=np.ones((5, 5)),
                   min_site_localizations=5, site_mask_radius_nm=2., min_rectangle_confidence=.3)
     result = PaintAnalysisApp._apply_origami_alignment_filters(picks, params)
     assert result.accepted_mask.tolist() == [True, False]

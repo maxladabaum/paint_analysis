@@ -40,6 +40,7 @@ from origami_analysis import (
     OrigamiAnalysisResult,
     OrigamiPickResult,
     alignment_corner_counts,
+    fitted_footprint_overlap_fractions,
     alignment_corner_sites,
     alignment_dark_boundary,
     align_picked_origamis,
@@ -77,7 +78,7 @@ from tkinter import filedialog, messagebox, ttk
 APP_TITLE = "DNA PAINT Picasso-Style ROI Analyzer"
 DEFAULT_DATA_DIR = Path.home() / "Desktop" / "LBNL_PAINT"
 DEFAULT_PIXEL_SIZE_NM = 130.0
-DEFAULT_ORIGAMI_PICK_BIN_NM = 10.0
+DEFAULT_ORIGAMI_PICK_BIN_NM = 5.0
 DEFAULT_ORIGAMI_MIN_DENSITY = 0.80
 DEFAULT_ORIGAMI_MIN_POINTS = 200
 DEFAULT_ORIGAMI_MAX_POINTS = 3000
@@ -113,6 +114,7 @@ ORIGAMI_ALIGNMENT_CACHE_KEYS = (
     "min_rectangle_confidence",
     "use_correlation_gate",
     "require_corner_support",
+    "max_footprint_overlap_fraction",
     "alignment_pixel_nm",
     "alignment_max_patch_pixels",
     "alignment_iterations",
@@ -836,9 +838,9 @@ def load_custom_template_image(path: str | Path) -> np.ndarray:
     else:
         raw = np.asarray(matplotlib_image.imread(template_path))
     image = np.asarray(raw, dtype=float)
+    metadata = load_custom_template_metadata(template_path)
     if raw.ndim == 3 and raw.shape[2] in {3, 4}:
         rgb = np.asarray(raw[..., :3], dtype=float)
-        metadata = load_custom_template_metadata(template_path)
         if metadata is not None and isinstance(metadata.get("logical_model"), dict):
             # Generator group colors are annotations, not intensity weights.
             # Every exported group color has a full-strength channel, so max
@@ -855,7 +857,12 @@ def load_custom_template_image(path: str | Path) -> np.ndarray:
     if float(np.max(image)) <= float(np.min(image)):
         raise ValueError("Custom templates must contain both dark background and bright signal.")
     # Raster rows run downward; alignment coordinates use positive y upward.
-    return np.flipud(np.asarray(image, dtype=float)).copy()
+    image = np.flipud(image)
+    # Template columns c1..c12 correspond to PAINT R1 replacements 12..1.
+    # Reverse the column order (x -> -x) to use the experimental convention.
+    if metadata is not None:
+        image = np.fliplr(image)
+    return np.asarray(image, dtype=float).copy()
 
 
 def custom_template_display_name(
@@ -937,6 +944,10 @@ def load_custom_template_metadata(path: str | Path) -> dict[str, Any] | None:
             result = dict(metadata)
             result["pixel_size_x_nm"] = pixel_x_nm
             result["pixel_size_y_nm"] = pixel_y_nm
+            raw_offsets = metadata.get("column_offsets_nm", metadata.get("logical_model", {}).get("column_offsets_nm", ()))
+            # The nested logical model stays in export coordinates until its
+            # parser runs; the top-level grid geometry is ready for analysis.
+            result["column_offsets_nm"] = tuple(-float(value) for value in reversed(raw_offsets))
             return result
     return None
 
@@ -977,9 +988,12 @@ def logical_bit_model_from_metadata(metadata: dict[str, Any]) -> dict[str, Any] 
             if not (0 <= source_row < rows and 0 <= column < columns):
                 raise ValueError(f"{owner} contains a site outside the lattice.")
             # Generator rows are top-to-bottom. Alignment coordinates and the
-            # full physical lattice use y-up ordering, so reverse the row here.
+            # full physical lattice use y-up ordering. Reverse columns too
+            # to map template c1..c12 to PAINT R1 replacements 12..1,
+            # matching the column reversal applied to generator rasters.
             physical_row = rows - 1 - source_row
-            cells.add(physical_row * columns + column)
+            physical_column = columns - 1 - column
+            cells.add(physical_row * columns + physical_column)
         if not cells:
             raise ValueError(f"{owner} contains no physical sites.")
         return tuple(sorted(cells))
@@ -1020,7 +1034,7 @@ def logical_bit_model_from_metadata(metadata: dict[str, Any]) -> dict[str, Any] 
     return {
         "format": "paint-analysis-logical-bits-v1",
         "physical_shape": (rows, columns),
-        "column_offsets_nm": tuple(float(value) for value in model.get("column_offsets_nm", ())),
+        "column_offsets_nm": tuple(-float(value) for value in reversed(offsets)),
         "bit_ids": tuple(bit_ids),
         "bit_cells": tuple(bit_cells),
         "bit_physical_cells": tuple(bit_physical_cells),
@@ -1113,7 +1127,7 @@ def draw_unclassified_theoretical_overlay(axis, details, maximum_candidates=500)
 
 
 def required_corner_mask(picks, params, index=None):
-    if not bool(params.get("require_corner_support", True)) or params.get("alignment_template_image") is None:
+    if not bool(params.get("require_corner_support", False)) or params.get("alignment_template_image") is None:
         return np.ones(len(picks.point_counts) if index is None else 1, dtype=bool)
     regions = picks.aligned_regions if index is None else [picks.aligned_regions[index]]
     counts = alignment_corner_counts(
@@ -1145,7 +1159,7 @@ def draw_corner_support_diagnostics(axis, picks, params, index, *, world_coordin
                                  linestyle="none", zorder=13))
         label = axis.annotate(
             f"C{number}: {count}/{minimum} {'PASS' if passed else 'FAIL'}"
-            + (" (gate off)" if not params.get("require_corner_support", True) else ""),
+            + (" (gate off)" if not params.get("require_corner_support", False) else ""),
             xy=position, xytext=(6, 7), textcoords="offset points", color=color,
             fontsize=7, clip_on=True, zorder=14,
             bbox={"facecolor": "#111827", "edgecolor": "none", "alpha": 0.8},
@@ -1223,6 +1237,32 @@ CLASSIFICATION_DIAGNOSTIC_GATES = (
 )
 
 
+def unclassified_template_attribution(attempts: list[tuple[float, int, int]]) -> tuple[tuple[float, int, int], str]:
+    """Select a diagnostic pose without inventing a preference on score ties."""
+    finite = [attempt for attempt in attempts if np.isfinite(attempt[0])]
+    if not finite:
+        return attempts[0], "no_match"
+    best_score = max(attempt[0] for attempt in finite)
+    best = [attempt for attempt in finite if attempt[0] == best_score]
+    status = "unique_best" if len({attempt[1] for attempt in best}) == 1 else "ambiguous"
+    return best[0], status
+
+
+def unclassified_attribution_status(detail: dict[str, Any]) -> str:
+    status = detail.get("template_attribution")
+    if status is not None:
+        return str(status)
+    # Correct diagnostics saved by the old last-template tie-breaker too.
+    reasons = " ".join(str(reason) for reason in detail.get("failure_reasons", ()))
+    if "no exact template match" in reasons or (
+        "classification_score" in detail and not np.isfinite(float(detail["classification_score"]))
+    ):
+        return "no_match"
+    if "multiple templates match" in reasons:
+        return "ambiguous"
+    return "unique_best"
+
+
 def classification_bias_diagnostics(
     template_names: list[str],
     assigned_counts: list[int] | np.ndarray,
@@ -1263,7 +1303,14 @@ def classification_bias_diagnostics(
         return 8
 
     described = 0
+    unmatched_count = ambiguous_count = 0
     for detail in unclassified_details:
+        attribution = unclassified_attribution_status(detail)
+        if attribution in {"no_match", "ambiguous"}:
+            described += 1
+            unmatched_count += attribution == "no_match"
+            ambiguous_count += attribution == "ambiguous"
+            continue
         template_index = name_to_index.get(str(detail.get("template_name", "")))
         if template_index is None:
             continue
@@ -1291,6 +1338,8 @@ def classification_bias_diagnostics(
         "assignment_rates": assignment_rates,
         "failure_counts": failure_counts,
         "unresolved_unclassified": max(0, int(unclassified_count) - described),
+        "unmatched_count": int(unmatched_count),
+        "ambiguous_count": int(ambiguous_count),
     }
 
 
@@ -3434,6 +3483,7 @@ class PaintAnalysisApp(tk.Tk):
         self.origami_zoom_render_running = False
         self.origami_zoom_render_pending = False
         self.origami_zoom_render_applying = False
+        self.origami_source_draw_signature: tuple[Any, ...] | None = None
         self.origami_source_density_artist: Any | None = None
         self.origami_source_colorbar: Any | None = None
         self.origami_plot_option = tk.StringVar(value="Individual origami gallery")
@@ -3522,6 +3572,7 @@ class PaintAnalysisApp(tk.Tk):
         self.origami_use_roi = tk.BooleanVar(value=True)
         self.origami_pick_bin_nm = tk.DoubleVar(value=DEFAULT_ORIGAMI_PICK_BIN_NM)
         self.origami_connect_distance_nm = tk.DoubleVar(value=DEFAULT_ORIGAMI_CONNECT_DISTANCE_NM)
+        self.origami_signal_gap_nm = tk.DoubleVar(value=DEFAULT_ORIGAMI_CONNECT_DISTANCE_NM)
         self.origami_min_density_contrast = tk.DoubleVar(value=DEFAULT_ORIGAMI_MIN_DENSITY)
         self.origami_min_points = tk.IntVar(value=DEFAULT_ORIGAMI_MIN_POINTS)
         self.origami_max_points = tk.IntVar(value=DEFAULT_ORIGAMI_MAX_POINTS)
@@ -3534,7 +3585,7 @@ class PaintAnalysisApp(tk.Tk):
         self.origami_custom_templates: list[dict[str, Any]] = []
         self.origami_shared_alignment_template: dict[str, Any] | None = None
         self.origami_shared_alignment_template_name = tk.StringVar(
-            value="No alignment template loaded"
+            value="Density detection · no shared template loaded"
         )
         self.origami_digital_pixel_model: dict[str, Any] | None = None
         self.origami_digital_pixel_schema_name = tk.StringVar(
@@ -3556,7 +3607,7 @@ class PaintAnalysisApp(tk.Tk):
         self.origami_rectangle_margin_nm = tk.DoubleVar(value=20.0)
         self.origami_min_rectangle_confidence = tk.DoubleVar(value=DEFAULT_ORIGAMI_CORRELATION_THRESHOLD)
         self.origami_use_correlation_gate = tk.BooleanVar(value=DEFAULT_ORIGAMI_USE_CORRELATION_GATE)
-        self.origami_require_corner_support = tk.BooleanVar(value=True)
+        self.origami_require_corner_support = tk.BooleanVar(value=False)
         self.origami_min_cell_pattern_correlation = tk.DoubleVar(
             value=DEFAULT_ORIGAMI_MIN_CELL_PATTERN_CORRELATION
         )
@@ -3573,6 +3624,7 @@ class PaintAnalysisApp(tk.Tk):
         self.origami_min_supported_rows = tk.IntVar(value=2)
         self.origami_min_supported_columns = tk.IntVar(value=2)
         self.origami_max_site_spacing_error_nm = tk.DoubleVar(value=DEFAULT_ORIGAMI_MAX_SITE_SPACING_ERROR_NM)
+        self.origami_max_overlap_percent = tk.DoubleVar(value=0.0)
         self.origami_preview_pixel_nm = tk.DoubleVar(value=1.0)
         self.origami_alignment_max_pixels = tk.IntVar(value=DEFAULT_ORIGAMI_ALIGNMENT_MAX_PIXELS)
         self.origami_alignment_iterations = tk.IntVar(value=DEFAULT_ORIGAMI_ALIGNMENT_PASSES)
@@ -4256,39 +4308,86 @@ class PaintAnalysisApp(tk.Tk):
         identify_form.columnconfigure(0, weight=1)
 
         coarse_group = workflow_group(identify_form, 0, "1 · Coarse candidate detection")
-        setting_row(coarse_group, 0, "Pick bin (nm)", self.origami_pick_bin_nm, "Coarse density-map bin size in nanometres.")
-        setting_row(coarse_group, 1, "Minimum density", self.origami_min_density_contrast, "Normalized coarse-density threshold used to seed candidate regions.")
-        setting_row(
-            coarse_group,
-            2,
-            "Connect distance (nm)",
-            self.origami_connect_distance_nm,
-            "Gap used to recover points around supported bins. Custom templates also join bins across one configured site pitch so hollow shapes stay intact.",
-        )
+        detection_template_group = ttk.Frame(coarse_group)
+        detection_template_group.grid(row=0, column=0, columnspan=2, sticky="ew", pady=(0, 6))
+        detection_template_group.columnconfigure(0, weight=1)
+        ttk.Button(
+            detection_template_group,
+            text="Load Detection Template…",
+            command=self._load_origami_shared_alignment_template,
+        ).grid(row=0, column=0, sticky="ew", pady=(2, 2))
+        ttk.Button(
+            detection_template_group,
+            text="Clear Template · Use Density Detection",
+            command=self._clear_origami_shared_alignment_template,
+        ).grid(row=1, column=0, sticky="ew", pady=(2, 2))
+        ttk.Label(
+            detection_template_group,
+            textvariable=self.origami_shared_alignment_template_name,
+            wraplength=245,
+            foreground="#3d626f",
+        ).grid(row=2, column=0, sticky="w", pady=(2, 2))
+        ttk.Label(
+            detection_template_group,
+            text="Choose a calibrated fiducial image shared by all origami, including empty-center designs. Calibration is read from the image metadata. Step 2 reuses this template to refine alignment.",
+            wraplength=245,
+        ).grid(row=3, column=0, sticky="w", pady=(2, 2))
+        setting_row(coarse_group, 1, "Pick bin (nm)", self.origami_pick_bin_nm, "Coarse density-map bin size in nanometres.")
+        setting_row(coarse_group, 2, "Minimum density", self.origami_min_density_contrast, "Normalized coarse-density threshold used to seed candidate regions.")
         setting_row(
             coarse_group,
             3,
+            "Connect distance (nm)",
+            self.origami_connect_distance_nm,
+            "Radius used to recover localizations around bright bins. Signal gap controls joining across empty interiors.",
+        )
+        self.origami_signal_gap_entry = setting_row(
+            coarse_group, 4, "Signal gap (nm)", self.origami_signal_gap_nm,
+            "Used only without a shared alignment template. Maximum distance between supported bins to join, at least Connect distance. "
+            "Increase to span an empty interior; larger values can merge neighboring origami. "
+            "The minimum-point filter runs after joining.",
+        )
+
+        setting_row(
+            coarse_group,
+            5,
             "Min candidate points",
             self.origami_min_points,
             "Components below this localization count are discarded during Step 1. This is the same minimum shown in the Step 4 point limits.",
         )
         ttk.Label(
             coarse_group,
-            text="These settings determine which objects become candidates at all. The minimum-point control is shared with Step 4.",
+            text="Template-guided detection checks the calibrated bright-fiducial geometry. Each connected blue-outlined cluster supplies at most one candidate for alignment. Without a template, density detection joins bright bins using Signal gap. Run Step 1 again after changing detection inputs.",
             wraplength=245,
-        ).grid(row=4, column=0, columnspan=2, sticky="w", pady=(5, 0))
+        ).grid(row=6, column=0, columnspan=2, sticky="w", pady=(5, 0))
         self.origami_run_candidates_button = ttk.Button(
             coarse_group,
             text="Run Step 1 · Inspect Candidates",
             command=self._run_origami_candidate_stage,
         )
         self.origami_run_candidates_button.grid(
-            row=5, column=0, columnspan=2, sticky="ew", pady=(7, 0)
+            row=7, column=0, columnspan=2, sticky="ew", pady=(7, 0)
         )
-        step_progress(coarse_group, 6, 1)
-
+        step_progress(coarse_group, 8, 1)
+        self.origami_shared_alignment_template_name.trace_add(
+            "write", lambda *_args: self.origami_signal_gap_entry.state(
+                ["disabled"] if self.origami_shared_alignment_template is not None else ["!disabled"]
+            )
+        )
+        self.origami_signal_gap_entry.state(
+            ["disabled"] if self.origami_shared_alignment_template is not None else ["!disabled"]
+        )
         template_group = workflow_group(identify_form, 1, "2 · Fit alignment template to candidates")
-        ttk.Label(template_group, text="Alignment template", wraplength=125, justify="left").grid(
+        ttk.Label(
+            template_group,
+            text="Refine rotation and translation of the Step 1 candidates using the template selected in Step 1. To change detection, return to Step 1 and rerun it.",
+            wraplength=245,
+        ).grid(row=5, column=0, columnspan=2, sticky="w", pady=(6, 2))
+        ttk.Label(
+            template_group, textvariable=self.origami_shared_alignment_template_name,
+            wraplength=245, foreground="#3d626f",
+        ).grid(row=6, column=0, columnspan=2, sticky="w", pady=(2, 2))
+        ttk.Label(template_group, text="Alignment model", wraplength=125, justify="left").grid(
             row=0, column=0, sticky="w", pady=3
         )
         template_mode = ttk.Combobox(
@@ -4299,7 +4398,7 @@ class PaintAnalysisApp(tk.Tk):
             width=1,
         )
         template_mode.grid(row=0, column=1, sticky="ew", padx=(8, 0), pady=3)
-        WidgetTooltip(template_mode, "Use the generated full grid or a bright-on-dark uploaded image for alignment and correlation.")
+        WidgetTooltip(template_mode, "Choose the model for fitting detected candidates. Detection uses the calibrated template selected in Step 1; this setting does not switch the detection method.")
         paired_setting_row(
             template_group,
             1,
@@ -4328,22 +4427,6 @@ class PaintAnalysisApp(tk.Tk):
             "Nanometres between adjacent template pixel centers. Loaded automatically from Picklist Generator metadata; editable for older images.",
         )
         setting_row(template_group, 4, "Image margin (nm)", self.origami_rectangle_margin_nm, "Extra nanometres around the theoretical grid retained in each candidate footprint.")
-        ttk.Button(
-            template_group,
-            text="Load Alignment Template…",
-            command=self._load_origami_shared_alignment_template,
-        ).grid(row=5, column=0, columnspan=2, sticky="ew", pady=(6, 2))
-        ttk.Button(
-            template_group,
-            text="Clear Alignment Template",
-            command=self._clear_origami_shared_alignment_template,
-        ).grid(row=6, column=0, columnspan=2, sticky="ew", pady=(2, 2))
-        ttk.Label(
-            template_group,
-            textvariable=self.origami_shared_alignment_template_name,
-            wraplength=245,
-            foreground="#3d626f",
-        ).grid(row=7, column=0, columnspan=2, sticky="w", pady=(2, 0))
         setting_row(template_group, 8, "Alignment pixel (nm)", self.origami_preview_pixel_nm, "Requested nanometres per pixel for candidate/template alignment.")
         setting_row(template_group, 9, "Max alignment pixels", self.origami_alignment_max_pixels, "Maximum pixels across the diagonal of each candidate/template alignment image. Increase this to honor finer alignment-pixel requests.")
         setting_row(template_group, 10, "Alignment passes", self.origami_alignment_iterations, "Number of residual rotational/template-alignment passes.")
@@ -4390,21 +4473,26 @@ class PaintAnalysisApp(tk.Tk):
         )
         corner_gate.grid(row=20, column=0, columnspan=2, sticky="w", pady=(3, 0))
         WidgetTooltip(corner_gate, "Require each outer template mark to meet Pose min locs / site within Pose site radius. Disable to allow fits with missing corners. Applies to alignment and final acceptance; diagnostics remain available. Rerun Step 2 after changing this setting.")
+        setting_row(
+            template_group, 21, "Max overlap (%)", self.origami_max_overlap_percent,
+            "Reject both fits when their intersection exceeds this percentage of the smaller active footprint. "
+            "Image margins are excluded. 0 rejects any overlap; 100 allows all overlaps. Rerun Step 2 after changing.",
+        )
 
         ttk.Label(
             template_group,
-            text="Fits and locks each candidate's position and rotation. Correlation and point limits apply now; corner coverage applies when Require corner support is enabled. Each outer corner mark requires Pose min locs / site within Pose site radius. Failed fits appear with dashed outlines when text statistics is enabled. Site coverage and spacing limits apply during Step 4 acceptance. Shared controls update in both steps.",
+            text="Fits and locks each candidate's position and rotation. Fits sharing more than Max overlap (%) of the smaller active footprint are both rejected; image margins are excluded. Correlation and point limits apply now; corner coverage applies when Require corner support is enabled. Each outer corner mark requires Pose min locs / site within Pose site radius. Failed fits appear with dashed outlines when text statistics is enabled. Site coverage and spacing limits apply during Step 4 acceptance. Shared controls update in both steps.",
             wraplength=245,
-        ).grid(row=21, column=0, columnspan=2, sticky="w", pady=(5, 0))
+        ).grid(row=22, column=0, columnspan=2, sticky="w", pady=(5, 0))
         self.origami_run_alignment_button = ttk.Button(
             template_group,
             text="Run Step 2 · Fit and Inspect",
             command=lambda: self.identify_origamis(target_stage=3, display_stage=2),
         )
         self.origami_run_alignment_button.grid(
-            row=22, column=0, columnspan=2, sticky="ew", pady=(7, 0)
+            row=23, column=0, columnspan=2, sticky="ew", pady=(7, 0)
         )
-        step_progress(template_group, 23, 2)
+        step_progress(template_group, 24, 2)
 
         ttk.Label(identify_fields, text="Digital detection, classification, and QC").grid(row=2, column=0, sticky="w", pady=(2, 4))
         self.origami_identify_advanced_frame = ttk.Frame(identify_fields)
@@ -4839,6 +4927,7 @@ class PaintAnalysisApp(tk.Tk):
         self.origami_canvas = FigureCanvasTkAgg(self.origami_figure, master=self.origami_plot_area)
         self.origami_canvas.get_tk_widget().grid(row=1, column=0, sticky="nsew")
         self.origami_canvas.mpl_connect("button_press_event", self._on_origami_canvas_click)
+        self.origami_canvas.mpl_connect("draw_event", self._on_origami_source_draw)
 
         self.origami_candidate_bar = ttk.Frame(self.origami_plot_area)
         self.origami_candidate_bar.grid(row=2, column=0, sticky="ew", pady=(4, 2))
@@ -4895,6 +4984,7 @@ class PaintAnalysisApp(tk.Tk):
         return (
             self.origami_pick_bin_nm,
             self.origami_connect_distance_nm,
+            self.origami_signal_gap_nm,
             self.origami_min_density_contrast,
             self.origami_min_points,
             self.origami_max_points,
@@ -4921,6 +5011,7 @@ class PaintAnalysisApp(tk.Tk):
             self.origami_min_supported_rows,
             self.origami_min_supported_columns,
             self.origami_max_site_spacing_error_nm,
+            self.origami_max_overlap_percent,
             self.origami_preview_pixel_nm,
             self.origami_alignment_max_pixels,
             self.origami_alignment_iterations,
@@ -5223,6 +5314,7 @@ class PaintAnalysisApp(tk.Tk):
             defaults: tuple[tuple[tk.Variable, Any], ...] = (
                 (self.origami_pick_bin_nm, DEFAULT_ORIGAMI_PICK_BIN_NM),
                 (self.origami_connect_distance_nm, DEFAULT_ORIGAMI_CONNECT_DISTANCE_NM),
+                (self.origami_signal_gap_nm, DEFAULT_ORIGAMI_CONNECT_DISTANCE_NM),
                 (self.origami_min_density_contrast, DEFAULT_ORIGAMI_MIN_DENSITY),
                 (self.origami_min_points, DEFAULT_ORIGAMI_MIN_POINTS),
                 (self.origami_max_points, DEFAULT_ORIGAMI_MAX_POINTS),
@@ -5235,7 +5327,7 @@ class PaintAnalysisApp(tk.Tk):
                 (self.origami_spacing_y_nm, DEFAULT_ORIGAMI_SPACING_Y_NM),
                 (self.origami_rectangle_margin_nm, 20.0),
                 (self.origami_use_correlation_gate, DEFAULT_ORIGAMI_USE_CORRELATION_GATE),
-                (self.origami_require_corner_support, True),
+                (self.origami_require_corner_support, False),
                 (
                     self.origami_min_cell_pattern_correlation,
                     DEFAULT_ORIGAMI_MIN_CELL_PATTERN_CORRELATION,
@@ -5255,6 +5347,7 @@ class PaintAnalysisApp(tk.Tk):
                 (self.origami_min_supported_rows, 2),
                 (self.origami_min_supported_columns, 2),
                 (self.origami_max_site_spacing_error_nm, DEFAULT_ORIGAMI_MAX_SITE_SPACING_ERROR_NM),
+                (self.origami_max_overlap_percent, 0.0),
                 (self.origami_preview_pixel_nm, 1.0),
                 (self.origami_alignment_max_pixels, DEFAULT_ORIGAMI_ALIGNMENT_MAX_PIXELS),
                 (self.origami_alignment_iterations, DEFAULT_ORIGAMI_ALIGNMENT_PASSES),
@@ -6404,7 +6497,7 @@ class PaintAnalysisApp(tk.Tk):
 
     def _load_origami_shared_alignment_template(self) -> None:
         path_text = filedialog.askopenfilename(
-            title="Load one calibrated shared alignment template",
+            title="Load calibrated detection and alignment template",
             initialdir=str(self._file_dialog_initial_dir()),
             filetypes=[
                 ("Template images", "*.png *.tif *.tiff *.jpg *.jpeg"),
@@ -6477,12 +6570,14 @@ class PaintAnalysisApp(tk.Tk):
             if variable is not None:
                 variable.set(value)
         self.origami_shared_alignment_template_name.set(
-            f"Shared alignment: {alignment_template['name']} "
-            f"({image.shape[1]} × {image.shape[0]} px)"
+            f"Template-guided detection: {alignment_template['name']}\n"
+            f"{image.shape[1]} × {image.shape[0]} px; "
+            f"{alignment_template['template_pixel_size_x_nm']:g} × "
+            f"{alignment_template['template_pixel_size_y_nm']:g} nm/px"
         )
         self._remember_file_dialog_dir(path)
         self.status.set(
-            f"Loaded {alignment_template['name']} for one-pass locked alignment."
+            f"Loaded {alignment_template['name']} for detection and alignment. Run Step 1 to detect candidates."
         )
 
     def _load_origami_digital_pixel_schema(self) -> None:
@@ -6560,10 +6655,10 @@ class PaintAnalysisApp(tk.Tk):
             self.origami_custom_template_path = None
             self.origami_custom_template_image = None
         self.origami_shared_alignment_template_name.set(
-            "No alignment template loaded"
+            "Density detection · no shared template loaded"
         )
         self.status.set(
-            "Cleared the alignment template. Load one before running Step 2."
+            "Density detection selected. Rerun Step 1, or load a detection template here for template-guided detection."
         )
 
     def load_file(self) -> None:
@@ -7152,20 +7247,34 @@ class PaintAnalysisApp(tk.Tk):
             "source_params": dict(params),
         }
 
+    def _origami_candidate_template_points(self) -> np.ndarray | None:
+        alignment = self.origami_shared_alignment_template
+        if alignment is None:
+            return None
+        points = alignment_template_overlay_points(
+            np.empty((0, 2)), {"shared_alignment_template": alignment}
+        )
+        if len(points) < 2:
+            raise ValueError("The shared alignment template needs at least two calibrated bright sites for candidate detection.")
+        return points
+
     def _origami_candidate_stage_signature(self) -> tuple[Any, ...]:
         fingerprint = str(getattr(self, "origami_source_candidate_fingerprint", ""))
         if not fingerprint and self.origami_source_points_nm is not None:
             fingerprint = origami_source_fingerprint(self.origami_source_points_nm)
             self.origami_source_candidate_fingerprint = fingerprint
+        template_points = self._origami_candidate_template_points()
         return (
             float(self.origami_pick_bin_nm.get()),
             float(self.origami_connect_distance_nm.get()),
+            float(self.origami_signal_gap_nm.get()),
             float(self.origami_min_density_contrast.get()),
             int(self.origami_min_points.get()),
             int(len(self.origami_source_points_nm))
             if self.origami_source_points_nm is not None
             else 0,
             fingerprint,
+            None if template_points is None else tuple(map(tuple, template_points)),
         )
 
     def _run_origami_candidate_stage(self) -> None:
@@ -7182,20 +7291,24 @@ class PaintAnalysisApp(tk.Tk):
         (
             bin_size_nm,
             connect_distance_nm,
+            signal_gap_nm,
             density_threshold,
             minimum_points,
             _point_count,
             _source_fingerprint,
+            candidate_template_points,
         ) = signature
         if (
             bin_size_nm <= 0.0
             or connect_distance_nm <= 0.0
+            or not np.isfinite(signal_gap_nm)
+            or signal_gap_nm <= 0.0
             or not 0.0 <= density_threshold <= 1.0
             or minimum_points < 1
         ):
             messagebox.showerror(
                 "Invalid candidate settings",
-                "Pick bin and connect distance must be positive, minimum density must be between 0 and 1, and minimum points must be at least one.",
+                "Pick bin, connect distance, and signal gap must be positive, minimum density must be between 0 and 1, and minimum points must be at least one.",
             )
             return
         if (
@@ -7240,6 +7353,8 @@ class PaintAnalysisApp(tk.Tk):
                         points_nm,
                         bin_size_nm=bin_size_nm,
                         connect_distance_nm=connect_distance_nm,
+                        component_connect_distance_nm=signal_gap_nm,
+                        candidate_template_points_nm=candidate_template_points,
                         density_threshold=density_threshold,
                         minimum_points=minimum_points,
                         progress_callback=self._origami_identification_worker_progress,
@@ -7259,7 +7374,7 @@ class PaintAnalysisApp(tk.Tk):
         if target_stage >= 3 and self.origami_shared_alignment_template is None:
             messagebox.showinfo(
                 "Alignment template not loaded",
-                "Load the Step 2 alignment template before fitting candidates.",
+                "Load a detection template in Step 1 and rerun candidate detection before fitting in Step 2.",
             )
             return
         if target_stage >= 4 and self.origami_digital_pixel_model is None:
@@ -7278,6 +7393,8 @@ class PaintAnalysisApp(tk.Tk):
             params = {
                 "pick_bin_size_nm": float(self.origami_pick_bin_nm.get()),
                 "connect_distance_nm": float(self.origami_connect_distance_nm.get()),
+                "component_connect_distance_nm": float(self.origami_signal_gap_nm.get()),
+                "candidate_template_points_nm": self._origami_candidate_template_points(),
                 "density_threshold": float(self.origami_min_density_contrast.get()),
                 "min_candidate_points": int(self.origami_min_points.get()),
                 "max_candidate_points": int(self.origami_max_points.get()),
@@ -7305,6 +7422,7 @@ class PaintAnalysisApp(tk.Tk):
                 "min_supported_rows": int(self.origami_min_supported_rows.get()),
                 "min_supported_columns": int(self.origami_min_supported_columns.get()),
                 "max_site_spacing_error_nm": float(self.origami_max_site_spacing_error_nm.get()),
+                "max_footprint_overlap_fraction": float(self.origami_max_overlap_percent.get()) / 100.0,
                 "alignment_pixel_nm": float(self.origami_preview_pixel_nm.get()),
                 "alignment_max_patch_pixels": int(self.origami_alignment_max_pixels.get()),
                 "alignment_iterations": int(self.origami_alignment_iterations.get()),
@@ -7354,6 +7472,9 @@ class PaintAnalysisApp(tk.Tk):
                 params["alignment_template_image"] = self.origami_custom_template_image.copy()
         else:
             params["alignment_template_image"] = None
+        if not 0.0 <= params["max_footprint_overlap_fraction"] <= 1.0:
+            messagebox.showerror("Invalid overlap threshold", "Max overlap must be between 0 and 100 percent.")
+            return
         if not 0.0 <= params["min_rectangle_confidence"] <= 1.0:
             messagebox.showerror("Invalid identification settings", "Minimum theoretical-template correlation must be between 0 and 1.")
             return
@@ -7553,6 +7674,8 @@ class PaintAnalysisApp(tk.Tk):
             points_nm,
             pick_bin_size_nm=float(params["pick_bin_size_nm"]),
             connect_distance_nm=float(params["connect_distance_nm"]),
+            component_connect_distance_nm=params.get("component_connect_distance_nm"),
+            candidate_template_points_nm=params.get("candidate_template_points_nm"),
             density_threshold=float(params["density_threshold"]),
             min_candidate_points=int(params["min_candidate_points"]),
             max_candidate_points=int(params["max_candidate_points"]),
@@ -7563,6 +7686,7 @@ class PaintAnalysisApp(tk.Tk):
             rectangle_margin_nm=float(params["rectangle_margin_nm"]),
             min_rectangle_confidence=float(params["min_rectangle_confidence"]),
             use_correlation_gate=bool(params.get("use_correlation_gate", True)),
+            require_corner_support=bool(params.get("require_corner_support", False)),
             site_mask_radius_nm=float(params.get("site_mask_radius_nm", DEFAULT_ORIGAMI_SITE_MASK_RADIUS_NM)),
             min_supported_sites=int(params.get("min_supported_sites", 0)),
             min_site_evidence=float(params.get("min_site_evidence", DEFAULT_ORIGAMI_MIN_SITE_PROMINENCE)),
@@ -7570,6 +7694,7 @@ class PaintAnalysisApp(tk.Tk):
             min_supported_rows=int(params.get("min_supported_rows", 0)),
             min_supported_columns=int(params.get("min_supported_columns", 0)),
             max_site_spacing_error_nm=float(params.get("max_site_spacing_error_nm", float("inf"))),
+            max_footprint_overlap_fraction=float(params.get("max_footprint_overlap_fraction", 0.0)),
             alignment_pixel_nm=float(params["alignment_pixel_nm"]),
             alignment_max_patch_pixels=int(params.get("alignment_max_patch_pixels", DEFAULT_ORIGAMI_ALIGNMENT_MAX_PIXELS)),
             alignment_iterations=int(params["alignment_iterations"]),
@@ -7588,6 +7713,28 @@ class PaintAnalysisApp(tk.Tk):
         return picks
 
     @staticmethod
+    def _reject_overlapping_origami_fits(picks, params, accepted):
+        threshold = float(params.get("max_footprint_overlap_fraction", 0.0))
+        if not 0.0 <= threshold <= 1.0:
+            raise ValueError("Maximum footprint overlap must be between 0 and 1.")
+        corners = np.asarray(getattr(picks, "rectangle_corners_nm", ()))
+        if corners.shape != (len(accepted), 4, 2):
+            # Legacy/geometry-free results cannot support a spatial gate.
+            return replace(picks, accepted_mask=accepted)
+        fractions = fitted_footprint_overlap_fractions(
+            corners,
+            margin_nm=float(params.get("rectangle_margin_nm", 0.0)),
+            eligible=accepted,
+        )
+        # Preserve overlap evidence measured at Step 2 even if another gate
+        # later rejects one member of the pair.
+        previous = np.asarray(getattr(picks, "footprint_overlap_fraction", ()))
+        if previous.shape == fractions.shape:
+            fractions = np.maximum(fractions, previous)
+        return replace(picks, accepted_mask=accepted & (fractions <= threshold),
+                       footprint_overlap_fraction=fractions)
+
+    @staticmethod
     def _apply_origami_alignment_filters(
         picks: OrigamiPickResult,
         params: dict[str, Any],
@@ -7604,7 +7751,7 @@ class PaintAnalysisApp(tk.Tk):
                 correlation >= float(params.get("min_rectangle_confidence", 0.0))
             )
         accepted &= required_corner_mask(picks, params)
-        return replace(picks, accepted_mask=accepted)
+        return PaintAnalysisApp._reject_overlapping_origami_fits(picks, params, accepted)
 
     def _remeasure_origami_sites(
         self,
@@ -7836,7 +7983,7 @@ class PaintAnalysisApp(tk.Tk):
                 )
             )
         accepted &= required_corner_mask(picks, params)
-        return replace(picks, accepted_mask=np.asarray(accepted, dtype=bool))
+        return PaintAnalysisApp._reject_overlapping_origami_fits(picks, params, np.asarray(accepted, dtype=bool))
 
     def _identify_origami_worker(
         self,
@@ -7893,6 +8040,13 @@ class PaintAnalysisApp(tk.Tk):
                 points_nm,
                 bin_size_nm=float(params["pick_bin_size_nm"]),
                 connect_distance_nm=float(params["connect_distance_nm"]),
+                component_connect_distance_nm=params.get("component_connect_distance_nm"),
+                candidate_template_points_nm=(
+                    params.get("candidate_template_points_nm")
+                    if params.get("candidate_template_points_nm") is not None
+                    else (alignment_template_overlay_points(np.empty((0, 2)), params)
+                          if params.get("shared_alignment_template") is not None else None)
+                ),
                 density_threshold=float(params["density_threshold"]),
                 minimum_points=int(params["min_candidate_points"]),
             )
@@ -8392,7 +8546,7 @@ class PaintAnalysisApp(tk.Tk):
                     attempts.append((score if np.isfinite(score) else -float("inf"), template_index, int(candidate_index)))
             if not attempts:
                 continue
-            score, template_index, candidate_index = max(attempts)
+            (score, template_index, candidate_index), attribution = unclassified_template_attribution(attempts)
             attempted = template_results[template_index]
             attempted_picks: OrigamiPickResult = attempted["picks"]
             attempted_params = dict(attempted["params"])
@@ -8405,6 +8559,9 @@ class PaintAnalysisApp(tk.Tk):
                 spacing_error_nm=float(attempted_picks.site_spacing_max_error_nm[candidate_index]),
                 params=attempted_params,
             )
+            overlap = np.asarray(getattr(attempted_picks, "footprint_overlap_fraction", ()))
+            if overlap.shape == (len(attempted_picks.regions),) and overlap[candidate_index] > float(attempted_params.get("max_footprint_overlap_fraction", 0.0)):
+                failure_reasons.append(f"overlapping origami footprints ({overlap[candidate_index]:.0%} of smaller footprint)")
             if not required_corner_mask(attempted_picks, attempted_params, candidate_index)[0]:
                 failure_reasons.append("required corner support missing")
             alignment_mask = np.asarray(
@@ -8485,7 +8642,9 @@ class PaintAnalysisApp(tk.Tk):
                     "center_nm": np.asarray(classification.group_centers_nm[group_index], dtype=float),
                     "theoretical_points_nm": unclassified_theoretical_points(
                         attempted_picks, attempted_params, candidate_index),
-                    "template_name": template_names[template_index],
+                    "template_name": template_names[template_index] if attribution == "unique_best" else "",
+                    "template_attribution": attribution,
+                    "diagnostic_pose_template_name": template_names[template_index],
                     "point_count": int(attempted_picks.point_counts[candidate_index]),
                     "correlation": float(attempted_picks.rectangle_confidence[candidate_index]),
                     "supported_sites": int(attempted_picks.supported_site_count[candidate_index]),
@@ -8798,6 +8957,8 @@ class PaintAnalysisApp(tk.Tk):
             points_nm,
             pick_bin_size_nm=float(identification_params["pick_bin_size_nm"]),
             connect_distance_nm=float(identification_params["connect_distance_nm"]),
+            component_connect_distance_nm=identification_params.get("component_connect_distance_nm"),
+            candidate_template_points_nm=identification_params.get("candidate_template_points_nm"),
             density_threshold=float(identification_params["density_threshold"]),
             min_candidate_points=int(identification_params["min_candidate_points"]),
             max_candidate_points=int(identification_params["max_candidate_points"]),
@@ -8808,6 +8969,7 @@ class PaintAnalysisApp(tk.Tk):
             rectangle_margin_nm=float(identification_params["rectangle_margin_nm"]),
             min_rectangle_confidence=float(identification_params["min_rectangle_confidence"]),
             use_correlation_gate=bool(identification_params.get("use_correlation_gate", True)),
+            require_corner_support=bool(identification_params.get("require_corner_support", False)),
             site_mask_radius_nm=float(identification_params.get("site_mask_radius_nm", DEFAULT_ORIGAMI_SITE_MASK_RADIUS_NM)),
             min_supported_sites=int(identification_params.get("min_supported_sites", 0)),
             min_site_evidence=float(identification_params.get("min_site_evidence", DEFAULT_ORIGAMI_MIN_SITE_PROMINENCE)),
@@ -8815,6 +8977,7 @@ class PaintAnalysisApp(tk.Tk):
             min_supported_rows=int(identification_params.get("min_supported_rows", 0)),
             min_supported_columns=int(identification_params.get("min_supported_columns", 0)),
             max_site_spacing_error_nm=float(identification_params.get("max_site_spacing_error_nm", float("inf"))),
+            max_footprint_overlap_fraction=float(identification_params.get("max_footprint_overlap_fraction", 0.0)),
             alignment_pixel_nm=float(identification_params["alignment_pixel_nm"]),
             alignment_max_patch_pixels=int(identification_params.get("alignment_max_patch_pixels", DEFAULT_ORIGAMI_ALIGNMENT_MAX_PIXELS)),
             alignment_iterations=int(identification_params["alignment_iterations"]),
@@ -9086,6 +9249,8 @@ class PaintAnalysisApp(tk.Tk):
                 tile_points,
                 pick_bin_size_nm=float(identification_params["pick_bin_size_nm"]),
                 connect_distance_nm=float(identification_params["connect_distance_nm"]),
+                component_connect_distance_nm=identification_params.get("component_connect_distance_nm"),
+                candidate_template_points_nm=identification_params.get("candidate_template_points_nm"),
                 density_threshold=float(identification_params["density_threshold"]),
                 min_candidate_points=int(identification_params["min_candidate_points"]),
                 max_candidate_points=int(identification_params["max_candidate_points"]),
@@ -9096,6 +9261,7 @@ class PaintAnalysisApp(tk.Tk):
                 rectangle_margin_nm=float(identification_params["rectangle_margin_nm"]),
                 min_rectangle_confidence=float(identification_params["min_rectangle_confidence"]),
                 use_correlation_gate=bool(identification_params.get("use_correlation_gate", True)),
+                require_corner_support=bool(identification_params.get("require_corner_support", False)),
                 site_mask_radius_nm=float(identification_params.get("site_mask_radius_nm", DEFAULT_ORIGAMI_SITE_MASK_RADIUS_NM)),
                 min_supported_sites=int(identification_params.get("min_supported_sites", 0)),
                 min_site_evidence=float(identification_params.get("min_site_evidence", DEFAULT_ORIGAMI_MIN_SITE_PROMINENCE)),
@@ -9103,6 +9269,7 @@ class PaintAnalysisApp(tk.Tk):
                 min_supported_rows=int(identification_params.get("min_supported_rows", 0)),
                 min_supported_columns=int(identification_params.get("min_supported_columns", 0)),
                 max_site_spacing_error_nm=float(identification_params.get("max_site_spacing_error_nm", float("inf"))),
+                max_footprint_overlap_fraction=float(identification_params.get("max_footprint_overlap_fraction", 0.0)),
                 alignment_pixel_nm=float(identification_params["alignment_pixel_nm"]),
                 alignment_max_patch_pixels=int(identification_params.get("alignment_max_patch_pixels", DEFAULT_ORIGAMI_ALIGNMENT_MAX_PIXELS)),
                 alignment_iterations=int(identification_params["alignment_iterations"]),
@@ -10464,14 +10631,14 @@ class PaintAnalysisApp(tk.Tk):
                                     f"Complete: {candidate_count:,} candidates"
                                 )
                                 self.origami_identification_progress_text.set(
-                                    f"Step 1 complete: {candidate_count:,} connected candidates."
+                                    f"Step 1 complete: {candidate_count:,} candidates."
                                 )
                                 self.origami_staged_status.set(
-                                    "Step 1 is cached. Adjust it and rerun, or load an alignment template and continue to Step 2."
+                                    "Step 1 is cached. Continue to Step 2 to fit the selected template. To change the template or detection settings, update Step 1 and rerun it."
                                 )
                                 self._plot_origami_coarse_density()
                                 self.status.set(
-                                    f"Step 1 complete: inspect {candidate_count:,} connected candidates before alignment."
+                                    f"Step 1 complete: inspect {candidate_count:,} candidates before alignment."
                                 )
                         elif result_kind == "origami_stage_preview":
                             if (
@@ -11537,6 +11704,32 @@ class PaintAnalysisApp(tk.Tk):
         self.after_idle(self._rerender_loaded_origami_source_view)
         self.status.set(f"Loaded and displayed {len(points):,} source points. Tune identification settings, then click Identify Origami.")
 
+    def _on_origami_source_draw(self, event: Any) -> None:
+        """Refresh source resolution after the axes reach their displayed size."""
+        if (
+            event.canvas is not self.origami_canvas
+            or self.origami_last_rendered_plot_option != "Loaded source data"
+            or self._current_notebook_tab_index() != ORIGAMI_TAB
+            or not self.origami_figure.axes
+        ):
+            return
+        axis = self.origami_figure.axes[0]
+        bounds = axis.get_window_extent()
+        width, height = float(bounds.width), float(bounds.height)
+        if not np.isfinite(width + height) or min(width, height) <= 1.0:
+            return
+        signature = (
+            id(axis), id(self.origami_source_points_nm),
+            tuple(axis.get_xlim()), tuple(axis.get_ylim()),
+            round(width), round(height),
+        )
+        if signature == self.origami_source_draw_signature:
+            return
+        self.origami_source_draw_signature = signature
+        # Do not render synchronously inside Matplotlib's draw callback. The
+        # scheduler also invalidates work requested for a previous canvas size.
+        self._schedule_origami_zoom_render()
+
     def _rerender_loaded_origami_source_view(self) -> None:
         if (
             self.origami_last_rendered_plot_option == "Loaded source data"
@@ -12071,8 +12264,14 @@ class PaintAnalysisApp(tk.Tk):
                 retained_text = f"; retained={100.0 * retained:.0f}%" if np.isfinite(retained) else ""
                 reasons = tuple(str(reason) for reason in detail.get("failure_reasons", ()))
                 failure_text = ", ".join(reasons) if reasons else "no template passed all gates"
+                attribution = unclassified_attribution_status(detail)
+                attribution_label = (
+                    "no matching template" if attribution == "no_match" else
+                    "tied templates" if attribution == "ambiguous" else
+                    f"best {detail.get('template_name', 'template')}"
+                )
                 label = axis.annotate(
-                    f"UNCLASSIFIED — best {detail.get('template_name', 'template')}: "
+                    f"UNCLASSIFIED — {attribution_label}: "
                     f"n={int(detail.get('point_count', 0)):,}; "
                     f"corr={float(detail.get('correlation', float('nan'))):.2f}; "
                     f"sites={int(detail.get('supported_sites', 0))}; "
@@ -12882,6 +13081,9 @@ class PaintAnalysisApp(tk.Tk):
         overlay = np.clip(overlay, 0.0, 1.0)
         accepted = bool(picks.accepted_mask[region_index])
         decision = "ACCEPTED" if accepted else "REJECTED"
+        overlap = np.asarray(getattr(picks, "footprint_overlap_fraction", ()))
+        if not accepted and overlap.ndim == 1 and region_index < len(overlap) and overlap[region_index] > float(params.get("max_footprint_overlap_fraction", 0.0)):
+            decision += f" — overlapping footprints ({overlap[region_index]:.0%})"
         decision_color = "#15803d" if accepted else "#b91c1c"
 
         self.origami_plot_option.set("Identified origami template matches")
@@ -13084,6 +13286,7 @@ class PaintAnalysisApp(tk.Tk):
         )
         bin_size_nm = float(params.get("pick_bin_size_nm", self.origami_pick_bin_nm.get()))
         connect_distance_nm = float(params.get("connect_distance_nm", self.origami_connect_distance_nm.get()))
+        signal_gap_nm = max(connect_distance_nm, float(params.get("component_connect_distance_nm") or self.origami_signal_gap_nm.get()))
         x_min, x_max, y_min, y_max = picks.density_extent_nm
         density = np.asarray(picks.density_image, dtype=float)
         contrast = np.asarray(picks.density_contrast, dtype=float)
@@ -13132,7 +13335,7 @@ class PaintAnalysisApp(tk.Tk):
 
         visible_components = np.ma.masked_less(component_labels.T, 0)
         component_count = int(np.max(component_labels) + 1) if np.any(component_labels >= 0) else 0
-        component_cmap = matplotlib.colormaps["turbo"].copy()
+        component_cmap = matplotlib.colors.ListedColormap(["#00ffff"])
         component_cmap.set_bad("#111827")
         component_axis.imshow(
             visible_components,
@@ -13144,6 +13347,32 @@ class PaintAnalysisApp(tk.Tk):
             interpolation="nearest",
             aspect="equal",
         )
+        if component_count:
+            # Draw only exposed bin edges, including boundaries between labels.
+            # A single collection keeps large candidate maps cheap to render.
+            active = component_labels >= 0
+            padded_labels = np.pad(component_labels, 1, constant_values=-1)
+            dx = (x_max - x_min) / component_labels.shape[0]
+            dy = (y_max - y_min) / component_labels.shape[1]
+            segments, edge_labels = [], []
+            for neighbor, first, second in (
+                (padded_labels[:-2, 1:-1], (0, 0), (0, 1)),
+                (padded_labels[2:, 1:-1], (1, 0), (1, 1)),
+                (padded_labels[1:-1, :-2], (0, 0), (1, 0)),
+                (padded_labels[1:-1, 2:], (0, 1), (1, 1)),
+            ):
+                ix, iy = np.nonzero(active & (component_labels != neighbor))
+                base = np.column_stack((x_min + ix * dx, y_min + iy * dy))
+                segments.append(np.stack((base + np.array(first) * (dx, dy),
+                                          base + np.array(second) * (dx, dy)), axis=1))
+                edge_labels.append(component_labels[ix, iy])
+            palette = matplotlib.colormaps["turbo"](
+                np.random.default_rng(0).uniform(0.05, 0.95, component_count)
+            )
+            component_axis.add_collection(LineCollection(
+                np.concatenate(segments), colors=palette[np.concatenate(edge_labels)],
+                linewidths=0.8,
+            ))
         if 0 < component_count <= 100:
             for component in range(component_count):
                 bin_indices = np.argwhere(component_labels == component)
@@ -13163,7 +13392,9 @@ class PaintAnalysisApp(tk.Tk):
                 )
         component_axis.set_title(
             f"Active bins grouped into {component_count:,} candidates\n"
-            f"bin centers within {connect_distance_nm:g} nm are connected"
+            + ("bounded shared-fiducial poses" if params.get("candidate_template_points_nm") is not None
+             or (history_payload is None and self.origami_shared_alignment_template is not None)
+             else f"bin centers within {signal_gap_nm:g} nm are connected")
         )
         for axis in (density_axis, component_axis):
             axis.set_xlabel("x position (nm)")
@@ -13427,7 +13658,7 @@ class PaintAnalysisApp(tk.Tk):
                         axis, picks, params, int(region_index)))
                 note = ("Corner support: green PASS / red FAIL; labels=count/minimum; "
                         f"radius={float(params.get('site_mask_radius_nm', DEFAULT_ORIGAMI_SITE_MASK_RADIUS_NM)):g} nm; cropped fit points")
-                if not params.get("require_corner_support", True):
+                if not params.get("require_corner_support", False):
                     note += "; corner gate OFF (diagnostics only)"
                 if params.get("alignment_template_image") is None:
                     note = "Corner support gate is inactive for this fit (no image template)."
@@ -13547,6 +13778,9 @@ class PaintAnalysisApp(tk.Tk):
                         spacing_error_nm=float(picks.site_spacing_max_error_nm[region_index]),
                         params=params,
                     )
+                    overlap = np.asarray(getattr(picks, "footprint_overlap_fraction", ()))
+                    if overlap.ndim == 1 and region_index < len(overlap) and overlap[region_index] > float(params.get("max_footprint_overlap_fraction", 0.0)):
+                        failure_reasons.append(f"overlapping origami footprints ({overlap[region_index]:.0%})")
                     exact = params.get("classification_exact_digital_match", ())
                     if region_index < len(exact) and not exact[region_index]:
                         failure_reasons.append("digital ON/OFF pattern differs from template")
@@ -14720,6 +14954,8 @@ class PaintAnalysisApp(tk.Tk):
         rates = np.asarray(diagnostics["assignment_rates"], dtype=float)
         failures = np.asarray(diagnostics["failure_counts"], dtype=int)
         unresolved = int(diagnostics["unresolved_unclassified"])
+        unmatched = int(diagnostics["unmatched_count"])
+        ambiguous = int(diagnostics["ambiguous_count"])
 
         self.origami_figure.clear()
         self.origami_figure.set_layout_engine("constrained", w_pad=10 / 72, h_pad=8 / 72)
@@ -14904,7 +15140,8 @@ class PaintAnalysisApp(tk.Tk):
         )
         self.origami_figure.suptitle(
             f"Classification diagnostics: {int(np.sum(assigned)):,} assigned · "
-            f"{int(np.sum(rejected)):,} diagnosed unclassified"
+            f"{int(np.sum(rejected)):,} rejected with unique best template\n"
+            f"{unmatched:,} no matching template · {ambiguous:,} tied/ambiguous"
             f"{f'; {unresolved:,} without a recorded best-template diagnosis' if unresolved else ''}",
             fontsize=12,
         )

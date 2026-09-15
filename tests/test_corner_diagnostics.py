@@ -22,7 +22,7 @@ class CornerDiagnosticsTests(unittest.TestCase):
         picks = SimpleNamespace(template_points_nm=sites, aligned_regions=[region],
                                 point_counts=np.array([len(region)]),
                                 rectangle_corners_nm=np.array([footprint @ rotation.T + translation]))
-        params = dict(alignment_template_image=np.ones((5, 5)),
+        params = dict(require_corner_support=True, alignment_template_image=np.ones((5, 5)),
                       min_site_localizations=3, site_mask_radius_nm=2.)
         self.assertFalse(required_corner_mask(picks, params)[0])
         axis = Figure().subplots()
@@ -52,7 +52,7 @@ class CornerDiagnosticsTests(unittest.TestCase):
         sites = np.array([[-20., -10.], [20., -10.], [20., 10.], [-20., 10.]])
         picks = Picks(np.array([9]), np.array([.9]), np.array([False]),
                       [np.repeat(sites[1:], 3, axis=0)], sites)
-        params = dict(alignment_template_image=np.ones((5, 5)),
+        params = dict(require_corner_support=True, alignment_template_image=np.ones((5, 5)),
                       site_mask_radius_nm=2., min_site_localizations=3,
                       min_rectangle_confidence=.3, digital_pixel_model={})
         self.assertFalse(required_corner_mask(picks, params)[0])

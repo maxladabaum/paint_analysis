@@ -138,7 +138,7 @@ class DynamicRenderTests(unittest.TestCase):
         self.assertEqual(origami_source_fingerprint(first), origami_source_fingerprint(first.copy()))
         self.assertNotEqual(origami_source_fingerprint(first), origami_source_fingerprint(second))
 
-        signature = (10.0, 20.0, 0.8, 200, len(first), origami_source_fingerprint(first))
+        signature = (10.0, 20.0, 20.0, 0.8, 200, len(first), origami_source_fingerprint(first), None)
         candidates = ([first], np.zeros((1, 1)), np.zeros((1, 1)), (0.0, 1.0, 0.0, 1.0), np.zeros((1, 1)))
         app = SimpleNamespace(
             origami_identification_running=False,
@@ -163,6 +163,26 @@ class DynamicRenderTests(unittest.TestCase):
         app._run_worker.assert_not_called()
         app._plot_origami_coarse_density.assert_called_once_with()
         self.assertEqual(app.origami_step_progress[1].get(), 100.0)
+
+    def test_step_one_cache_tracks_shared_fiducial_geometry(self) -> None:
+        app = SimpleNamespace(
+            origami_source_points_nm=np.array([[0.0, 0.0], [1.0, 1.0]]),
+            origami_source_candidate_fingerprint="",
+            origami_pick_bin_nm=FakeVariable(5.0),
+            origami_connect_distance_nm=FakeVariable(15.0),
+            origami_signal_gap_nm=FakeVariable(125.0),
+            origami_min_density_contrast=FakeVariable(0.2),
+            origami_min_points=FakeVariable(100),
+            origami_shared_alignment_template=None,
+        )
+        app._origami_candidate_template_points = lambda: PaintAnalysisApp._origami_candidate_template_points(app)
+        original = PaintAnalysisApp._origami_candidate_stage_signature(app)
+        app.origami_shared_alignment_template = {"overlay_points_nm": np.array([[-60.0, 0.0], [60.0, 0.0]])}
+        loaded = PaintAnalysisApp._origami_candidate_stage_signature(app)
+        self.assertNotEqual(original, loaded)
+        self.assertEqual(loaded, PaintAnalysisApp._origami_candidate_stage_signature(app))
+        app.origami_shared_alignment_template["overlay_points_nm"][1, 0] = 65.0
+        self.assertNotEqual(loaded, PaintAnalysisApp._origami_candidate_stage_signature(app))
 
     def test_step_four_cache_ignores_classification_template_names(self) -> None:
         previous = {
@@ -844,6 +864,50 @@ class DynamicRenderTests(unittest.TestCase):
         self.assertGreater(float(loaded[-1, 1]), 0.0)
         self.assertEqual(float(loaded[0, 1]), 0.0)
 
+    def test_generator_reflection_keeps_raster_sites_and_schema_in_agreement(self) -> None:
+        from origami_analysis import custom_template_site_points
+
+        metadata = {
+            "format": "paint-analysis-origami-template-v1",
+            "rows": 2, "columns": 3, "spacing_x_nm": 10.0, "spacing_y_nm": 10.0,
+            "margin_nm": 5.0, "width_px": 41, "height_px": 21,
+            "width_nm": 40.0, "height_nm": 20.0,
+            "logical_model": {
+                "format": "paint-analysis-logical-bits-v1",
+                "physical_rows": 2, "physical_columns": 3,
+                "column_offsets_nm": [0.0, 2.0, 6.0],
+                "alignment_groups": [{"id": "fid", "physical_sites": [[1, 1]]}],
+                "logical_bits": [{"id": "bit", "physical_sites": [[2, 2]],
+                                  "evidence_sites": [[2, 2]]}],
+                "active_logical_bits": ["bit"],
+            },
+        }
+        raster = np.zeros((21, 41), dtype=np.uint8)
+        raster[5, 7] = 255  # x=-13, y=+5 before the left/right reflection
+        raster[15, 19] = 255  # x=-1, y=-5
+        with TemporaryDirectory() as directory:
+            path = Path(directory) / "asymmetric.png"
+            png_metadata = PngImagePlugin.PngInfo()
+            png_metadata.add_text("paint_analysis_template", json.dumps(metadata))
+            Image.fromarray(raster).save(path, pnginfo=png_metadata)
+            loaded = load_custom_template_image(path)
+            calibration = load_custom_template_metadata(path)
+        self.assertGreater(loaded[15, 33], 0)
+        self.assertGreater(loaded[5, 21], 0)
+        self.assertEqual(loaded[15, 7], 0)
+        self.assertEqual(calibration["column_offsets_nm"], (-6.0, -2.0, 0.0))
+        model = logical_stroke_model_from_metadata(calibration)
+        standalone = logical_stroke_model_from_metadata(metadata)
+        self.assertEqual(model, standalone)
+        grid = origami_grid_points(2, 3, 10.0, 10.0, calibration)
+        np.testing.assert_allclose(grid[list(model["alignment_cells"])], [[13.0, 5.0]])
+        np.testing.assert_allclose(grid[list(model["bit_cells"][0])], [[1.0, -5.0]])
+        sites = custom_template_site_points(
+            loaded, rectangle_width_nm=40.0, rectangle_height_nm=20.0,
+            pixel_size_x_nm=1.0, pixel_size_y_nm=1.0)
+        self.assertEqual(set(map(tuple, sites)), {(13.0, 5.0), (1.0, -5.0)})
+        self.assertEqual(model["active_bits"], (True,))
+
     def test_colored_logical_groups_have_equal_alignment_intensity(self) -> None:
         metadata = {
             "format": "paint-analysis-origami-template-v1",
@@ -931,8 +995,8 @@ class DynamicRenderTests(unittest.TestCase):
         }
         model = logical_stroke_model_from_metadata(metadata)
         self.assertEqual(model["bit_ids"], ("left.slash", "right.bottom"))
-        self.assertEqual(model["bit_cells"], ((62, 73), (7, 8)))
-        self.assertEqual(model["alignment_cells"], (11, 84))
+        self.assertEqual(model["bit_cells"], ((69, 82), (3, 4)))
+        self.assertEqual(model["alignment_cells"], (0, 95))
         self.assertEqual(model["active_bits"], (True, False))
 
     def test_loading_separate_shared_alignment_template_preserves_calibration(self) -> None:
@@ -966,7 +1030,7 @@ class DynamicRenderTests(unittest.TestCase):
             app.origami_shared_alignment_template["template_pixel_size_x_nm"],
             160.0 / 499.0,
         )
-        self.assertIn("Shared alignment: L_L", app.origami_shared_alignment_template_name.get())
+        self.assertIn("Template-guided detection: L_L", app.origami_shared_alignment_template_name.get())
 
     def test_clearing_shared_alignment_restores_independent_fitting(self) -> None:
         app = PaintAnalysisApp.__new__(PaintAnalysisApp)
@@ -979,9 +1043,9 @@ class DynamicRenderTests(unittest.TestCase):
         self.assertIsNone(app.origami_shared_alignment_template)
         self.assertEqual(
             app.origami_shared_alignment_template_name.get(),
-            "No alignment template loaded",
+            "Density detection · no shared template loaded",
         )
-        self.assertIn("Load one", app.status.get())
+        self.assertIn("Rerun Step 1", app.status.get())
 
     def test_loading_standalone_digital_pixel_json(self) -> None:
         app = PaintAnalysisApp.__new__(PaintAnalysisApp)
@@ -2159,7 +2223,7 @@ class DynamicRenderTests(unittest.TestCase):
         self.assertIn("largest equal-prior probability is square", app.status.get())
 
     def test_origami_acceptance_defaults_match_validated_examples(self) -> None:
-        self.assertEqual(DEFAULT_ORIGAMI_PICK_BIN_NM, 10.0)
+        self.assertEqual(DEFAULT_ORIGAMI_PICK_BIN_NM, 5.0)
         self.assertEqual(DEFAULT_ORIGAMI_MIN_DENSITY, 0.80)
         self.assertEqual(DEFAULT_ORIGAMI_MIN_POINTS, 200)
         self.assertEqual(DEFAULT_ORIGAMI_MAX_POINTS, 3000)
@@ -2439,6 +2503,44 @@ class DynamicRenderTests(unittest.TestCase):
         self.assertEqual(app.origami_zoom_render_request_id, 5)
         self.assertEqual(app.origami_zoom_render_after_id, "scheduled-render")
         app.after.assert_called_once()
+
+    def test_source_draw_refreshes_final_canvas_size_without_a_render_loop(self) -> None:
+        from matplotlib.figure import Figure
+        from matplotlib.backends.backend_agg import FigureCanvasAgg
+
+        figure = Figure(figsize=(2, 2), dpi=100)
+        canvas = FigureCanvasAgg(figure)
+        axis = figure.add_subplot(111)
+        axis.imshow(np.ones((10, 20)), extent=(0, 200, 0, 100))
+        app = SimpleNamespace(
+            origami_canvas=canvas, origami_figure=figure,
+            origami_last_rendered_plot_option="Loaded source data",
+            _current_notebook_tab_index=lambda: ORIGAMI_TAB,
+            origami_source_points_nm=np.array([[1.0, 2.0]]),
+            origami_source_draw_signature=None,
+            _schedule_origami_zoom_render=mock.Mock(),
+        )
+        canvas.mpl_connect("draw_event", lambda event: PaintAnalysisApp._on_origami_source_draw(app, event))
+        canvas.draw()
+        app._schedule_origami_zoom_render.assert_called_once_with()
+        initial = app.origami_source_draw_signature
+        # Simulate tab layout finishing after the first preview was drawn.
+        figure.set_size_inches(8, 6)
+        canvas.draw()
+        self.assertEqual(app._schedule_origami_zoom_render.call_count, 2)
+        self.assertNotEqual(initial, app.origami_source_draw_signature)
+        # Applying a sharper image must not request another identical render.
+        axis.images[0].set_data(np.ones((100, 200)))
+        canvas.draw()
+        self.assertEqual(app._schedule_origami_zoom_render.call_count, 2)
+        # A new source at the same extent still needs its own refresh.
+        app.origami_source_points_nm = np.array([[3.0, 4.0]])
+        canvas.draw()
+        self.assertEqual(app._schedule_origami_zoom_render.call_count, 3)
+        app.origami_last_rendered_plot_option = "Selected origami detail"
+        figure.set_size_inches(9, 7)
+        canvas.draw()
+        self.assertEqual(app._schedule_origami_zoom_render.call_count, 3)
 
     def test_loaded_source_switch_rerenders_from_visible_origami_viewport(self) -> None:
         app = PaintAnalysisApp.__new__(PaintAnalysisApp)

@@ -344,6 +344,98 @@ class OrigamiAnalysisTests(unittest.TestCase):
         self.assertEqual(len(baseline), 8)
         self.assertEqual(sum(len(region) == 150 for region in contaminated), 8)
 
+    def test_signal_gap_recovers_empty_and_full_origami_before_point_filter(self) -> None:
+        rng = np.random.default_rng(510)
+        for angle in (0.0, 0.6, 1.4):
+            with self.subTest(angle=angle):
+                rotation = np.array([[np.cos(angle), -np.sin(angle)],
+                                     [np.sin(angle), np.cos(angle)]])
+                ends = np.array([(x, y) for x in (-60.0, 60.0)
+                                 for y in (-15.0, 0.0, 15.0)])
+                interior = np.array([(x, y) for x in (-30.0, 0.0, 30.0)
+                                     for y in (-15.0, 0.0, 15.0)])
+                empty = np.vstack([rng.normal(site, 1.0, (20, 2)) for site in ends]) @ rotation.T
+                full = np.vstack([rng.normal(site, 1.0, (20, 2))
+                                  for site in np.vstack((ends, interior))]) @ rotation.T + (500.0, 0.0)
+                # A faint localization in the empty center must not be swept
+                # into the candidate by the larger component connection radius.
+                points = np.vstack((empty, full, [[0.0, 0.0]]))
+                settings = dict(bin_size_nm=5.0, connect_distance_nm=15.0,
+                                density_threshold=0.2, minimum_points=100)
+                baseline = pick_origami_candidates(points, **settings)
+                self.assertEqual(len(baseline[0]), 1)
+                candidates = pick_origami_candidates(
+                    points, component_connect_distance_nm=125.0, **settings)
+                self.assertEqual(sorted(map(len, candidates[0])), [120, 300])
+                labels = candidates[4]
+                self.assertEqual(set(np.unique(labels)), {-1, 0, 1})
+                self.assertTrue(np.all(candidates[2][labels >= 0] >= 0.2))
+                # Direct identification and shared/cached candidates agree.
+                direct = identify_origami_regions(
+                    points, pick_bin_size_nm=5.0, connect_distance_nm=15.0,
+                    component_connect_distance_nm=125.0, density_threshold=0.2,
+                    min_candidate_points=100, max_candidate_points=500,
+                    measure_sites=False)
+                self.assertEqual(sorted(map(len, direct.regions)), [120, 300])
+
+    def test_shared_fiducials_separate_neighbors_closer_than_the_interior_gap(self) -> None:
+        rng = np.random.default_rng(52)
+        fiducials = np.array([(x, y) for x in (-60.0, 60.0)
+                              for y in (-15.0, 0.0, 15.0)])
+        interior = np.array([(x, y) for x in (-30.0, 0.0, 30.0)
+                             for y in (-15.0, 0.0, 15.0)])
+        for arrangement in ("end-to-end", "side-by-side"):
+            for angle in (0.0, 0.6, 1.4):
+                with self.subTest(arrangement=arrangement, angle=angle):
+                    rotation = np.array([[np.cos(angle), -np.sin(angle)],
+                                         [np.sin(angle), np.cos(angle)]])
+                    groups = []
+                    for index in range(3):
+                        sites = np.vstack((fiducials, interior)) if index == 1 else fiducials
+                        center = np.array([190.0 * index, 0.0] if arrangement == "end-to-end"
+                                          else [0.0, 80.0 * index]) @ rotation.T
+                        groups.append(np.vstack([rng.normal(site, 1.0, (20, 2))
+                                                 for site in sites]) @ rotation.T + center)
+                    points = np.vstack(groups)
+                    settings = dict(bin_size_nm=5.0, connect_distance_nm=15.0,
+                                    density_threshold=0.2, minimum_points=100,
+                                    component_connect_distance_nm=125.0)
+                    merged = pick_origami_candidates(points, **settings)
+                    self.assertEqual(len(merged[0]), 1)
+                    picked = pick_origami_candidates(
+                        points, candidate_template_points_nm=fiducials, **settings)
+                    self.assertEqual(sorted(map(len, picked[0])), [120, 120, 300])
+                    # Verify identities, not just counts: each region is exactly
+                    # one original object's localizations, with no duplication.
+                    expected = {frozenset(map(tuple, group)) for group in groups}
+                    self.assertEqual({frozenset(map(tuple, region)) for region in picked[0]}, expected)
+                    self.assertEqual(set(np.unique(picked[4])), {-1, 0, 1, 2})
+                    direct = identify_origami_regions(
+                        points, pick_bin_size_nm=5.0, connect_distance_nm=15.0,
+                        density_threshold=0.2, min_candidate_points=100,
+                        max_candidate_points=400, candidate_template_points_nm=fiducials,
+                        component_connect_distance_nm=125.0, measure_sites=False)
+                    self.assertEqual({frozenset(map(tuple, region)) for region in direct.regions}, expected)
+
+    def test_shared_fiducial_detection_rejects_a_single_bright_end(self) -> None:
+        rng = np.random.default_rng(514)
+        fiducials = np.array([(x, y) for x in (-60.0, 60.0)
+                              for y in (-15.0, 0.0, 15.0)])
+        points = np.vstack([rng.normal(site, 1.0, (100, 2)) for site in fiducials[:3]])
+        picked = pick_origami_candidates(
+            points, bin_size_nm=5.0, connect_distance_nm=15.0,
+            density_threshold=0.2, minimum_points=100,
+            candidate_template_points_nm=fiducials)
+        self.assertEqual(len(picked[0]), 0)
+
+    def test_signal_gap_rejects_invalid_distances(self) -> None:
+        for gap in (0.0, -1.0, float("nan"), float("inf")):
+            with self.subTest(gap=gap), self.assertRaisesRegex(ValueError, "Signal-gap"):
+                pick_origami_candidates(
+                    np.array([[0.0, 0.0], [1.0, 1.0]]), bin_size_nm=5.0,
+                    connect_distance_nm=15.0, density_threshold=0.2,
+                    component_connect_distance_nm=gap)
+
     def test_candidate_point_minimum_is_applied_before_alignment(self) -> None:
         rng = np.random.default_rng(405)
         small = rng.normal((0.0, 0.0), 2.0, size=(40, 2))

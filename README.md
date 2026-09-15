@@ -335,18 +335,43 @@ Picklist Generator defaults use uniform 10.909 nm column and 5.714 nm row
 spacing, giving a 120 × 40 nm span between the outer site centers; the image
 margin is blank physical padding around those sites. For older images,
 set `Template pixel x / y (nm)` manually. Raster top remains physical top after
-loading, and every raster pixel retains its calibrated physical position. Avoid
+loading. Calibrated Picklist Generator images are additionally reflected across
+the y-axis (left–right, `x → −x`) to reconcile column numbering: template
+columns `c1, c2, …, c12` correspond to PAINT R1 replacements `12, 11, …, 1`.
+This reverses columns while preserving row identity; the raster-to-y-up
+conversion is a separate coordinate conversion.
+The same reflection applies to fiducials, digital-group site columns, evidence
+sites, and nonuniform column offsets; bit names and ON/OFF states stay the same.
+Uncalibrated custom images retain their left–right orientation.
+After updating from the earlier convention, reload the detection template,
+Step 3 digital-group JSON, and classification templates, then rerun from Step 1.
+Avoid
 labels, scale bars, and unrelated decorations because every
 visible feature participates in correlation. Image resolution is not itself a
 physical calibration. Custom
 templates use extra thumbnail canvas so off-center signal, including an L whose
 localization median lies near its elbow, is not cropped before pose fitting.
 
-The Identify workflow has five ordered checkpoints. `Run Step 1`
-builds the coarse connected components, removes components below the configured
-minimum point limit as background noise, and opens their density/component map.
-Step 2 loads one calibrated alignment image such as `L_L.png`, fits it once per
-candidate, locks rotation and translation, and displays every fitted pose. Step 3
+The Identify workflow has five ordered checkpoints. Step 1 contains all detection inputs:
+load a calibrated shared fiducial image with **Load Detection Template**, review
+the displayed calibration, and set the bin size, density threshold, recovery
+distance, and minimum point count. **Run Step 1** detects bounded candidates from
+the fiducials and opens their density/component map. **Clear Template · Use
+Density Detection** selects the connected-bin fallback and enables Signal gap.
+Changing the template or detection settings requires rerunning Step 1. Each connected active-bin cluster
+(the blue outline) belongs to at most one candidate. Template-guided detection
+can group disconnected fiducials into one candidate, but cannot split or reuse
+a connected cluster for several fits. It retains the whole cluster as the
+alignment input, including signal outside the initial template proposal.
+Step 2 reuses the template selected in Step 1, fits it once per candidate, locks rotation and translation, and displays every fitted pose. **Max overlap (%)** in Step 2 sets the permitted intersection as a percentage
+of the smaller active footprint. It defaults to **0%** (reject any overlap);
+100% allows all overlaps. Both fits are rejected above the threshold, even if
+their individual correlations pass. The
+check uses the rotated rectangles and excludes image margins. Rejections remain
+in effect during classification and are labeled as overlapping footprints.
+This detects overlap between recovered fits; a superposition represented by only
+one recovered candidate can still escape this check. Rerun Step 2 and subsequent
+steps to apply the overlap check to previously fitted candidates. Step 3
 loads one standalone Picklist Generator logical-bit JSON, measures physical sites
 on the locked candidates, and converts their evidence into the shared digital
 pixel groups. Step 4 loads two or more classification template images; their JSON
@@ -560,8 +585,22 @@ the displayed points; click `Load Source Data` again to refresh them.
 
 For a 3-by-4 design, set rows to `3`, columns to `4`, and enter the actual
 x/y docking-site spacing. `Pick bin size` controls the coarse detection grid.
-`Connect distance` should be large enough to connect occupied bins across one
-origami but smaller than the separation between origamis. During overlay,
+`Connect distance` controls how far to recover localizations around bright bins.
+With a calibrated **shared alignment template** loaded in Step 1, detection searches
+for the template's bright fiducials at different positions and rotations. Each
+connected coarse cluster can contribute to only one candidate. Interior darkness is neutral, so full and
+empty-center origami use the same detection geometry. Nearby objects are not
+joined by a chain of bright bins. The coarse search requires support near at
+least 70% of the fiducial sites; later alignment and classification still apply.
+Load the shared fiducial template and rerun Step 1 after changing it.
+
+Without a shared alignment template, `Signal gap` joins connected bright bins
+before the minimum candidate-point filter. Large values can merge neighboring
+origami, so this fallback is unsuitable when inter-object gaps are smaller than
+an empty interior. Both distance controls default to 20 nm. `Signal gap` is
+ignored by shared-fiducial detection. Both detection modes apply to Step 1,
+shared multi-template candidates, and tiled analysis, and retain the minimum
+density and total candidate-point limits. During overlay,
 Picasso G5M is run separately on every accepted origami. This is Picasso's
 Gaussian Mixture Modeling with Modifications for Molecular Mapping method; the
 installed Picasso package does not contain a separate algorithm named D5M.
@@ -668,7 +707,7 @@ in **Step 2 · Fit and Inspect**, then rerun Step 2 and subsequent steps. This
 removes the corner requirement from both alignment and final acceptance. Other
 fit criteria still apply. **Show corner support diagnostics** remains independent;
 its labels say `gate off` when corner counts are only informational. The corner
-requirement is enabled by default.
+requirement is disabled by default.
 
 After exact lookup, **Show theoretical overlay** also draws unclassified objects
 as grey hollow site markers at their locked fitted poses. These markers represent
@@ -686,3 +725,9 @@ analysis clips partial edge tiles to the saved region; limited and random runs
 use only fully fitting tiles. Older default-named ROI exports use the same
 inferred bounds as their initial map view. Empty tiles inside the saved region
 can still occur and are skipped.
+
+Classification diagnostics attribute a rejected candidate to a template only
+when that template has a unique, finite best score. Candidates with no matching
+template and tied/ambiguous candidates are counted separately above the plots;
+they do not enter template-specific rejection bars or pass rates. Older recorded
+no-match diagnoses are also excluded from the last template's rejection count.

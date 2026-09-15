@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import math
 from functools import lru_cache
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Callable, Sequence
 
 import numpy as np
@@ -92,6 +92,7 @@ class OrigamiPickResult:
     alignment_canvas_side_nm: float
     alignment_reference_image: np.ndarray
     alignment_candidate_images: np.ndarray
+    footprint_overlap_fraction: np.ndarray = field(default_factory=lambda: np.empty(0, dtype=float))
 
     @property
     def accepted_regions(self) -> list[np.ndarray]:
@@ -194,6 +195,10 @@ def concatenate_origami_pick_results(results: list[OrigamiPickResult]) -> Origam
         alignment_canvas_side_nm=float(first.alignment_canvas_side_nm),
         alignment_reference_image=np.asarray(first.alignment_reference_image).copy(),
         alignment_candidate_images=concatenate("alignment_candidate_images"),
+        footprint_overlap_fraction=np.concatenate([
+            result.footprint_overlap_fraction if len(result.footprint_overlap_fraction) == len(result.regions)
+            else np.zeros(len(result.regions)) for result in results
+        ]),
     )
 
 
@@ -2023,6 +2028,119 @@ def _regular_grid_active_components(
     return output, int(component_count)
 
 
+def _pick_template_supported_regions(
+    points_nm: np.ndarray,
+    density: np.ndarray,
+    contrast: np.ndarray,
+    extent: tuple[float, float, float, float],
+    *,
+    template_points_nm: np.ndarray,
+    bin_size_nm: float,
+    connect_distance_nm: float,
+    density_threshold: float,
+    minimum_points: int,
+    progress_callback: Callable[[float, str], None] | None,
+) -> tuple[list[np.ndarray], np.ndarray, np.ndarray, tuple[float, float, float, float], np.ndarray]:
+    """Find bounded poses from shared bright fiducials, without connecting objects.
+
+    Each expected site votes equally, so interior data cannot outweigh a sparse
+    fiducial pattern. Empty template space is neutral. Each connected active-bin
+    cluster belongs to at most one candidate, even when several poses fit it.
+    """
+    sites = np.asarray(template_points_nm, dtype=float)
+    if sites.ndim != 2 or sites.shape[1] != 2 or len(sites) < 2 or not np.all(np.isfinite(sites)):
+        raise ValueError("Candidate template must contain at least two finite x/y sites.")
+    sites = sites - (np.min(sites, axis=0) + np.max(sites, axis=0)) / 2.0
+    if np.max(np.ptp(sites, axis=0)) <= 0.0:
+        raise ValueError("Candidate template sites must span a nonzero distance.")
+    active = (contrast >= density_threshold) & (density > 0.0)
+    labels = np.full(contrast.shape, -1, dtype=np.int32)
+    active_indices = np.argwhere(active)
+    if not len(active_indices):
+        return [], density, contrast, extent, labels
+    origin = np.array([extent[0], extent[2]]) + bin_size_nm / 2.0
+    cells = origin + active_indices * bin_size_nm
+    cell_tree = cKDTree(cells)
+    # Tolerate the coarse raster and angle quantization, but never fill the
+    # interior or grow components across the fiducial separation.
+    supported = maximum_filter(active.astype(float), size=3, mode="constant")
+    best_score = np.full(contrast.shape, -np.inf)
+    best_angle = np.zeros(contrast.shape)
+    radius_bins = int(np.ceil(np.max(np.linalg.norm(sites, axis=1)) / bin_size_nm)) + 1
+    kernel_shape = (2 * radius_bins + 1,) * 2
+    for angle_index, degrees in enumerate(range(0, 360, 5)):
+        angle = np.deg2rad(degrees)
+        rotation = np.array([[np.cos(angle), -np.sin(angle)], [np.sin(angle), np.cos(angle)]])
+        offsets = np.rint(sites @ rotation.T / bin_size_nm).astype(int)
+        kernel = np.zeros(kernel_shape)
+        np.add.at(kernel, (offsets[:, 0] + radius_bins, offsets[:, 1] + radius_bins), 1.0 / len(sites))
+        kernel = kernel[::-1, ::-1]
+        coverage = fftconvolve(supported, kernel, mode="same")
+        score = fftconvolve(contrast, kernel, mode="same")
+        # Require support at a majority of the fiducials, preventing one
+        # isolated bright end from becoming a complete candidate.
+        score[coverage < 0.7] = -np.inf
+        better = score > best_score
+        best_score[better] = score[better]
+        best_angle[better] = angle
+        if progress_callback is not None and angle_index % 12 == 0:
+            progress_callback(25.0 + 50.0 * angle_index / 72.0, "Searching bounded fiducial poses…")
+    peak_mask = np.isfinite(best_score) & (best_score >= maximum_filter(best_score, size=3))
+    peaks = np.argwhere(peak_mask)
+    ranking = np.argsort(-best_score[peak_mask], kind="stable")
+    point_tree = cKDTree(points_nm)
+    recovery_distance, nearest_cell = cell_tree.query(points_nm)
+    coarse_labels, coarse_count = label(active, structure=np.ones((3, 3), dtype=int))
+    cell_clusters = coarse_labels[tuple(active_indices.T)] - 1
+    point_clusters = cell_clusters[nearest_cell]
+    recoverable = np.flatnonzero(recovery_distance <= connect_distance_nm)
+    order = recoverable[np.argsort(point_clusters[recoverable], kind="stable")]
+    splits = np.flatnonzero(np.diff(point_clusters[order])) + 1
+    cluster_points = {
+        int(point_clusters[group[0]]): group
+        for group in np.split(order, splits) if len(group)
+    }
+    cluster_owners = np.full(coarse_count, -1, dtype=int)
+    half_size = np.ptp(sites, axis=0) / 2.0 + connect_distance_nm
+    search_radius = float(np.linalg.norm(half_size))
+    regions = []
+    for peak in peaks[ranking]:
+        center = origin + peak * bin_size_nm
+        angle = best_angle[tuple(peak)]
+        rotation = np.array([[np.cos(angle), -np.sin(angle)], [np.sin(angle), np.cos(angle)]])
+        predicted = sites @ rotation.T + center
+        support_groups = cell_tree.query_ball_point(predicted, r=2.0 * bin_size_nm)
+        support = np.unique([index for group in support_groups for index in group]).astype(int)
+        if not len(support) or np.any(cluster_owners[cell_clusters[support]] >= 0):
+            continue
+        indices = np.asarray(point_tree.query_ball_point(center, search_radius), dtype=int)
+        local = (points_nm[indices] - center) @ rotation
+        keep = (np.all(np.abs(local) <= half_size, axis=1)
+                & (recovery_distance[indices] <= connect_distance_nm))
+        indices = indices[keep]
+        if not len(indices):
+            continue
+        clusters = np.unique(np.concatenate((point_clusters[indices], cell_clusters[support])))
+        if np.any(cluster_owners[clusters] >= 0):
+            continue
+        # Preserve whole coarse clusters for alignment and its quality checks.
+        # Cropping the first pose must not leave a second candidate in the same
+        # blue contour, or hide the original size of an aggregate.
+        groups = [cluster_points[int(cluster)] for cluster in clusters if int(cluster) in cluster_points]
+        if not groups:
+            continue
+        indices = np.concatenate(groups)
+        if len(indices) < minimum_points:
+            continue
+        region_index = len(regions)
+        regions.append(points_nm[indices])
+        cluster_owners[clusters] = region_index
+    labels[tuple(active_indices.T)] = cluster_owners[cell_clusters]
+    if progress_callback is not None:
+        progress_callback(100.0, f"Recovered {len(regions):,} bounded fiducial candidates.")
+    return regions, density, contrast, extent, labels
+
+
 def _pick_origami_regions(
     points_nm: np.ndarray,
     bin_size_nm: float,
@@ -2033,6 +2151,10 @@ def _pick_origami_regions(
     progress_callback: Callable[[float, str], None] | None = None,
 ) -> tuple[list[np.ndarray], np.ndarray, np.ndarray, tuple[float, float, float, float], np.ndarray]:
     """Connect supported bins, then recover original points near each object."""
+    if component_connect_distance_nm is not None and (
+        not np.isfinite(component_connect_distance_nm) or component_connect_distance_nm <= 0.0
+    ):
+        raise ValueError("Signal-gap distance must be finite and positive.")
     density, contrast, extent, x_edges, y_edges = density_map_for_origami_picking(points_nm, bin_size_nm)
     component_labels = np.full(contrast.shape, -1, dtype=np.int32)
     active_indices = np.argwhere(contrast >= density_threshold)
@@ -2104,9 +2226,16 @@ def pick_origami_candidates(
     connect_distance_nm: float,
     density_threshold: float,
     minimum_points: int = 1,
+    component_connect_distance_nm: float | None = None,
+    candidate_template_points_nm: np.ndarray | None = None,
     progress_callback: Callable[[float, str], None] | None = None,
 ) -> tuple[list[np.ndarray], np.ndarray, np.ndarray, tuple[float, float, float, float], np.ndarray]:
-    """Generate physical candidates, omitting components that cannot meet a point minimum."""
+    """Join density-supported signal before applying the localization minimum.
+
+    With candidate_template_points_nm, search bounded poses of shared fiducials
+    and ignore component joining. Otherwise component_connect_distance_nm bridges
+    connected regions. connect_distance_nm bounds localization recovery.
+    """
     points = np.asarray(points_nm, dtype=float)
     if points.ndim != 2 or points.shape[1] != 2:
         raise ValueError("Origami candidate generation requires an N x 2 coordinate array.")
@@ -2121,12 +2250,21 @@ def pick_origami_candidates(
         raise ValueError("Minimum candidate points must be at least one.")
     if progress_callback is not None:
         progress_callback(5.0, "Binning source points for coarse candidate detection…")
+    if candidate_template_points_nm is not None:
+        density, contrast, extent, _x_edges, _y_edges = density_map_for_origami_picking(points, bin_size_nm)
+        return _pick_template_supported_regions(
+            points, density, contrast, extent,
+            template_points_nm=candidate_template_points_nm,
+            bin_size_nm=bin_size_nm, connect_distance_nm=connect_distance_nm,
+            density_threshold=density_threshold, minimum_points=minimum_points,
+            progress_callback=progress_callback,
+        )
     candidates = _pick_origami_regions(
         points,
         float(bin_size_nm),
         float(connect_distance_nm),
         float(density_threshold),
-        component_connect_distance_nm=None,
+        component_connect_distance_nm=component_connect_distance_nm,
         progress_callback=(
             (lambda percent, message: progress_callback(5.0 + 0.8 * percent, message))
             if progress_callback is not None
@@ -3966,6 +4104,81 @@ def _align_regions_by_image_correlation(
     return aligned_regions, centers, np.asarray(corners), reported_angles, correlations, pixel_nm, template
 
 
+def fitted_footprint_overlap_fractions(
+    corners_nm: np.ndarray,
+    *,
+    margin_nm: float = 0.0,
+    eligible: np.ndarray | None = None,
+) -> np.ndarray:
+    """Largest intersection / smaller active-footprint area for each fit.
+
+    Remove image padding before testing. Intersect rotated rectangles exactly;
+    overlapping axis-aligned bounding boxes alone do not imply overlapping fits.
+    """
+    corners = np.asarray(corners_nm, dtype=float)
+    if not corners.size:
+        return np.zeros(0)
+    if corners.ndim != 3 or corners.shape[1:] != (4, 2):
+        raise ValueError("Footprints must have shape N x 4 x 2.")
+    centers = corners.mean(axis=1)
+    u = corners[:, 1] - corners[:, 0]
+    v = corners[:, 3] - corners[:, 0]
+    widths, heights = np.linalg.norm(u, axis=1), np.linalg.norm(v, axis=1)
+    active_widths = np.maximum(0.0, widths - 2.0 * margin_nm)
+    active_heights = np.maximum(0.0, heights - 2.0 * margin_nm)
+    valid = np.all(np.isfinite(corners), axis=(1, 2)) & (active_widths > 0) & (active_heights > 0)
+    if eligible is not None:
+        valid &= np.asarray(eligible, dtype=bool)
+    result = np.zeros(len(corners))
+    indices = np.flatnonzero(valid)
+    if len(indices) < 2:
+        return result
+    half_u = u[indices] / widths[indices, None] * active_widths[indices, None] / 2.0
+    half_v = v[indices] / heights[indices, None] * active_heights[indices, None] / 2.0
+    centers = centers[indices]
+    polygons = np.stack((centers-half_u-half_v, centers+half_u-half_v,
+                         centers+half_u+half_v, centers-half_u+half_v), axis=1)
+    areas = active_widths[indices] * active_heights[indices]
+    radii = np.linalg.norm(half_u + half_v, axis=1)
+    tree = cKDTree(centers)
+    maximum_radius = float(np.max(radii))
+
+    def cross(a: np.ndarray, b: np.ndarray) -> float:
+        return float(a[0] * b[1] - a[1] * b[0])
+
+    for first, center in enumerate(centers):
+        for second in tree.query_ball_point(center, radii[first] + maximum_radius):
+            if second <= first or np.linalg.norm(center-centers[second]) >= radii[first]+radii[second]:
+                continue
+            polygon = list(polygons[first])
+            clip = polygons[second]
+            winding = 1.0 if cross(clip[1]-clip[0], clip[3]-clip[0]) >= 0 else -1.0
+            for start, end in zip(clip, np.roll(clip, -1, axis=0)):
+                if not polygon:
+                    break
+                output = []
+                previous = polygon[-1]
+                previous_side = winding * cross(end-start, previous-start)
+                for current in polygon:
+                    current_side = winding * cross(end-start, current-start)
+                    if (current_side >= 0) != (previous_side >= 0):
+                        output.append(previous + (current-previous) * previous_side / (previous_side-current_side))
+                    if current_side >= 0:
+                        output.append(current)
+                    previous, previous_side = current, current_side
+                polygon = output
+            if len(polygon) < 3:
+                continue
+            vertices = np.asarray(polygon) - center
+            intersection = abs(sum(cross(a, b) for a, b in zip(vertices, np.roll(vertices, -1, axis=0)))) / 2.0
+            fraction = float(np.clip(intersection / min(areas[first], areas[second]), 0, 1))
+            if fraction < 1e-12:
+                fraction = 0.0  # Ignore floating-point slivers at touching edges.
+            result[indices[first]] = max(result[indices[first]], fraction)
+            result[indices[second]] = max(result[indices[second]], fraction)
+    return result
+
+
 def identify_origami_regions(
     points_nm: np.ndarray,
     *,
@@ -3974,6 +4187,8 @@ def identify_origami_regions(
     density_threshold: float,
     min_candidate_points: int,
     max_candidate_points: int,
+    component_connect_distance_nm: float | None = None,
+    candidate_template_points_nm: np.ndarray | None = None,
     rows: int | None = None,
     columns: int | None = None,
     spacing_x_nm: float | None = None,
@@ -3986,6 +4201,7 @@ def identify_origami_regions(
     site_match_radius_nm: float = 7.5,
     min_rectangle_confidence: float = 0.40,
     use_correlation_gate: bool = True,
+    require_corner_support: bool = False,
     site_mask_radius_nm: float = 7.5,
     min_supported_sites: int = 0,
     min_site_evidence: float = 0.10,
@@ -3993,6 +4209,7 @@ def identify_origami_regions(
     min_supported_rows: int = 0,
     min_supported_columns: int = 0,
     max_site_spacing_error_nm: float = float("inf"),
+    max_footprint_overlap_fraction: float = 0.0,
     alignment_pixel_nm: float = 1.0,
     alignment_max_patch_pixels: int = 128,
     alignment_iterations: int = 3,
@@ -4012,6 +4229,8 @@ def identify_origami_regions(
     ] | None = None,
     candidate_image_cache: dict[tuple[object, ...], tuple[object, ...]] | None = None,
 ) -> OrigamiPickResult:
+    if not 0.0 <= max_footprint_overlap_fraction <= 1.0:
+        raise ValueError("Maximum footprint overlap must be between 0 and 1.")
     points_nm = np.asarray(points_nm, dtype=float)
     if points_nm.ndim != 2 or points_nm.shape[1] != 2:
         raise ValueError("Origami identification requires an N x 2 coordinate array.")
@@ -4044,9 +4263,9 @@ def identify_origami_regions(
 
     if progress_callback:
         progress_callback(2.0, "Building the spatial density map...")
-    component_connect_distance_nm = None
     if (
-        alignment_template_image is not None
+        component_connect_distance_nm is None
+        and alignment_template_image is not None
         and spacing_x_nm is not None
         and spacing_y_nm is not None
     ):
@@ -4060,11 +4279,13 @@ def identify_origami_regions(
             + math.sqrt(2.0) * float(pick_bin_size_nm)
         )
     if precomputed_candidates is None:
-        raw_candidates = _pick_origami_regions(
+        raw_candidates = pick_origami_candidates(
             points_nm,
-            pick_bin_size_nm,
-            connect_distance_nm,
-            density_threshold,
+            bin_size_nm=pick_bin_size_nm,
+            connect_distance_nm=connect_distance_nm,
+            density_threshold=density_threshold,
+            candidate_template_points_nm=candidate_template_points_nm,
+            minimum_points=min_candidate_points if candidate_template_points_nm is not None else 1,
             component_connect_distance_nm=component_connect_distance_nm,
             progress_callback=(
                 (lambda percent, message: progress_callback(2.0 + 0.1 * percent, message))
@@ -4322,9 +4543,13 @@ def identify_origami_regions(
         & (supported_column_counts >= min_supported_columns)
         & (site_spacing_max_errors <= max_site_spacing_error_nm)
     )
-    if alignment_template_image is not None:
+    if require_corner_support and alignment_template_image is not None:
         corner_counts = alignment_corner_counts(aligned_regions, grid, site_mask_radius_nm)
         accepted_mask &= np.all(corner_counts >= min_site_localizations, axis=1)
+    footprint_overlap_fraction = fitted_footprint_overlap_fractions(
+        np.asarray(rectangle_corners), margin_nm=rectangle_margin_nm, eligible=accepted_mask,
+    )
+    accepted_mask &= footprint_overlap_fraction <= max_footprint_overlap_fraction
     bounds = np.asarray(
         [
             [
@@ -4383,6 +4608,7 @@ def identify_origami_regions(
         ),
         alignment_reference_image=reference,
         alignment_candidate_images=np.asarray(aligned_candidate_images, dtype=np.float32),
+        footprint_overlap_fraction=footprint_overlap_fraction,
     )
     if progress_callback:
         progress_callback(
