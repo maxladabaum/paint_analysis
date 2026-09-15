@@ -1272,6 +1272,7 @@ def classify_template_candidates(
     match_distance_nm: float,
     deduplication_distance_nm: float | None = None,
     minimum_winner_probability: float | None = None,
+    require_unique_match: bool = False,
 ) -> TemplateClassificationResult:
     """Match duplicate detections across templates and select one accepted fit per object."""
     template_count = len(candidate_centers_by_template)
@@ -1379,7 +1380,7 @@ def classify_template_candidates(
             for template_index, candidate_index in group.items()
             if bool(accepted_masks[template_index][candidate_index])
         ]
-        if not passing:
+        if not passing or (require_unique_match and len(passing) != 1):
             continue
         _score, template_index, candidate_index = max(passing)
         # This probability is normalized across every loaded template with
@@ -2315,15 +2316,20 @@ def _render_candidate_image(
     return image / norm if norm > 0 else image
 
 
-def alignment_corner_counts(regions, template_points_nm, radius_nm):
-    """Count support at template marks nearest each bounding-box corner."""
+def alignment_corner_sites(template_points_nm):
+    """Return the exact unique marks required by the corner-support gate."""
     sites = np.asarray(template_points_nm, dtype=float).reshape(-1, 2)
     if not len(sites):
-        return np.empty((len(regions), 0), dtype=int)
+        return np.empty((0, 2), dtype=float)
     low, high = sites.min(axis=0), sites.max(axis=0)
     corners = np.asarray([low, [high[0], low[1]], high, [low[0], high[1]]])
     indices = np.unique(cKDTree(sites).query(corners)[1])
-    required = sites[indices]
+    return sites[indices]
+
+
+def alignment_corner_counts(regions, template_points_nm, radius_nm):
+    """Count support at template marks nearest each bounding-box corner."""
+    required = alignment_corner_sites(template_points_nm)
     counts = np.zeros((len(regions), len(required)), dtype=int)
     for index, points in enumerate(regions):
         if len(points):

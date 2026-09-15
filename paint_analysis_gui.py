@@ -8,6 +8,7 @@ import queue
 import re
 import sys
 import threading
+import tempfile
 import traceback
 import gc
 from dataclasses import dataclass, replace
@@ -39,6 +40,7 @@ from origami_analysis import (
     OrigamiAnalysisResult,
     OrigamiPickResult,
     alignment_corner_counts,
+    alignment_corner_sites,
     alignment_dark_boundary,
     align_picked_origamis,
     bidirectional_template_classification_scores,
@@ -110,6 +112,7 @@ ORIGAMI_ALIGNMENT_CACHE_KEYS = (
     "column_offsets_nm",
     "min_rectangle_confidence",
     "use_correlation_gate",
+    "require_corner_support",
     "alignment_pixel_nm",
     "alignment_max_patch_pixels",
     "alignment_iterations",
@@ -1031,8 +1034,86 @@ def logical_bit_model_from_metadata(metadata: dict[str, Any]) -> dict[str, Any] 
 logical_stroke_model_from_metadata = logical_bit_model_from_metadata
 
 
+def exact_digital_template_matches(params: dict[str, Any], candidate_count: int) -> np.ndarray:
+    """Match the measured Step 3 ON/OFF states by bit ID, with no nearest fallback."""
+    model = params["logical_model"]
+    bit_ids = tuple(str(value) for value in params.get("digital_pixel_ids", ()))
+    template_ids = tuple(str(value) for value in model["bit_ids"])
+    if (not bit_ids or len(set(bit_ids)) != len(bit_ids)
+            or len(set(template_ids)) != len(template_ids) or set(bit_ids) != set(template_ids)):
+        raise ValueError("Classification templates must define exactly the measured digital-pixel IDs.")
+    shape = (candidate_count, len(bit_ids))
+    arrays = []
+    for key in ("digital_pixel_probabilities", "digital_group_localization_evidence", "digital_group_prominences"):
+        values = np.asarray(params.get(key, ()), dtype=float)
+        if candidate_count == 0 and values.size == 0:
+            values = np.empty(shape)
+        if values.shape != shape:
+            raise ValueError("Digital-pixel measurements are missing or stale. Run Step 3 again.")
+        arrays.append(values)
+    probabilities, evidence, prominence = arrays
+    valid = np.logical_and.reduce([np.isfinite(values).all(axis=1) for values in arrays])
+    states = ((probabilities >= 0.5)
+              & (evidence >= float(params.get("min_site_localizations", 0)))
+              & (prominence >= float(params.get("min_site_evidence", 0))))
+    expected = np.asarray(model["active_bits"], dtype=bool)
+    if expected.shape != (len(template_ids),):
+        raise ValueError("Classification template must specify one ON/OFF state per digital pixel.")
+    expected = expected[[template_ids.index(bit_id) for bit_id in bit_ids]]
+    matches = valid & np.all(states == expected, axis=1)
+    params["classification_observed_digital_states"] = tuple(tuple(bool(v) for v in row) for row in states)
+    params["classification_expected_digital_states"] = tuple(bool(v) for v in expected)
+    params["classification_exact_digital_match"] = tuple(bool(v) for v in matches)
+    return matches
+
+
+def unclassified_theoretical_points(picks, params, index):
+    """Place measured ON groups and alignment sites at the saved fitted pose."""
+    model = params.get("digital_pixel_model") or params.get("logical_model")
+    states = params.get("classification_observed_digital_states", ())
+    if not isinstance(model, dict) or index >= len(states):
+        return np.empty((0, 2), dtype=float)
+    bit_ids = tuple(params.get("digital_pixel_ids", ()))
+    model_ids = tuple(model.get("bit_ids", ()))
+    if set(bit_ids) != set(model_ids) or len(states[index]) != len(bit_ids):
+        return np.empty((0, 2), dtype=float)
+    observed_model = dict(model)
+    observed_model["active_bits"] = tuple(states[index][bit_ids.index(bit)] for bit in model_ids)
+    overlay_params = dict(params, logical_model=observed_model)
+    grid = np.asarray(picks.template_points_nm, dtype=float)
+    rows, columns = observed_model.get("physical_shape", (0, 0))
+    if len(grid) == int(rows) * int(columns):
+        points = grid[classified_template_overlay_indices(grid, overlay_params)]
+    else:
+        points = classified_template_overlay_points(grid, overlay_params)
+    return theoretical_grid_in_footprint(points, picks.rectangle_corners_nm[index])
+
+
+def draw_unclassified_theoretical_overlay(axis, details, maximum_candidates=500):
+    """Draw visible unclassified overlays with bounded overview rendering cost."""
+    x0, x1 = sorted(axis.get_xlim())
+    y0, y1 = sorted(axis.get_ylim())
+    visible = []
+    for detail in details:
+        points = np.asarray(detail.get("theoretical_points_nm", ()), dtype=float).reshape(-1, 2)
+        if not len(points) or not np.isfinite(points).all():
+            continue
+        if points[:, 0].max() < x0 or points[:, 0].min() > x1 or points[:, 1].max() < y0 or points[:, 1].min() > y1:
+            continue
+        visible.append(points)
+    if not visible:
+        return []
+    indices = np.linspace(0, len(visible) - 1, min(len(visible), maximum_candidates), dtype=int)
+    points = np.vstack([visible[index] for index in indices])
+    artist = axis.scatter(points[:, 0], points[:, 1], s=22, facecolors="none",
+                          edgecolors="#9ca3af", linewidths=.8, zorder=5,
+                          label="Unclassified theoretical sites")
+    artist.set_in_layout(False)
+    return [artist]
+
+
 def required_corner_mask(picks, params, index=None):
-    if params.get("alignment_template_image") is None:
+    if not bool(params.get("require_corner_support", True)) or params.get("alignment_template_image") is None:
         return np.ones(len(picks.point_counts) if index is None else 1, dtype=bool)
     regions = picks.aligned_regions if index is None else [picks.aligned_regions[index]]
     counts = alignment_corner_counts(
@@ -1040,6 +1121,38 @@ def required_corner_mask(picks, params, index=None):
         float(params.get("site_mask_radius_nm", DEFAULT_ORIGAMI_SITE_MASK_RADIUS_NM)),
     )
     return np.all(counts >= int(params.get("min_site_localizations", DEFAULT_ORIGAMI_MIN_SITE_LOCALIZATIONS)), axis=1)
+
+
+def draw_corner_support_diagnostics(axis, picks, params, index, *, world_coordinates=True):
+    """Display the same marks and cropped-point counts used by the acceptance gate."""
+    if params.get("alignment_template_image") is None:
+        return []
+    template_points = alignment_template_overlay_points(picks.template_points_nm, params)
+    sites = alignment_corner_sites(template_points)
+    radius = float(params.get("site_mask_radius_nm", DEFAULT_ORIGAMI_SITE_MASK_RADIUS_NM))
+    minimum = int(params.get("min_site_localizations", DEFAULT_ORIGAMI_MIN_SITE_LOCALIZATIONS))
+    counts = alignment_corner_counts([picks.aligned_regions[index]], template_points, radius)[0]
+    positions = theoretical_grid_in_footprint(sites, picks.rectangle_corners_nm[index]) if world_coordinates else sites
+    artists = []
+    for number, (position, count) in enumerate(zip(positions, counts), start=1):
+        passed = count >= minimum
+        color = "#84cc16" if passed else "#ff3b30"
+        circle = matplotlib.patches.Circle(position, radius, fill=False, edgecolor=color,
+                                            linewidth=1.4, zorder=12)
+        axis.add_patch(circle)
+        artists.append(circle)
+        artists.extend(axis.plot(*position, marker="+", color=color, markersize=7,
+                                 linestyle="none", zorder=13))
+        label = axis.annotate(
+            f"C{number}: {count}/{minimum} {'PASS' if passed else 'FAIL'}"
+            + (" (gate off)" if not params.get("require_corner_support", True) else ""),
+            xy=position, xytext=(6, 7), textcoords="offset points", color=color,
+            fontsize=7, clip_on=True, zorder=14,
+            bbox={"facecolor": "#111827", "edgecolor": "none", "alpha": 0.8},
+        )
+        label.set_in_layout(False)
+        artists.append(label)
+    return artists
 
 
 def draw_alignment_dark_boundary(axis, picks, transform=None):
@@ -1359,6 +1472,10 @@ def load_development_session_cache(
                 cached_map["image"] = np.asarray(map_group["image"], dtype=float)
                 cached_map["source_path"] = source_path
                 cached_map["restored_from_cache"] = True
+            roi_viewport = roi_file_viewport_nm(loaded)
+            if (cached_map is not None and roi_viewport is not None
+                    and not np.allclose(cached_map["extent"], roi_viewport)):
+                cached_map = None
             return {
                 "loaded": loaded,
                 "locs": pd.DataFrame.from_records(np.asarray(handle["corrected_locs"])),
@@ -1502,6 +1619,26 @@ def picasso_info_from_metadata(metadata: dict[str, Any], locs: pd.DataFrame) -> 
     height = int(metadata.get("Height") or math.ceil(float(np.nanmax(locs["y"]) + 1)))
     pixelsize = float(metadata.get("Pixelsize") or DEFAULT_PIXEL_SIZE_NM)
     return [{"Frames": frames, "Width": width, "Height": height, "Pixelsize": pixelsize}]
+
+
+def roi_file_viewport_nm(loaded: LoadedData) -> tuple[float, float, float, float] | None:
+    """Restore exported ROI bounds, including older exports without bounds metadata."""
+    bounds = loaded.metadata.get("ROI bounds (nm)")
+    if bounds is not None:
+        values = np.asarray(bounds, dtype=float)
+        if values.shape == (4,) and np.isfinite(values).all() and values[0] < values[1] and values[2] < values[3]:
+            return tuple(float(value) for value in values)
+    # Earlier versions wrote only acquisition dimensions. Their default export
+    # names identify the subset; derive its occupied extent once when loading.
+    if loaded.path.stem.casefold().endswith(("_raw_roi", "_corrected_roi")) and not loaded.locs.empty:
+        pixel = float(loaded.info[0]["Pixelsize"])
+        x0, x1 = float(loaded.locs["x"].min()) * pixel, float(loaded.locs["x"].max()) * pixel
+        y0, y1 = float(loaded.locs["y"].min()) * pixel, float(loaded.locs["y"].max()) * pixel
+        pad = max(pixel, .01 * max(x1 - x0, y1 - y0))
+        bounds = (x0 - pad, x1 + pad, y0 - pad, y1 + pad)
+        loaded.metadata["ROI bounds (nm)"] = list(bounds)
+        return bounds
+    return None
 
 
 def finalize_loaded_locs(path: Path, locs: pd.DataFrame, metadata: dict[str, Any]) -> LoadedData:
@@ -1693,6 +1830,110 @@ def read_locs_csv(
     if converted:
         metadata["CSV nm-to-pixel conversion"] = f"{pixelsize:g} nm/pixel ({', '.join(converted)})"
     return finalize_loaded_locs(path, locs, metadata)
+
+
+def export_roi_localizations_csv(
+    loaded: LoadedData,
+    destination: Path,
+    roi_nm: tuple[float, float, float, float],
+    corrected_locs: pd.DataFrame | None = None,
+    progress_callback: Callable[[str], None] | None = None,
+    chunk_size: int = 100_000,
+) -> int:
+    """Stream original CSV fields, replacing only corrected coordinate columns.
+
+    Source rows are matched to the finite loaded rows in order, including when
+    a development cache has reset their DataFrame index.
+    """
+    destination = Path(destination)
+    if (destination.resolve() == loaded.path.resolve()
+            or (destination.exists() and destination.samefile(loaded.path))):
+        raise ValueError("Choose a new CSV file; the source cannot be overwritten.")
+    if roi_nm is None or not np.isfinite(roi_nm).all():
+        raise ValueError("Select a finite rectangular ROI before exporting.")
+    pixelsize = float(loaded.info[0]["Pixelsize"])
+    locs = loaded.locs if corrected_locs is None else corrected_locs
+    if len(locs) != len(loaded.locs):
+        raise ValueError("Corrected and raw localization row counts must match.")
+    x0, x1 = sorted(roi_nm[:2])
+    y0, y1 = sorted(roi_nm[2:])
+    if x0 == x1 or y0 == y1:
+        raise ValueError("The ROI must have positive width and height.")
+    count = 0
+    offset = 0
+    temporary_path = None
+    chunks = None
+    try:
+        with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", newline="",
+                                         dir=destination.parent, suffix=".csv", delete=False) as output:
+            temporary_path = Path(output.name)
+            if loaded.path.suffix.casefold() == ".csv":
+                header = pd.read_csv(loaded.path, nrows=0)
+                mapped = {}
+                for name in header.columns:
+                    alias = CSV_COLUMN_ALIASES.get(normalized_csv_column(str(name)))
+                    if alias is not None and alias[0] not in mapped:
+                        mapped[alias[0]] = (name, alias[1])
+                header.to_csv(output, index=False)
+                chunks = pd.read_csv(loaded.path, dtype=str, keep_default_na=False, chunksize=chunk_size)
+            else:
+                mapped = {}
+                locs.iloc[:0].to_csv(output, index=False)
+                chunks = (locs.iloc[start:start + chunk_size] for start in range(0, len(locs), chunk_size))
+            for chunk in chunks:
+                if mapped:
+                    numeric = {}
+                    for axis in ("frame", "x", "y"):
+                        name, is_nm = mapped[axis]
+                        values = pd.to_numeric(chunk[name], errors="coerce").to_numpy(dtype=np.float32)
+                        if is_nm:
+                            values = values / np.float32(pixelsize)
+                        numeric[axis] = values
+                    valid = np.logical_and.reduce([np.isfinite(v) for v in numeric.values()])
+                    chunk = chunk.loc[valid].copy()
+                    raw = loaded.locs.iloc[offset:offset + len(chunk)]
+                    for axis, values in numeric.items():
+                        expected = values[valid]
+                        if axis == "frame":
+                            expected = expected.astype(np.uint32)
+                        if not np.array_equal(raw[axis].to_numpy(), expected):
+                            raise ValueError("The source CSV has changed since loading. Reload it before exporting.")
+                current = locs.iloc[offset:offset + len(chunk)]
+                mask = ((current["x"] >= x0 / pixelsize) & (current["x"] <= x1 / pixelsize)
+                        & (current["y"] >= y0 / pixelsize) & (current["y"] <= y1 / pixelsize)).to_numpy()
+                subset = chunk.iloc[np.flatnonzero(mask)].copy()
+                if mapped and corrected_locs is not None:
+                    # Update all coordinate aliases, preserving every other field.
+                    for name in subset.columns:
+                        alias = CSV_COLUMN_ALIASES.get(normalized_csv_column(str(name)))
+                        if alias is not None and alias[0] in {"x", "y", "z"} and alias[0] in current:
+                            subset[name] = current[alias[0]].to_numpy(dtype=float)[mask] * (pixelsize if alias[1] else 1.0)
+                subset.to_csv(output, index=False, header=False)
+                count += len(subset)
+                offset += len(chunk)
+                if progress_callback:
+                    progress_callback(f"Exporting ROI: {offset:,}/{len(locs):,} rows scanned, {count:,} saved")
+            if offset != len(locs):
+                raise ValueError("The source CSV has changed since loading. Reload it before exporting.")
+        metadata_path = destination.with_suffix(".yaml")
+        if metadata_path.exists():
+            existing = read_yaml_metadata(destination)
+            if float(existing.get("Pixelsize") or DEFAULT_PIXEL_SIZE_NM) != pixelsize:
+                raise ValueError("Destination YAML has a different pixel size. Choose a new export filename.")
+        if metadata_path.resolve() == loaded.path.with_suffix(".yaml").resolve():
+            raise ValueError("Choose a different filename so the source metadata is preserved.")
+        export_metadata = dict(read_yaml_metadata(destination))
+        export_metadata.update(loaded.info[0])
+        export_metadata["ROI bounds (nm)"] = [float(x0), float(x1), float(y0), float(y1)]
+        with metadata_path.open("w", encoding="utf-8") as metadata_output:
+            yaml.safe_dump(export_metadata, metadata_output)
+        os.replace(temporary_path, destination)
+    finally:
+        if chunks is not None:
+            chunks.close()
+        if temporary_path is not None:
+            temporary_path.unlink(missing_ok=True)
+    return count
 
 
 def read_locs(
@@ -2446,8 +2687,21 @@ def fully_fitting_roi_tiles(
     validation_roi_nm: tuple[float, float, float, float],
     *,
     include_partial_edges: bool = False,
+    image_bounds_nm: tuple[float, float, float, float] | None = None,
 ) -> list[tuple[float, float, float, float]]:
-    """Tile the validation lattice, optionally clipping edge tiles to the image."""
+    """Tile the validation lattice within the file bounds, preserving world coordinates."""
+    if image_bounds_nm is not None:
+        left, right, bottom, top = (float(value) for value in image_bounds_nm)
+        if not np.isfinite([left, right, bottom, top]).all() or right <= left or top <= bottom:
+            raise ValueError("Image bounds must be finite with positive width and height.")
+        x0, x1, y0, y1 = validation_roi_nm
+        local_tiles = fully_fitting_roi_tiles(
+            right - left, top - bottom,
+            (x0 - left, x1 - left, y0 - bottom, y1 - bottom),
+            include_partial_edges=include_partial_edges,
+        )
+        return [(x0 + left, x1 + left, y0 + bottom, y1 + bottom)
+                for x0, x1, y0, y1 in local_tiles]
     x0, x1, y0, y1 = validation_roi_nm
     anchor_x = min(float(x0), float(x1))
     anchor_y = min(float(y0), float(y1))
@@ -3076,6 +3330,8 @@ class PaintAnalysisApp(tk.Tk):
         self.linked_roi_patch = None
         self.filtered_roi_patch = None
         self.raw_roi_highlight = None
+        self.raw_selector: RectangleSelector | None = None
+        self.raw_roi_patch = None
         self.selector: RectangleSelector | None = None
         self.linked_selector: RectangleSelector | None = None
         self.raw_map_colorbar = None
@@ -3194,6 +3450,7 @@ class PaintAnalysisApp(tk.Tk):
         self.origami_show_detected_sites_overlay = tk.BooleanVar(
             value=DEFAULT_ORIGAMI_SHOW_DETECTED_SITES_OVERLAY
         )
+        self.origami_show_corner_diagnostics = tk.BooleanVar(value=False)
         self.origami_show_site_diagnostics = tk.BooleanVar(
             value=DEFAULT_ORIGAMI_SHOW_SITE_DIAGNOSTICS
         )
@@ -3299,6 +3556,7 @@ class PaintAnalysisApp(tk.Tk):
         self.origami_rectangle_margin_nm = tk.DoubleVar(value=20.0)
         self.origami_min_rectangle_confidence = tk.DoubleVar(value=DEFAULT_ORIGAMI_CORRELATION_THRESHOLD)
         self.origami_use_correlation_gate = tk.BooleanVar(value=DEFAULT_ORIGAMI_USE_CORRELATION_GATE)
+        self.origami_require_corner_support = tk.BooleanVar(value=True)
         self.origami_min_cell_pattern_correlation = tk.DoubleVar(
             value=DEFAULT_ORIGAMI_MIN_CELL_PATTERN_CORRELATION
         )
@@ -3401,6 +3659,8 @@ class PaintAnalysisApp(tk.Tk):
         roi_box.columnconfigure(0, weight=1)
         ttk.Label(roi_box, textvariable=self.roi_label, wraplength=250).grid(row=0, column=0, sticky="ew")
         ttk.Button(roi_box, text="Clear ROI", command=self.clear_roi).grid(row=1, column=0, sticky="ew", pady=(8, 0))
+        ttk.Button(roi_box, text="Save Raw ROI CSV", command=lambda: self.export_roi_csv(False)).grid(row=2, column=0, sticky="ew", pady=(8, 0))
+        ttk.Button(roi_box, text="Save Corrected ROI CSV", command=lambda: self.export_roi_csv(True)).grid(row=3, column=0, sticky="ew", pady=(8, 0))
 
         drift_box = ttk.LabelFrame(sidebar, text="Drift Correction", padding=10)
         drift_box.grid(row=4, column=0, sticky="ew", pady=(0, 10))
@@ -4124,20 +4384,27 @@ class PaintAnalysisApp(tk.Tk):
         )
         fit_correlation_gate.grid(row=19, column=0, columnspan=2, sticky="w", pady=(3, 0))
         WidgetTooltip(fit_correlation_gate, "Shared with Step 4. Disable to keep correlation as a QC measurement only.")
+        corner_gate = ttk.Checkbutton(
+            template_group, text="Require corner support",
+            variable=self.origami_require_corner_support,
+        )
+        corner_gate.grid(row=20, column=0, columnspan=2, sticky="w", pady=(3, 0))
+        WidgetTooltip(corner_gate, "Require each outer template mark to meet Pose min locs / site within Pose site radius. Disable to allow fits with missing corners. Applies to alignment and final acceptance; diagnostics remain available. Rerun Step 2 after changing this setting.")
+
         ttk.Label(
             template_group,
-            text="Fits and locks each candidate's position and rotation. Correlation, point limits, and required corner coverage apply now. Each outer corner mark requires Pose min locs / site within Pose site radius. Failed fits appear with dashed outlines when text statistics is enabled. Site coverage and spacing limits apply during Step 4 acceptance. Shared controls update in both steps.",
+            text="Fits and locks each candidate's position and rotation. Correlation and point limits apply now; corner coverage applies when Require corner support is enabled. Each outer corner mark requires Pose min locs / site within Pose site radius. Failed fits appear with dashed outlines when text statistics is enabled. Site coverage and spacing limits apply during Step 4 acceptance. Shared controls update in both steps.",
             wraplength=245,
-        ).grid(row=20, column=0, columnspan=2, sticky="w", pady=(5, 0))
+        ).grid(row=21, column=0, columnspan=2, sticky="w", pady=(5, 0))
         self.origami_run_alignment_button = ttk.Button(
             template_group,
             text="Run Step 2 · Fit and Inspect",
             command=lambda: self.identify_origamis(target_stage=3, display_stage=2),
         )
         self.origami_run_alignment_button.grid(
-            row=21, column=0, columnspan=2, sticky="ew", pady=(7, 0)
+            row=22, column=0, columnspan=2, sticky="ew", pady=(7, 0)
         )
-        step_progress(template_group, 22, 2)
+        step_progress(template_group, 23, 2)
 
         ttk.Label(identify_fields, text="Digital detection, classification, and QC").grid(row=2, column=0, sticky="w", pady=(2, 4))
         self.origami_identify_advanced_frame = ttk.Frame(identify_fields)
@@ -4173,7 +4440,7 @@ class PaintAnalysisApp(tk.Tk):
         )
         step_progress(site_group, 7, 3)
 
-        acceptance_group = workflow_group(self.origami_identify_advanced_frame, 1, "4 · Fit templates to digital-pixel outcomes")
+        acceptance_group = workflow_group(self.origami_identify_advanced_frame, 1, "4 · Exact digital-pixel template lookup")
         ttk.Button(
             acceptance_group,
             text="Load Classification Templates…",
@@ -4202,16 +4469,16 @@ class PaintAnalysisApp(tk.Tk):
         setting_row(
             acceptance_group,
             8,
-            "Min winning-template probability",
+            "Legacy min template probability",
             self.origami_min_monte_carlo_probability,
-            "With one template, passing fits form one inspection group; probability is 1 by definition, not a confidence measure. With multiple templates, require the winner's equal-prior probability after they compete. With six templates, 0.167 is chance; the default 0.25 requires evidence above chance without demanding an absolute majority.",
+            "Used only for legacy image templates. Digital-pixel templates require an exact ON/OFF match and ignore this probability threshold.",
         )
         setting_row(
             acceptance_group,
             9,
-            "Min cell-pattern correlation",
+            "Legacy cell-pattern correlation",
             self.origami_min_cell_pattern_correlation,
-            "Optional multiple-template gate comparing the complete detected bright/dark lattice with each template. It remains part of the soft classification score even when this hard gate is disabled.",
+            "Used only for legacy image templates. Digital-pixel classification uses exact ON/OFF equality instead.",
         )
         correlation_gate_toggle = ttk.Checkbutton(
             acceptance_group,
@@ -4241,7 +4508,7 @@ class PaintAnalysisApp(tk.Tk):
         step_progress(acceptance_group, 13, 4)
         ttk.Label(
             acceptance_group,
-            text="Load one template for overlays and galleries of passing fits, or several to compare types. With one template, class probability is 1 by definition. Point minimum is shared with Step 1; fit-quality limits are shared with Step 2. Digital ON/OFF thresholds are set in Step 3. Run Step 4 to apply acceptance and classify the measured outcomes.",
+            text="Digital-pixel templates require every Step 3 ON/OFF state to match exactly. Unknown patterns and patterns matching multiple templates remain unclassified, including with only one template loaded. Fit-quality gates still apply. Run Step 4 after changing templates or digital-pixel outcomes.",
             wraplength=245,
         ).grid(row=14, column=0, columnspan=2, sticky="w", pady=(5, 0))
 
@@ -4497,6 +4764,12 @@ class PaintAnalysisApp(tk.Tk):
         )
         qc_display_specs = (
             (
+                "Show corner support diagnostics",
+                self.origami_show_corner_diagnostics,
+                self._toggle_origami_corner_diagnostics,
+                "Show required corner marks, exact counting radii, and count/minimum: green passes, red fails. Uses cropped aligned points and saved fit settings. Zoom to 12 or fewer candidates for details.",
+            ),
+            (
                 "Show theoretical overlay",
                 self.origami_show_theoretical_overlay,
                 self._toggle_origami_theoretical_overlay,
@@ -4637,6 +4910,7 @@ class PaintAnalysisApp(tk.Tk):
             self.origami_spacing_y_nm,
             self.origami_rectangle_margin_nm,
             self.origami_use_correlation_gate,
+            self.origami_require_corner_support,
             self.origami_min_cell_pattern_correlation,
             self.origami_use_cell_pattern_gate,
             self.origami_min_monte_carlo_probability,
@@ -4858,6 +5132,16 @@ class PaintAnalysisApp(tk.Tk):
             state = "enabled" if enabled else "disabled"
             self.status.set(f"The detected-site overlay is {state} for the identification overview.")
 
+    def _toggle_origami_corner_diagnostics(self) -> None:
+        if (self.origami_last_rendered_plot_option == "Identified origami match ROI"
+                and self.origami_selected_match_index is not None):
+            self._plot_identified_origami_match_roi(self.origami_selected_match_index)
+        elif self.origami_last_rendered_plot_option in {
+                "Identified origami template matches", "Random ROI inspection"}:
+            self._refresh_origami_footprints()
+        else:
+            self.status.set("Corner diagnostics are available in fitted-candidate overview and inspection views.")
+
     def _toggle_origami_site_diagnostics(self) -> None:
         if self.origami_last_rendered_plot_option in {"Individual origami gallery", "Individual site assignments", "Aligned density"}:
             self.render_origami_plot()
@@ -4951,6 +5235,7 @@ class PaintAnalysisApp(tk.Tk):
                 (self.origami_spacing_y_nm, DEFAULT_ORIGAMI_SPACING_Y_NM),
                 (self.origami_rectangle_margin_nm, 20.0),
                 (self.origami_use_correlation_gate, DEFAULT_ORIGAMI_USE_CORRELATION_GATE),
+                (self.origami_require_corner_support, True),
                 (
                     self.origami_min_cell_pattern_correlation,
                     DEFAULT_ORIGAMI_MIN_CELL_PATTERN_CORRELATION,
@@ -5733,6 +6018,9 @@ class PaintAnalysisApp(tk.Tk):
     def _full_map_viewport_nm(self) -> tuple[float, float, float, float] | None:
         if self.loaded is None:
             return None
+        roi_viewport = roi_file_viewport_nm(self.loaded)
+        if roi_viewport is not None:
+            return roi_viewport
         pixelsize = float(self.loaded.info[0]["Pixelsize"])
         return (
             0.0,
@@ -6581,6 +6869,9 @@ class PaintAnalysisApp(tk.Tk):
     def _clear_raw_map_before_render(self) -> None:
         self.suspend_map_limit_sync = True
         try:
+            if self.raw_selector is not None:
+                self.raw_selector.disconnect_events()
+                self.raw_selector = None
             self._remove_raw_map_colorbar()
             self._remove_raw_roi_highlight()
             self.raw_map_axis.clear()
@@ -6999,6 +7290,7 @@ class PaintAnalysisApp(tk.Tk):
                 "rectangle_margin_nm": float(self.origami_rectangle_margin_nm.get()),
                 "min_rectangle_confidence": float(self.origami_min_rectangle_confidence.get()),
                 "use_correlation_gate": bool(self.origami_use_correlation_gate.get()),
+                "require_corner_support": bool(self.origami_require_corner_support.get()),
                 "min_cell_pattern_correlation": float(
                     self.origami_min_cell_pattern_correlation.get()
                 ),
@@ -7930,6 +8222,10 @@ class PaintAnalysisApp(tk.Tk):
                 result["params"]["classification_evidence_model"] = "direct digital groups"
             else:
                 result["params"]["classification_evidence_model"] = "cell agreement"
+            if logical_model is not None:
+                exact_matches = exact_digital_template_matches(result_params, len(picks.regions))
+                scores = np.where(exact_matches, 0.0, -np.inf)
+                result["params"]["classification_method"] = "exact digital ON/OFF lookup"
             result["params"]["classification_scores"] = tuple(float(value) for value in scores)
             result["params"]["classification_crop_retained_fraction"] = tuple(
                 float(value) for value in crop_retention
@@ -7954,10 +8250,15 @@ class PaintAnalysisApp(tk.Tk):
             == "direct digital groups"
             for result in template_results
         )
+        if not digital_classification and any(
+                "classification_exact_digital_match" in result["params"] for result in template_results):
+            raise ValueError("Load digital-pixel templates together; do not mix them with legacy image-only templates.")
         classification = classify_template_candidates(
             centers_by_template,
             [
                 np.asarray(result["picks"].accepted_mask, dtype=bool)
+                & np.asarray(result["params"].get(
+                    "classification_exact_digital_match", np.ones(len(result["picks"].regions), dtype=bool)), dtype=bool)
                 & (
                     np.ones(len(result["picks"].regions), dtype=bool)
                     if digital_classification
@@ -7983,7 +8284,7 @@ class PaintAnalysisApp(tk.Tk):
                             DEFAULT_ORIGAMI_MIN_CELL_PATTERN_CORRELATION,
                         ))
                     )
-                    if bool(result["params"].get(
+                    if not digital_classification and bool(result["params"].get(
                         "classification_use_cell_pattern_gate",
                         DEFAULT_ORIGAMI_USE_CELL_PATTERN_GATE,
                     ))
@@ -7994,14 +8295,7 @@ class PaintAnalysisApp(tk.Tk):
             classification_scores,
             match_distance_nm=deduplication_distance_nm,
             deduplication_distance_nm=deduplication_distance_nm,
-            minimum_winner_probability=(
-                float(params.get(
-                    "min_monte_carlo_probability",
-                    DEFAULT_ORIGAMI_MIN_MONTE_CARLO_POSTERIOR,
-                ))
-                if digital_classification
-                else None
-            ),
+            require_unique_match=digital_classification,
         )
         core_bounds = params.get("_candidate_core_bounds_nm")
         if core_bounds is not None:
@@ -8144,8 +8438,15 @@ class PaintAnalysisApp(tk.Tk):
                     else float("nan")
                 )
             )
+            if direct_digital_evidence:
+                exact = attempted_params.get("classification_exact_digital_match", ())
+                if candidate_index < len(exact) and not exact[candidate_index]:
+                    failure_reasons.append("digital ON/OFF pattern has no exact template match")
+                elif not failure_reasons:
+                    failure_reasons.append("ambiguous digital ON/OFF pattern: multiple templates match")
             if (
-                np.isfinite(reported_template_probability)
+                not direct_digital_evidence
+                and np.isfinite(reported_template_probability)
                 and reported_template_probability < minimum_monte_carlo_probability
             ):
                 evidence_name = (
@@ -8165,7 +8466,8 @@ class PaintAnalysisApp(tk.Tk):
                 )
             )
             if (
-                bool(attempted_params.get(
+                not direct_digital_evidence
+                and bool(attempted_params.get(
                     "classification_use_cell_pattern_gate",
                     DEFAULT_ORIGAMI_USE_CELL_PATTERN_GATE,
                 ))
@@ -8181,6 +8483,8 @@ class PaintAnalysisApp(tk.Tk):
             unclassified_details.append(
                 {
                     "center_nm": np.asarray(classification.group_centers_nm[group_index], dtype=float),
+                    "theoretical_points_nm": unclassified_theoretical_points(
+                        attempted_picks, attempted_params, candidate_index),
                     "template_name": template_names[template_index],
                     "point_count": int(attempted_picks.point_counts[candidate_index]),
                     "correlation": float(attempted_picks.rectangle_confidence[candidate_index]),
@@ -8383,7 +8687,11 @@ class PaintAnalysisApp(tk.Tk):
         full_width_nm = float(self.loaded.info[0]["Width"]) * pixelsize
         full_height_nm = float(self.loaded.info[0]["Height"]) * pixelsize
         try:
-            tile_lattice = fully_fitting_roi_tiles(full_width_nm, full_height_nm, self.origami_loaded_roi_nm, include_partial_edges=include_partial_edges)
+            tile_lattice = fully_fitting_roi_tiles(
+                full_width_nm, full_height_nm, self.origami_loaded_roi_nm,
+                include_partial_edges=include_partial_edges,
+                image_bounds_nm=roi_file_viewport_nm(self.loaded),
+            )
         except ValueError as exc:
             messagebox.showerror("Invalid validation ROI", str(exc))
             return None
@@ -8842,6 +9150,8 @@ class PaintAnalysisApp(tk.Tk):
             ]
             combined_templates: list[dict[str, Any]] = []
             sequence_param_names = (
+                "classification_observed_digital_states",
+                "classification_exact_digital_match",
                 "classification_lattice_precision",
                 "classification_empty_cell_fraction",
                 "classification_bright_cell_probability",
@@ -9890,7 +10200,9 @@ class PaintAnalysisApp(tk.Tk):
                 elif kind == "result":
                     try:
                         result_kind, result_payload = payload
-                        if result_kind == "cached_session":
+                        if result_kind == "roi_csv_export":
+                            self.status.set(result_payload)
+                        elif result_kind == "cached_session":
                             self.session_load_in_progress = False
                             cached_loaded = result_payload["loaded"]
                             # The corrected map is the useful restored view.
@@ -10521,6 +10833,10 @@ class PaintAnalysisApp(tk.Tk):
         self._update_hist_options()
         self._update_roi_label()
         self._clear_outputs_for_new_file()
+        initial_viewport = roi_file_viewport_nm(loaded)
+        if initial_viewport is not None:
+            x0, x1, y0, y1 = initial_viewport
+            self.shared_map_limits = ((x0, x1), (y0, y1))
         if render_raw:
             self.status.set(f"Loaded {loaded.path}. Rendering raw uncorrected map...")
             self.show_raw_map(auto_fit=True)
@@ -10528,6 +10844,9 @@ class PaintAnalysisApp(tk.Tk):
             self.status.set(f"Restored cached localization tables for {loaded.path.name}.")
 
     def _clear_outputs_for_new_file(self) -> None:
+        if self.raw_selector is not None:
+            self.raw_selector.disconnect_events()
+            self.raw_selector = None
         self.map_density_images.clear()
         if self.density_refresh_after_id is not None:
             try:
@@ -10663,6 +10982,8 @@ class PaintAnalysisApp(tk.Tk):
             self.raw_map_axis.set_xlabel("x position (nm)")
             self.raw_map_axis.set_ylabel("y position (nm)")
             self.raw_map_axis.grid(False)
+            self._enable_raw_roi_selector()
+            self._draw_roi_patch()
             self._highlight_raw_roi_locs()
             self._center_map_axis(self.raw_map_axis)
         finally:
@@ -10673,7 +10994,7 @@ class PaintAnalysisApp(tk.Tk):
         self.status.set(
             f"Rendered raw map with {result['n_rendered']:,} uncorrected localizations at "
             f"{float(result['disp_px_size_nm']):.3g} nm/pixel. "
-            "Choose drift settings and click Apply Drift Correction for the corrected map."
+            "Drag to select an ROI and use Save Raw ROI CSV, or apply drift correction."
         )
 
     def _plot_map(self, result: dict[str, Any]) -> None:
@@ -10714,6 +11035,17 @@ class PaintAnalysisApp(tk.Tk):
             f"Density limits {density_limits[0]:.4g}-{density_limits[1]:.4g}. "
             f"{'Rendered current zoomed viewport. ' if result.get('viewport_nm') is not None else ''}"
             "Drag on the map to select an ROI."
+        )
+
+    def _enable_raw_roi_selector(self) -> None:
+        if self.raw_selector is not None:
+            self.raw_selector.disconnect_events()
+        self.raw_selector = RectangleSelector(
+            self.raw_map_axis,
+            lambda start, end: self._on_roi_select(start, end, "raw map"),
+            useblit=False, button=[1], minspanx=5, minspany=5,
+            spancoords="data", interactive=False,
+            props={"facecolor": "none", "edgecolor": "#00e5ff", "linewidth": 1.2},
         )
 
     def _enable_roi_selector(self) -> None:
@@ -10759,7 +11091,7 @@ class PaintAnalysisApp(tk.Tk):
         self.linked_map_canvas.draw_idle()
         self.status.set(
             f"ROI selected on {source}. Highlighted {highlighted_count:,} matching raw localizations. "
-            "Plot an ROI histogram to analyze corrected localizations inside it."
+            "Save Raw ROI CSV or Save Corrected ROI CSV to export localizations within these bounds."
         )
 
     def _update_roi_label(self) -> None:
@@ -11299,6 +11631,10 @@ class PaintAnalysisApp(tk.Tk):
             site_positions: list[np.ndarray] = []
             alignment_positions: list[np.ndarray] = []
             for region_index in visible:
+                corner_toggle = getattr(self, "origami_show_corner_diagnostics", None)
+                if corner_toggle is not None and corner_toggle.get() and len(visible) <= 12:
+                    self.origami_footprint_artists.extend(draw_corner_support_diagnostics(
+                        axis, picks, params, int(region_index)))
                 corners = picks.rectangle_corners_nm[region_index]
                 center = np.mean(corners, axis=0)
                 fitted_centers.append(center)
@@ -11683,6 +12019,9 @@ class PaintAnalysisApp(tk.Tk):
             note.set_in_layout(False)
             self.origami_footprint_artists.append(note)
 
+        if show_sites:
+            self.origami_footprint_artists.extend(draw_unclassified_theoretical_overlay(
+                axis, getattr(self, "origami_multi_template_unclassified_details", ())))
         unclassified = np.asarray(
             getattr(self, "origami_multi_template_unclassified_centers_nm", np.empty((0, 2))),
             dtype=float,
@@ -12591,6 +12930,9 @@ class PaintAnalysisApp(tk.Tk):
             draw_prominence_geometry(candidate_axis)
             draw_site_diagnostics(candidate_axis)
             draw_group_assignments(candidate_axis)
+            corner_toggle = getattr(self, "origami_show_corner_diagnostics", None)
+            if corner_toggle is not None and corner_toggle.get():
+                draw_corner_support_diagnostics(candidate_axis, picks, params, region_index, world_coordinates=False)
             candidate_axis.set_title(
                 f"Aligned candidate: {decision}\n"
                 f"{int(picks.point_counts[region_index]):,} points • {picks.rectangle_angles_deg[region_index]:.1f}°",
@@ -12637,6 +12979,9 @@ class PaintAnalysisApp(tk.Tk):
             draw_prominence_geometry(overlay_axis)
             draw_site_diagnostics(overlay_axis)
             draw_group_assignments(overlay_axis)
+            corner_toggle = getattr(self, "origami_show_corner_diagnostics", None)
+            if corner_toggle is not None and corner_toggle.get():
+                draw_corner_support_diagnostics(overlay_axis, picks, params, region_index, world_coordinates=False)
             overlay_axis.set_title(
                 "Measured assignments + negative space\nfilled = measured • hollow = grid target • amber gaps",
                 fontsize=9,
@@ -12854,11 +13199,23 @@ class PaintAnalysisApp(tk.Tk):
             (bounds[:, 1] >= x0) & (bounds[:, 0] <= x1) & (bounds[:, 3] >= y0) & (bounds[:, 2] <= y1)
         )
         total_visible = len(visible)
+        corner_toggle = getattr(self, "origami_show_corner_diagnostics", None)
+        show_corners = corner_toggle is not None and bool(corner_toggle.get())
         show_labels = bool(self.origami_show_text_statistics.get())
         # Rejected poses are diagnostic results rather than identified
         # origamis. Keep every part of those fits hidden unless the user asks
         # for the text-statistics view that explains why they failed.
-        if not show_labels:
+        active = self._active_origami_picks_and_params()
+        unclassified_params = active[1] if active is not None and active[0] is picks else dict(self.origami_identification_params or {})
+        if self.origami_show_theoretical_overlay.get() and unclassified_params.get("classification_method") == "exact digital ON/OFF lookup":
+            dispositions = unclassified_params.get("classification_dispositions", ())
+            details = [
+                {"theoretical_points_nm": unclassified_theoretical_points(picks, unclassified_params, int(index))}
+                for index in visible
+                if index < len(dispositions) and str(dispositions[index]).startswith("unclassified")
+            ]
+            self.origami_footprint_artists.extend(draw_unclassified_theoretical_overlay(axis, details))
+        if not show_labels and not show_corners:
             visible = visible[np.asarray(picks.accepted_mask[visible], dtype=bool)]
         displayed_visible = len(visible)
         maximum_outlines = 500
@@ -12917,7 +13274,11 @@ class PaintAnalysisApp(tk.Tk):
                     theoretical_grid,
                     picks.rectangle_corners_nm[region_index],
                 )
-                if show_theoretical:
+                dispositions = params.get("classification_dispositions", ())
+                unclassified_exact = (params.get("classification_method") == "exact digital ON/OFF lookup"
+                                      and region_index < len(dispositions)
+                                      and str(dispositions[region_index]).startswith("unclassified"))
+                if show_theoretical and not unclassified_exact:
                     displayed_overlay_grid = overlay_grid
                     if show_site_diagnostics:
                         decision_overlay_grid = digital_group_decision_overlay_points(
@@ -13059,6 +13420,24 @@ class PaintAnalysisApp(tk.Tk):
                                 )[0]
                                 prominence_references.append(reference_world)
                                 prominence_links.append(np.vstack((peak_world, reference_world)))
+        if show_corners:
+            if displayed_visible <= 12:
+                for region_index in visible:
+                    self.origami_footprint_artists.extend(draw_corner_support_diagnostics(
+                        axis, picks, params, int(region_index)))
+                note = ("Corner support: green PASS / red FAIL; labels=count/minimum; "
+                        f"radius={float(params.get('site_mask_radius_nm', DEFAULT_ORIGAMI_SITE_MASK_RADIUS_NM)):g} nm; cropped fit points")
+                if not params.get("require_corner_support", True):
+                    note += "; corner gate OFF (diagnostics only)"
+                if params.get("alignment_template_image") is None:
+                    note = "Corner support gate is inactive for this fit (no image template)."
+            else:
+                note = "Zoom to 12 or fewer candidates to show corner counts and counting radii."
+            artist = axis.text(0.01, 0.99, note, transform=axis.transAxes, va="top",
+                               color="white", fontsize=8, zorder=15,
+                               bbox={"facecolor": "#111827", "alpha": 0.85, "edgecolor": "none"})
+            artist.set_in_layout(False)
+            self.origami_footprint_artists.append(artist)
         for region_index in visible:
             accepted = bool(picks.accepted_mask[region_index])
             accepted_number = int(accepted_numbers[region_index])
@@ -13168,6 +13547,9 @@ class PaintAnalysisApp(tk.Tk):
                         spacing_error_nm=float(picks.site_spacing_max_error_nm[region_index]),
                         params=params,
                     )
+                    exact = params.get("classification_exact_digital_match", ())
+                    if region_index < len(exact) and not exact[region_index]:
+                        failure_reasons.append("digital ON/OFF pattern differs from template")
                     if not required_corner_mask(picks, params, region_index)[0]:
                         failure_reasons.append("required corner support missing")
                     dispositions = params.get("classification_dispositions", ())
@@ -15625,6 +16007,9 @@ class PaintAnalysisApp(tk.Tk):
             "linestyle": "-",
             "zorder": 10,
         }
+        if self.raw_map_axis.images:
+            self.raw_roi_patch = matplotlib.patches.Rectangle(**patch_args)
+            self.raw_map_axis.add_patch(self.raw_roi_patch)
         if self.map_axis.images:
             self.roi_patch = matplotlib.patches.Rectangle(**patch_args)
             self.map_axis.add_patch(self.roi_patch)
@@ -15636,6 +16021,12 @@ class PaintAnalysisApp(tk.Tk):
             self.filtered_map_axis.add_patch(self.filtered_roi_patch)
 
     def _remove_roi_patch(self) -> None:
+        if self.raw_roi_patch is not None:
+            try:
+                self.raw_roi_patch.remove()
+            except (ValueError, NotImplementedError):
+                pass
+            self.raw_roi_patch = None
         if self.roi_patch is not None:
             try:
                 self.roi_patch.remove()
@@ -15654,6 +16045,29 @@ class PaintAnalysisApp(tk.Tk):
             except (ValueError, NotImplementedError):
                 pass
             self.filtered_roi_patch = None
+
+    def export_roi_csv(self, corrected: bool) -> None:
+        loaded, roi = self.loaded, self.roi_nm
+        if loaded is None or roi is None:
+            messagebox.showinfo("Select ROI", "Load localizations and drag a rectangle on the raw or corrected map first.")
+            return
+        coordinates = self.corrected_locs if corrected else None
+        if corrected and coordinates is None:
+            messagebox.showinfo("No corrected data", "Apply drift correction before exporting corrected localizations.")
+            return
+        label = "corrected" if corrected else "raw"
+        path = filedialog.asksaveasfilename(
+            title=f"Save {label} ROI localizations", defaultextension=".csv",
+            filetypes=[("CSV", "*.csv")], initialdir=str(loaded.path.parent),
+            initialfile=f"{loaded.path.stem}_{label}_roi.csv",
+        )
+        if not path:
+            return
+        def worker() -> tuple[str, Any]:
+            count = export_roi_localizations_csv(loaded, Path(path), roi, coordinates, self._worker_status)
+            return "roi_csv_export", f"Saved {count:,} {label} ROI localizations to {path}"
+        self.status.set(f"Exporting {label} ROI localizations...")
+        self._run_worker(worker)
 
     def export_csv(self) -> None:
         values = getattr(self, "current_values", None)

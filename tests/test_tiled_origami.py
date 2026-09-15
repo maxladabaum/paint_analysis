@@ -1,4 +1,5 @@
 import unittest
+from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
 
@@ -7,6 +8,7 @@ import pandas as pd
 
 from paint_analysis_gui import (
     PaintAnalysisApp,
+    LoadedData,
     evenly_distributed_tile_indices,
     fully_fitting_roi_tiles,
     independent_origami_pipeline_params,
@@ -15,6 +17,45 @@ from paint_analysis_gui import (
 
 
 class TiledOrigamiTests(unittest.TestCase):
+    def test_saved_roi_tiles_use_offset_bounds_and_cover_partial_edges(self):
+        bounds = (40000., 62500., 52000., 71300.)
+        validation = (42000., 45000., 54000., 56000.)
+        tiles = fully_fitting_roi_tiles(120000, 120000, validation,
+                                        include_partial_edges=True, image_bounds_nm=bounds)
+        self.assertIn(validation, tiles)
+        self.assertTrue(all(bounds[0] <= x0 < x1 <= bounds[1]
+                            and bounds[2] <= y0 < y1 <= bounds[3]
+                            for x0, x1, y0, y1 in tiles))
+        self.assertAlmostEqual(sum((x1-x0)*(y1-y0) for x0,x1,y0,y1 in tiles),
+                               (bounds[1]-bounds[0])*(bounds[3]-bounds[2]))
+        complete = fully_fitting_roi_tiles(120000, 120000, validation, image_bounds_nm=bounds)
+        self.assertTrue(all(x1-x0 == 3000 and y1-y0 == 2000 for x0,x1,y0,y1 in complete))
+        self.assertIn(validation, complete)
+
+    def test_validated_tile_context_uses_saved_file_roi_not_acquisition_size(self):
+        bounds = (400., 600., 500., 700.)
+        locs = pd.DataFrame({'x': [450., 550.], 'y': [550., 650.]})
+        loaded = LoadedData(Path('subset.csv'), locs,
+                            [{'Pixelsize': 1., 'Width': 1200, 'Height': 1200}],
+                            {'ROI bounds (nm)': list(bounds)})
+        app = SimpleNamespace(loaded=loaded, corrected_locs=locs,
+                              origami_pick_result=SimpleNamespace(accepted_count=1),
+                              origami_identification_params={'min_candidate_points': 1},
+                              origami_loaded_source_params={'source': 'Corrected localizations'},
+                              origami_loaded_roi_nm=(450., 500., 550., 600.))
+        for partial in (False, True):
+            context = PaintAnalysisApp._validated_origami_tile_context(app, include_partial_edges=partial)
+            self.assertEqual(len(context[2]), 16)
+            self.assertEqual(context[2][0], (400., 450., 500., 550.))
+            self.assertEqual(context[2][-1], (550., 600., 650., 700.))
+        loaded.metadata = {}
+        ordinary = PaintAnalysisApp._validated_origami_tile_context(app, include_partial_edges=True)
+        self.assertEqual(len(ordinary[2]), 24 * 24)
+        loaded.path = Path('subset_corrected_roi.csv')
+        legacy = PaintAnalysisApp._validated_origami_tile_context(app, include_partial_edges=True)
+        self.assertLess(len(legacy[2]), len(ordinary[2]))
+        self.assertTrue(all(tile[0] >= 449 and tile[2] >= 549 for tile in legacy[2]))
+
     def test_independent_tile_pipeline_discards_validation_roi_caches(self) -> None:
         cached_object = object()
         alignment_template = {"name": "L_L", "image": np.ones((3, 3))}

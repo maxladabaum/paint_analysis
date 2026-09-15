@@ -64,6 +64,30 @@ Large CSV and HDF5 imports show determinate progress beneath the selected file
 name. CSV data is loaded in chunks into preallocated arrays to keep memory close
 to the final localization-table size.
 
+## Save an ROI as a localization CSV
+
+Drag a rectangle on the raw map immediately after loading, or on the corrected
+map after applying drift correction. In the sidebar ROI panel, choose **Save Raw
+ROI CSV** or **Save Corrected ROI CSV** and choose a new filename. Each button
+selects localizations within the rectangle using that version's coordinates,
+including points on the boundary. Coordinates stay in the original reference
+frame; the crop does not move the origin or renumber frames. Histogram filters
+and linking do not affect these exports.
+
+For CSV inputs, the export retains every original column, column order, extra
+text fields, and coordinate units. Raw exports preserve the original field
+values; corrected exports replace only coordinate fields with corrected values.
+The original CSV must remain available. Export runs in the background and streams
+rows in chunks so it does not load another full copy of a large CSV. A companion
+YAML preserves pixel size, acquisition dimensions, and the selected ROI bounds.
+Reloading the subset opens the map at those ROI bounds, and the map toolbar Home
+button returns to that region. Original coordinates stay unchanged. Older exports
+with filenames ending in `_raw_roi` or `_corrected_roi` automatically use their
+localization bounds with a small margin.
+HDF5 inputs export the loaded numeric fields as a CSV in Picasso pixel units.
+An empty selection produces a header-only CSV. The source file is protected
+against overwriting.
+
 For development restarts, completing drift correction writes an app-owned HDF5
 session cache containing the loaded numeric localization table, corrected table,
 and drift trace. The next launch automatically restores the most recent valid
@@ -607,3 +631,58 @@ orientation is arbitrary. The template alignment keeps a shared missing-site
 pattern consistent, but assigning that pattern to a physical corner requires a
 fiducial or another asymmetric feature. Enable mirrored picks only if origamis
 can genuinely appear face-up and face-down in the experiment.
+
+### Corner support diagnostics
+
+Enable **Show corner support diagnostics** in the Origami plot's **QC and display**
+bar after fitting alignment. In the candidate overview, zoom to 12 or fewer
+candidates to see the required corner marks and their exact counting circles.
+Green marks pass and red marks fail. A label such as `C2: 2/3 FAIL` means two
+localizations were counted where at least three are required. The overlay uses
+saved fit settings and the same cropped aligned points as the acceptance test.
+It also appears in the candidate-image and overlay panels of individual fit
+inspection. Overview diagnostics reveal rejected candidates even when **Show
+text statistics** is off; toggling diagnostics does not rerun fitting or change
+acceptance. The All templates overview shows diagnostics for its displayed
+assigned fits; select a template to inspect its rejected fits.
+
+### Exact digital-pixel classification
+
+Step 4 matches the complete ON/OFF pattern measured in Step 3 to the classification
+templates by digital-pixel ID. ON uses the same probability, minimum support,
+and minimum prominence thresholds as the displayed digital-group decisions.
+Every expected ON and OFF pixel must match. A unique matching template receives
+the object, subject to the existing fit-quality gates. Unknown patterns and
+ambiguous patterns matching multiple eligible templates remain unclassified.
+A single loaded template also requires an exact match; there is no closest-match
+fallback. Missing or nonfinite measurements cannot establish a match.
+
+Probability and cell-pattern-correlation acceptance controls apply only to legacy
+image-only classification, not to digital-pixel lookup. Digital-pixel probabilities
+still describe the ON/OFF measurement, rather than confidence in a nearest
+classification. Rerun Step 4 to replace existing classifications with exact
+lookup results. Rerun Step 3 first if you change digital-pixel detection thresholds.
+
+To allow alignment fits with missing corners, uncheck **Require corner support**
+in **Step 2 · Fit and Inspect**, then rerun Step 2 and subsequent steps. This
+removes the corner requirement from both alignment and final acceptance. Other
+fit criteria still apply. **Show corner support diagnostics** remains independent;
+its labels say `gate off` when corner counts are only informational. The corner
+requirement is enabled by default.
+
+After exact lookup, **Show theoretical overlay** also draws unclassified objects
+as grey hollow site markers at their locked fitted poses. These markers represent
+the measured ON digital groups plus alignment sites, rather than an arbitrarily
+chosen classification template. They appear with text statistics off, in both
+All templates and individual-template overviews. Grey × markers still mark the
+unclassified centers. Overview drawing is limited to 500 visible unclassified
+objects and refreshes when zooming or panning. Rerun Step 4 for previously computed
+results to populate the saved overlay geometry.
+
+Whole-image tiling, limited-tile analysis, and random ROI inspection use saved
+ROI-file bounds rather than the original acquisition dimensions. Tile positions
+retain the validation ROI's grid alignment and absolute coordinates. Whole-image
+analysis clips partial edge tiles to the saved region; limited and random runs
+use only fully fitting tiles. Older default-named ROI exports use the same
+inferred bounds as their initial map view. Empty tiles inside the saved region
+can still occur and are skipped.
