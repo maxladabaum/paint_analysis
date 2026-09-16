@@ -292,3 +292,45 @@ def undrift_rcc_with_lattice_suppression(
     )
     corrected_locs = postprocess.apply_drift(locs, info, drift=drift)
     return drift, corrected_locs
+
+
+def memory_bounded_aim(module: Any, progress_dialog_type: Any = None) -> Callable:
+    """Use Picasso's AIM with one trial-shift array at a time.
+
+    Clone its Python functions into a private namespace so concurrent callers
+    never change Picasso globals or its GUI progress-dialog class.
+    """
+    from types import FunctionType, SimpleNamespace
+
+    count = getattr(module, "_count_intersections", None)
+    if count is None:
+        count = getattr(module, "count_intersections", None)
+    if count is None:
+        raise RuntimeError("This Picasso version does not expose AIM intersection counting.")
+
+    def intersections(l0_coords, l0_counts, l1_coords, l1_counts, shifts_xy, box):
+        values = np.empty(len(shifts_xy), dtype=np.int64)
+        shift_dtype = np.result_type(l1_coords.dtype, shifts_xy.dtype)
+        for index, shift in enumerate(shifts_xy):
+            shifted = np.add(l1_coords, shift, dtype=shift_dtype)
+            values[index] = count(l0_coords, l0_counts, shifted, l1_counts)
+            del shifted
+        return values if box == 1 else values.reshape(box, box)
+
+    namespace = dict(vars(module))
+    for name, value in vars(module).items():
+        if isinstance(value, FunctionType) and value.__globals__ is module.__dict__:
+            cloned = FunctionType(value.__code__, namespace, value.__name__, value.__defaults__, value.__closure__)
+            cloned.__kwdefaults__ = value.__kwdefaults__
+            namespace[name] = cloned
+    targets = ("_run_intersections_multithread", "run_intersections_multithread",
+               "_run_intersections", "run_intersections")
+    if not any(name in namespace for name in targets):
+        raise RuntimeError("This Picasso version uses an unsupported AIM intersection dispatcher.")
+    for name in targets:
+        if name in namespace:
+            namespace[name] = intersections
+    if progress_dialog_type is not None:
+        namespace["lib"] = SimpleNamespace(**vars(module.lib))
+        namespace["lib"].ProgressDialog = progress_dialog_type
+    return namespace["aim"]

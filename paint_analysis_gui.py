@@ -36,6 +36,13 @@ from matplotlib.collections import LineCollection, PolyCollection
 from matplotlib.path import Path as MatplotlibPath
 from matplotlib.widgets import RectangleSelector
 
+from origami_orientation import compare_half_turn, plot_half_turn
+from origami_dropout import fit_dropout_models, plot_dropout_models
+from origami_review import (review_tables, review_filter_options, review_mask, threshold_sweep,
+                           plot_evidence, plot_sweep, plot_full_detail)
+from origami_qc import (build_classification_audits, export_classification_audits,
+                        plot_classification_audit, expected_template_fractions, expected_group_fractions)
+
 from origami_analysis import (
     OrigamiAnalysisResult,
     OrigamiPickResult,
@@ -69,7 +76,7 @@ from origami_analysis import (
     supported_site_centroids,
     supported_site_spacing_errors,
 )
-from drift_analysis import undrift_rcc_with_lattice_suppression
+from drift_analysis import undrift_rcc_with_lattice_suppression, memory_bounded_aim
 
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
@@ -532,10 +539,84 @@ def _digital_group_decisions(
     return annotations
 
 
+def unclassified_display_payload(results):
+    """Create a display-only selection over shared candidates, never a new class."""
+    if not results:
+        raise ValueError("Run template classification before viewing unclassified candidates.")
+    first = next(iter(results.values()))
+    picks = first["picks"]
+    assigned = np.zeros(len(picks.regions), dtype=bool)
+    for payload in results.values():
+        other = payload["picks"]
+        if len(other.regions) != len(picks.regions) or any(
+            a is not b and not np.array_equal(a, b, equal_nan=True)
+            for a, b in zip(picks.regions, other.regions)
+        ):
+            raise ValueError("Unclassified result plots require shared candidate alignment. Rerun classification with shared alignment.")
+        mask = np.asarray(other.accepted_mask, dtype=bool)
+        if mask.shape != assigned.shape:
+            raise ValueError("Saved classification masks are incomplete. Rerun classification.")
+        assigned |= mask
+    params = dict(first["params"])
+    params["_unclassified_display"] = True
+    # No winning code exists: show the common group schema as reference geometry.
+    model = params.get("digital_pixel_model") or params.get("logical_model")
+    if isinstance(model, dict):
+        params["logical_model"] = dict(model, active_bits=tuple(True for _ in model.get("bit_ids", ())))
+    return {"picks": replace(picks, accepted_mask=~assigned), "params": params}
+
+
+def saved_gallery_classification(app, result, index):
+    """Map gallery order back to shared candidate IDs and saved decision evidence."""
+    if not (vars(app).get("origami_identification_params") or {}).get("classification_method"):
+        return None
+    active = app._active_origami_picks_and_params()
+    if active is None:
+        return None
+    picks, original = active
+    if not original.get("classification_method"):
+        return None
+    selected = np.flatnonzero(picks.accepted_mask)
+    if len(selected) != len(result.aligned_points) or not 0 <= index < len(selected):
+        return None
+    candidate = int(selected[index])
+    center = np.median(picks.regions[candidate], axis=0)
+    if not np.allclose(result.centers_nm[index], center, rtol=0, atol=1e-6):
+        return None
+    params = dict(original)
+    for key in ("digital_pixel_probabilities", "digital_group_localization_evidence", "digital_group_prominences"):
+        rows = original.get(key, ())
+        if candidate >= len(rows):
+            return None
+        params[key] = (rows[candidate],)
+    # Decision drawing expects measurement order to match the group schema.
+    model = params.get("digital_pixel_model") or params.get("logical_model")
+    measured_ids = tuple(map(str, params.get("digital_pixel_ids", ())))
+    if isinstance(model, dict) and measured_ids:
+        order = [measured_ids.index(str(bit)) for bit in model["bit_ids"]]
+        for key in ("digital_pixel_probabilities", "digital_group_localization_evidence", "digital_group_prominences"):
+            params[key] = (np.asarray(params[key][0])[order],)
+    dispositions = original.get("classification_dispositions", ())
+    reason = str(dispositions[candidate]) if candidate < len(dispositions) else "Saved classification"
+    if original.get("_unclassified_display"):
+        reason = "Unclassified; saved rejection details unavailable"
+        for detail in getattr(app, "origami_multi_template_unclassified_details", ()):
+            if np.allclose(detail.get("center_nm", [np.inf, np.inf]), center, rtol=0, atol=1e-6):
+                failures = "; ".join(detail.get("failure_reasons", ()))
+                name = detail.get("template_name")
+                reason = f"Unclassified — {name}: {failures}" if name else f"Unclassified: {failures or detail.get('template_attribution', 'no matching template')}"
+                break
+    return params, candidate, reason
+
+
 def selected_classification_has_assignments(app) -> bool:
     selector = getattr(app, "origami_template_result_view", None)
     if selector is None:
         return False
+    if selector.get() == "Unclassified":
+        picks = getattr(app, "origami_pick_result", None)
+        params = getattr(app, "origami_identification_params", {}) or {}
+        return bool(params.get("_unclassified_display") and picks is not None and picks.accepted_count > 0)
     payload = getattr(app, "origami_multi_template_results", {}).get(selector.get(), {})
     picks = payload.get("picks")
     return picks is not None and picks.accepted_count > 0
@@ -1432,11 +1513,18 @@ def _development_cache_path(
     return cache_dir / f"session-{digest}.h5"
 
 
-def _write_cached_dataframe(handle: h5py.File, name: str, frame: pd.DataFrame) -> None:
-    records = frame.to_records(index=False)
-    if records.dtype.hasobject:
+def _write_cached_dataframe(
+    handle: h5py.File, name: str, frame: pd.DataFrame, *, chunk_bytes: int = 16 * 1024 * 1024,
+) -> None:
+    # A full to_records() duplicates every column (several GB for large files).
+    dtype = frame.iloc[:0].to_records(index=False).dtype
+    if dtype.hasobject:
         raise TypeError("Development caching requires numeric localization columns.")
-    handle.create_dataset(name, data=records)
+    dataset = handle.create_dataset(name, shape=(len(frame),), dtype=dtype)
+    rows_per_chunk = max(1, chunk_bytes // max(1, dtype.itemsize))
+    for start in range(0, len(frame), rows_per_chunk):
+        stop = min(start + rows_per_chunk, len(frame))
+        dataset[start:stop] = frame.iloc[start:stop].to_records(index=False)
 
 
 def save_development_session_cache(
@@ -2465,8 +2553,24 @@ def apply_drift_correction(
     if frames / segmentation < 4:
         raise ValueError("RCC/AIM needs at least four time segments. Use a smaller segmentation value.")
 
-    locs_for_picasso = locs.copy()
+    # Estimation needs coordinates/precision only. Picasso makes its own copies;
+    # carrying every acquisition column through those copies wastes gigabytes.
+    estimation_columns = [name for name in ("frame", "x", "y", "z", "lpx", "lpy") if name in locs]
+    locs_for_picasso = pd.DataFrame(
+        {name: locs[name].to_numpy(copy=False) for name in estimation_columns},
+        index=locs.index, copy=False,
+    )
     locs_for_picasso["frame"] = locs_for_picasso["frame"].astype(np.uint32)
+
+    def restore_columns(corrected_coordinates: pd.DataFrame) -> pd.DataFrame:
+        # Own each result column independently without an intermediate full-table
+        # copy. Keep original frame dtype, row order, and acquisition columns.
+        corrected = pd.DataFrame({
+            name: (corrected_coordinates[name] if name in {"x", "y", "z"} else locs[name]).to_numpy(copy=True)
+            for name in locs.columns
+        }, index=locs.index, copy=False)
+        corrected.attrs = dict(locs.attrs)
+        return corrected
 
     if method == "rcc":
         if not np.isfinite(rcc_lattice_pitch_nm) or rcc_lattice_pitch_nm < 0:
@@ -2513,7 +2617,7 @@ def apply_drift_correction(
                 rcc_callback=rcc_progress,
             )
             label = f"Picasso RCC, segmentation={segmentation} frames"
-        return corrected_locs, drift, label
+        return restore_columns(corrected_locs), drift, label
 
     if method == "aim":
         # Picasso runs two x/y AIM passes, followed by two z passes for 3D
@@ -2527,21 +2631,17 @@ def apply_drift_correction(
         )
         if progress_callback is not None:
             progress_callback("AIM drift correction started.")
-        original_progress_dialog = aim.lib.ProgressDialog
-        try:
-            if aim_progress is not None:
-                aim.lib.ProgressDialog = PicassoAimStatusProgress
-            corrected_locs, _new_info, drift = aim.aim(
-                locs_for_picasso,
-                info,
-                segmentation=int(segmentation),
-                intersect_d=float(aim_intersect_nm) / pixelsize,
-                roi_r=float(aim_roi_nm) / pixelsize,
-                progress=aim_progress,
-            )
-        finally:
-            aim.lib.ProgressDialog = original_progress_dialog
-        return corrected_locs, drift, f"Picasso AIM, segmentation={segmentation} frames, intersect={aim_intersect_nm:g} nm, ROI={aim_roi_nm:g} nm"
+        corrected_locs, _new_info, drift = memory_bounded_aim(
+            aim, PicassoAimStatusProgress if aim_progress is not None else None,
+        )(
+            locs_for_picasso,
+            info,
+            segmentation=int(segmentation),
+            intersect_d=float(aim_intersect_nm) / pixelsize,
+            roi_r=float(aim_roi_nm) / pixelsize,
+            progress=aim_progress,
+        )
+        return restore_columns(corrected_locs), drift, f"Picasso AIM, segmentation={segmentation} frames, intersect={aim_intersect_nm:g} nm, ROI={aim_roi_nm:g} nm"
 
     raise ValueError(f"Unknown drift correction method: {method}")
 
@@ -3524,6 +3624,9 @@ class PaintAnalysisApp(tk.Tk):
         self.origami_gallery_home_limits: tuple[tuple[float, float], tuple[float, float]] | None = None
         self.origami_gallery_page = tk.IntVar(value=1)
         self.origami_gallery_page_size = tk.StringVar(value="64")
+        self.origami_review_filter = tk.StringVar(value="All unclassified")
+        self.origami_sweep_parameter = tk.StringVar(value="support")
+        self.origami_sweep_values = tk.StringVar(value="")
         self.origami_gallery_sort = tk.StringVar(value="Origami ID")
         self.origami_gallery_min_match = tk.StringVar(value="")
         self.origami_gallery_max_rms = tk.StringVar(value="")
@@ -4721,6 +4824,22 @@ class PaintAnalysisApp(tk.Tk):
         ttk.Button(self.origami_overlay_advanced_frame, text="Apply Gallery Filters", command=self._apply_origami_gallery_view).grid(
             row=12, column=0, columnspan=2, sticky="ew", pady=(5, 0)
         )
+        review_fields = ttk.LabelFrame(overlay_fields, text="Unclassified investigation", padding=6)
+        review_fields.grid(row=8, column=0, sticky="ew", pady=(8, 0))
+        review_fields.columnconfigure(0, weight=1)
+        ttk.Label(review_fields, text="Gallery rejection group").grid(row=0, column=0, sticky="w")
+        self.origami_review_combo = ttk.Combobox(review_fields, textvariable=self.origami_review_filter,
+            values=("All unclassified",), state="readonly", width=24)
+        self.origami_review_combo.grid(row=1, column=0, sticky="ew")
+        self.origami_review_combo.bind("<<ComboboxSelected>>", lambda _event: self._apply_origami_gallery_view())
+        ttk.Button(review_fields, text="Why wasn't this full?", command=self._show_origami_full_review).grid(row=2, column=0, sticky="ew", pady=4)
+        ttk.Label(review_fields, text="Sweep one threshold (other gates fixed)", wraplength=240).grid(row=3, column=0, sticky="w")
+        ttk.Combobox(review_fields, textvariable=self.origami_sweep_parameter, values=("support", "prominence"),
+                     state="readonly", width=24).grid(row=4, column=0, sticky="ew")
+        ttk.Label(review_fields, text="Values: comma-separated; blank = automatic", wraplength=240).grid(row=5, column=0, sticky="w")
+        ttk.Entry(review_fields, textvariable=self.origami_sweep_values).grid(row=6, column=0, sticky="ew")
+        ttk.Button(review_fields, text="Run threshold sweep", command=self._show_origami_sweep).grid(row=7, column=0, sticky="ew", pady=4)
+        ttk.Label(review_fields, text="Display only. Export Classification Audits includes the latest sweep's candidate transitions.", wraplength=240).grid(row=8, column=0, sticky="w")
         self.origami_refine_button = ttk.Button(
             overlay_fields, text="Refine Current Overlay with G5M", command=self.refine_origami_overlay_with_g5m
         )
@@ -4749,6 +4868,11 @@ class PaintAnalysisApp(tk.Tk):
         )
         self.origami_export_pdf_button.grid(row=2, column=0, sticky="ew", pady=(5, 0))
         WidgetTooltip(self.origami_export_pdf_button, "Available after an overlay result exists.")
+        self.origami_export_audit_button = ttk.Button(
+            export_fields, text="Export Classification Audits", command=self.export_origami_audits
+        )
+        self.origami_export_audit_button.grid(row=3, column=0, sticky="ew", pady=(5, 0))
+        WidgetTooltip(self.origami_export_audit_button, "Save per-candidate gates, unmatched patterns, and template distances as a CSV ZIP after Step 4.")
 
         sticky_actions = ttk.Frame(self.origami_sidebar)
         sticky_actions.grid(row=2, column=0, sticky="ew", pady=(6, 0))
@@ -4777,10 +4901,17 @@ class PaintAnalysisApp(tk.Tk):
             "Origami type counts",
             "Classification diagnostics",
             "Digital-group bias heatmap",
+            "Digital-group threshold audit",
+            "Unmatched-pattern audit",
+            "Unclassified evidence distributions",
+            "Threshold sensitivity",
+            "ON-dropout model check",
+            "180° orientation check",
             "Digital-pixel spatial heatmap",
             "Individual origami gallery",
             "Individual site assignments",
             "Selected origami detail",
+            "Why wasn’t this full?",
             "Aligned density",
             "Integrated density per site",
             "Mean site counts",
@@ -5087,6 +5218,8 @@ class PaintAnalysisApp(tk.Tk):
             self._show_origami_stage(self.origami_workflow_stage.get())
         if hasattr(self, "origami_prev_candidate_button"):
             self._configure_origami_navigation_controls()
+        if hasattr(self, "origami_export_audit_button"):
+            self.origami_export_audit_button.state(["!disabled"] if self.origami_multi_template_results else ["disabled"])
         overlay_state = ["!disabled"] if self.origami_result is not None else ["disabled"]
         if hasattr(self, "origami_refine_button"):
             self.origami_refine_button.state(overlay_state)
@@ -5096,6 +5229,12 @@ class PaintAnalysisApp(tk.Tk):
                 "Origami type counts",
                 "Classification diagnostics",
                 "Digital-group bias heatmap",
+                "Digital-group threshold audit",
+                "Unmatched-pattern audit",
+                "Unclassified evidence distributions",
+                "Threshold sensitivity",
+                "ON-dropout model check",
+                "180° orientation check",
                 "Digital-pixel spatial heatmap",
             )
             identification_options: tuple[str, ...] = ()
@@ -5139,7 +5278,7 @@ class PaintAnalysisApp(tk.Tk):
         if not results:
             self.origami_template_result_combo.state(["disabled"])
             return
-        values = ("All templates", *(str(name) for name in results))
+        values = ("All templates", *(str(name) for name in results), "Unclassified")
         self.origami_template_result_combo.configure(values=values)
         variable = getattr(self, "origami_template_result_view", None)
         if variable is not None and str(variable.get()) not in values:
@@ -5547,7 +5686,7 @@ class PaintAnalysisApp(tk.Tk):
             "Random ROI inspection",
         }:
             return "roi"
-        if self.origami_last_rendered_plot_option == "Selected origami detail":
+        if self.origami_last_rendered_plot_option in {"Selected origami detail", "Why wasn’t this full?"}:
             return "detail"
         return "none"
 
@@ -5695,7 +5834,8 @@ class PaintAnalysisApp(tk.Tk):
         requested = max(1, min(result.origami_count, requested))
         self.origami_selected_index = requested - 1
         self.origami_detail_number.set(requested)
-        self.origami_plot_option.set("Selected origami detail")
+        if self.origami_plot_option.get() != "Why wasn’t this full?":
+            self.origami_plot_option.set("Selected origami detail")
         self.render_origami_plot()
 
     def _on_origami_plot_selection(self, _event: tk.Event | None = None) -> None:
@@ -5717,13 +5857,22 @@ class PaintAnalysisApp(tk.Tk):
                 self._plot_classification_diagnostics()
             elif requested_view == "Digital-pixel spatial heatmap":
                 self._plot_digital_pixel_spatial_heatmap()
+            elif requested_view in ("Digital-group threshold audit", "Unmatched-pattern audit", "Unclassified evidence distributions", "Threshold sensitivity", "ON-dropout model check", "180° orientation check"):
+                self._plot_origami_audit(requested_view)
             elif requested_view == "Digital-group bias heatmap":
                 self._plot_digital_group_bias_heatmap()
             else:
                 self.origami_plot_option.set("Identified origami template matches")
                 self._plot_all_template_classifications()
         else:
-            payload = self.origami_multi_template_results.get(name)
+            if name == "Unclassified":
+                try:
+                    payload = unclassified_display_payload(self.origami_multi_template_results)
+                except ValueError as exc:
+                    messagebox.showinfo("Unclassified plots unavailable", str(exc))
+                    return
+            else:
+                payload = self.origami_multi_template_results.get(name)
             if payload is None:
                 return
             self.origami_pick_result = payload["picks"]
@@ -5748,6 +5897,8 @@ class PaintAnalysisApp(tk.Tk):
                 self._plot_classification_diagnostics()
             elif requested_view == "Digital-pixel spatial heatmap":
                 self._plot_digital_pixel_spatial_heatmap()
+            elif requested_view in ("Digital-group threshold audit", "Unmatched-pattern audit", "Unclassified evidence distributions", "Threshold sensitivity", "ON-dropout model check", "180° orientation check"):
+                self._plot_origami_audit(requested_view)
             elif requested_view == "Digital-group bias heatmap":
                 self._plot_digital_group_bias_heatmap()
             elif overlay_payload is not None:
@@ -5771,7 +5922,7 @@ class PaintAnalysisApp(tk.Tk):
                 self.overlay_origamis()
             return
         if (
-            name not in self.origami_multi_template_results
+            (name not in self.origami_multi_template_results and name != "Unclassified")
             or name in self.origami_multi_template_overlay_results
             or self.origami_pick_result is None
             or self.origami_pick_result.accepted_count == 0
@@ -7898,20 +8049,13 @@ class PaintAnalysisApp(tk.Tk):
         group_cells = digital_model.get(
             "bit_physical_cells", digital_model.get("bit_cells", ())
         )
-        template_states = [
-            np.asarray(template.get("logical_model", {}).get("active_bits", ()), dtype=float)
-            for template in params.get("custom_templates", ())
-            if isinstance(template.get("logical_model"), dict)
-        ]
-        valid_template_states = [
-            state for state in template_states
-            if state.shape == (len(digital_model["bit_ids"]),)
-        ]
-        group_on_priors = (
-            np.mean(np.stack(valid_template_states, axis=0), axis=0)
-            if valid_template_states
-            else np.full(len(digital_model["bit_ids"]), 0.5, dtype=float)
+        group_on_priors = expected_group_fractions(
+            {str(template.get("name", index)): {"params": template}
+             for index, template in enumerate(params.get("custom_templates", ()))},
+            tuple(map(str, digital_model["bit_ids"])),
         )
+        if group_on_priors.shape != (len(digital_model["bit_ids"]),):
+            group_on_priors = np.full(len(digital_model["bit_ids"]), 0.5, dtype=float)
         group_evidence = direct_digital_group_localization_evidence(
             picks.aligned_regions,
             full_grid,
@@ -8407,6 +8551,8 @@ class PaintAnalysisApp(tk.Tk):
         if not digital_classification and any(
                 "classification_exact_digital_match" in result["params"] for result in template_results):
             raise ValueError("Load digital-pixel templates together; do not mix them with legacy image-only templates.")
+        for result in template_results:
+            result["params"]["classification_qc_eligible"] = tuple(bool(v) for v in result["picks"].accepted_mask)
         classification = classify_template_candidates(
             centers_by_template,
             [
@@ -9328,6 +9474,7 @@ class PaintAnalysisApp(tk.Tk):
                 "classification_monte_carlo_log_bayes_factor",
                 "classification_scores",
                 "classification_dispositions",
+                "classification_qc_eligible",
                 "classification_winner_margins",
                 "classification_runner_up_templates",
                 "classification_template_probabilities",
@@ -9567,12 +9714,14 @@ class PaintAnalysisApp(tk.Tk):
                 "source_path": self.origami_loaded_source_path,
                 "source_label": (
                     f"{self.origami_loaded_source_label} — {self.origami_template_result_view.get()}"
-                    if self.origami_template_result_view.get() in self.origami_multi_template_results
+                    if (self.origami_template_result_view.get() in self.origami_multi_template_results
+                        or self.origami_template_result_view.get() == "Unclassified")
                     else self.origami_loaded_source_label
                 ),
                 "template_name": (
                     self.origami_template_result_view.get()
-                    if self.origami_template_result_view.get() in self.origami_multi_template_results
+                    if (self.origami_template_result_view.get() in self.origami_multi_template_results
+                        or self.origami_template_result_view.get() == "Unclassified")
                     else None
                 ),
                 "source_count": len(self.origami_source_points_nm) if self.origami_source_points_nm is not None else 0,
@@ -9628,6 +9777,7 @@ class PaintAnalysisApp(tk.Tk):
                 "source_path": self.loaded.path if self.loaded is not None else None,
                 "source_label": self.origami_result_source,
                 "source_count": self.origami_result_source_count,
+                "preserve_pose": bool((self.origami_identification_params or {}).get("classification_method")),
             }
         except (tk.TclError, TypeError, ValueError) as exc:
             messagebox.showerror("Invalid G5M settings", str(exc))
@@ -9678,6 +9828,7 @@ class PaintAnalysisApp(tk.Tk):
             g5m_min_locs=int(params["g5m_min_locs"]),
             g5m_max_rounds_without_best_bic=int(params["g5m_bic_patience"]),
             prealigned=True,
+            preserve_pose=params.get("template_name") is not None or bool(params.get("preserve_pose", False)),
             source_centers_nm=accepted_centers,
             allow_mirror=bool(params["allow_mirror"]),
             initially_rejected_count=rejected_count,
@@ -9722,6 +9873,7 @@ class PaintAnalysisApp(tk.Tk):
             float(self.rcc_lattice_pitch_nm.get()),
             self.drift_file_path,
         )
+        self._worker_status("Drift correction complete; saving session cache in bounded chunks...")
         cache_path = save_development_session_cache(
             self.loaded,
             corrected_locs,
@@ -10815,7 +10967,7 @@ class PaintAnalysisApp(tk.Tk):
                                     )
                                 self.origami_template_result_view.set("All templates")
                                 self.origami_template_result_combo.configure(
-                                    values=("All templates", *names)
+                                    values=("All templates", *names, "Unclassified")
                                 )
                                 self.origami_template_result_combo.state(["!disabled", "readonly"])
                                 self.origami_identification_baseline = (
@@ -10911,6 +11063,10 @@ class PaintAnalysisApp(tk.Tk):
                                     f"{result_payload['tile_count']:,} selected complete {width_nm:g} × {height_nm:g} nm ROIs "
                                     f"({tile_summary})."
                                 )
+                        elif result_kind == "origami_orientation":
+                            self._finish_origami_orientation(result_payload)
+                        elif result_kind == "origami_dropout":
+                            self._finish_origami_dropout(result_payload)
                         elif result_kind == "origami":
                             if self.loaded is not None and result_payload.get("source_path") == self.loaded.path:
                                 self._plot_origami_analysis(result_payload)
@@ -12452,11 +12608,17 @@ class PaintAnalysisApp(tk.Tk):
             f"pick bin {float(self.origami_pick_bin_nm.get()):g} nm; density ≥ {picks.density_threshold:.3g}; "
             f"showing {visible_footprints}/{total_visible} footprints in view"
         )
+        if selected_template == "Unclassified":
+            axis.set_title(f"Unclassified origami: {picks.accepted_count:,} candidates\n"
+                           f"Saved alignment for QC; reference sites do not imply a winning template. "
+                           f"Showing {visible_footprints}/{total_visible} footprints in view")
         self.origami_canvas.draw_idle()
         self.origami_last_rendered_plot_option = "Identified origami template matches"
         self._configure_origami_navigation_controls()
         self.notebook.select(ORIGAMI_TAB)
-        if is_stage_preview:
+        if selected_template == "Unclassified":
+            self.status.set("Showing unclassified candidates only. Choose a gallery, aligned density, or site summary to inspect their saved alignments.")
+        elif is_stage_preview:
             self.status.set(
                 f"{picks.accepted_count}/{len(picks.regions)} candidates pass fit gates. "
                 "Enable text statistics to inspect failed fits. Classification is applied in Step 4."
@@ -13080,11 +13242,11 @@ class PaintAnalysisApp(tk.Tk):
         overlay[..., 2] = template_positive
         overlay = np.clip(overlay, 0.0, 1.0)
         accepted = bool(picks.accepted_mask[region_index])
-        decision = "ACCEPTED" if accepted else "REJECTED"
+        decision = "UNCLASSIFIED — saved alignment for QC" if params.get("_unclassified_display") else ("ACCEPTED" if accepted else "REJECTED")
         overlap = np.asarray(getattr(picks, "footprint_overlap_fraction", ()))
         if not accepted and overlap.ndim == 1 and region_index < len(overlap) and overlap[region_index] > float(params.get("max_footprint_overlap_fraction", 0.0)):
             decision += f" — overlapping footprints ({overlap[region_index]:.0%})"
-        decision_color = "#15803d" if accepted else "#b91c1c"
+        decision_color = "#6b7280" if params.get("_unclassified_display") else ("#15803d" if accepted else "#b91c1c")
 
         self.origami_plot_option.set("Identified origami template matches")
         self.origami_figure.clear()
@@ -13438,6 +13600,9 @@ class PaintAnalysisApp(tk.Tk):
         # for the text-statistics view that explains why they failed.
         active = self._active_origami_picks_and_params()
         unclassified_params = active[1] if active is not None and active[0] is picks else dict(self.origami_identification_params or {})
+        if unclassified_params.get("_unclassified_display"):
+            visible = visible[np.asarray(picks.accepted_mask[visible], dtype=bool)]
+            total_visible = len(visible)
         if self.origami_show_theoretical_overlay.get() and unclassified_params.get("classification_method") == "exact digital ON/OFF lookup":
             dispositions = unclassified_params.get("classification_dispositions", ())
             details = [
@@ -13688,7 +13853,7 @@ class PaintAnalysisApp(tk.Tk):
                 self.origami_footprint_artists.append(rectangle)
             if show_labels:
                 label_corner = corners[int(np.argmax(corners[:, 1]))]
-                prefix = f"A{accepted_number}" if accepted else f"R{region_index + 1}"
+                prefix = f"U{accepted_number}" if params.get("_unclassified_display") else (f"A{accepted_number}" if accepted else f"R{region_index + 1}")
                 classification_scores = params.get("classification_scores", ())
                 monte_carlo_posteriors = params.get("classification_monte_carlo_posterior", ())
                 lattice_precisions = params.get("classification_lattice_precision", ())
@@ -14275,7 +14440,7 @@ class PaintAnalysisApp(tk.Tk):
         result_template = payload.get("template_name")
         if result_template is None:
             self.origami_single_overlay_building = False
-        if result_template in self.origami_multi_template_results:
+        if result_template in self.origami_multi_template_results or result_template == "Unclassified":
             self.origami_multi_template_overlay_results[str(result_template)] = dict(payload)
             getattr(self, "origami_multi_template_overlays_building", set()).discard(result_template)
             if self.origami_template_result_view.get() != result_template:
@@ -14318,6 +14483,15 @@ class PaintAnalysisApp(tk.Tk):
             min_grid_match_fraction=min_match,
             max_alignment_rms_nm=max_rms,
         )
+        review_variable = self.__dict__.get("origami_review_filter")
+        if review_variable is not None and (self.origami_identification_params or {}).get("_unclassified_display"):
+            audit = self._get_origami_review()
+            self.origami_review_combo.configure(values=review_filter_options(audit))
+            mask = review_mask(audit["candidates"], review_variable.get())
+            candidate_indices = np.flatnonzero(self.origami_pick_result.accepted_mask)
+            if len(candidate_indices) != result.origami_count:
+                raise ValueError("Gallery candidate mapping is stale. Rebuild the overlay.")
+            indices = indices[mask[candidate_indices[indices]]]
         page_indices, page_number, page_count = origami_gallery_page(
             indices,
             int(self.origami_gallery_page.get()),
@@ -14442,6 +14616,9 @@ class PaintAnalysisApp(tk.Tk):
         if option == "Digital-pixel spatial heatmap":
             self._plot_digital_pixel_spatial_heatmap()
             return
+        if option in ("Digital-group threshold audit", "Unmatched-pattern audit", "Unclassified evidence distributions", "Threshold sensitivity", "ON-dropout model check", "180° orientation check"):
+            self._plot_origami_audit(option)
+            return
         if option == "Digital-group bias heatmap":
             self._plot_digital_group_bias_heatmap()
             return
@@ -14461,6 +14638,9 @@ class PaintAnalysisApp(tk.Tk):
             self._plot_identified_origamis()
             return
 
+        if option == "Why wasn’t this full?":
+            self._plot_origami_full_review()
+            return
         result = self.origami_result
         render_settings = self.origami_result_render_settings
         if result is None or render_settings is None:
@@ -14677,6 +14857,12 @@ class PaintAnalysisApp(tk.Tk):
                     fontweight="bold",
                 )
             axis.legend(loc="upper right", fontsize=8)
+        evaluated_count = sum(counts) + int(self.origami_multi_template_unclassified_count)
+        expected_counts = evaluated_count * expected_template_fractions(names)
+        axis.scatter(np.arange(len(names)), expected_counts, marker="_", s=280,
+                     linewidths=2, color="#111827", zorder=6,
+                     label="Expected mixture (code3 ×2; all evaluated candidates)")
+        axis.legend(loc="upper right", fontsize=8)
         axis.set_xticks(np.arange(len(labels)), labels=labels, rotation=20, ha="right")
         axis.set_ylabel("classified origami count")
         axis.set_title(
@@ -14700,6 +14886,12 @@ class PaintAnalysisApp(tk.Tk):
     def _plot_digital_pixel_spatial_heatmap(self) -> None:
         selected = self.origami_template_result_view.get()
         results = self.origami_multi_template_results
+        if selected == "Unclassified":
+            try:
+                results = {"Unclassified": unclassified_display_payload(results)}
+            except ValueError as exc:
+                messagebox.showinfo("Unclassified plots unavailable", str(exc))
+                return
         names = list(results) if selected == "All templates" else [selected]
         cohorts = []
         for name in names:
@@ -14760,6 +14952,163 @@ class PaintAnalysisApp(tk.Tk):
         self.notebook.select(ORIGAMI_TAB)
         self.status.set("Spatial ON fractions use the same probability, localization support, and prominence "
                         "criteria as digital-pixel inspection. Missing measurements are excluded; gray means no data.")
+
+    def _get_origami_review(self):
+        results = self.origami_multi_template_results
+        details = self.origami_multi_template_unclassified_details
+        key = (tuple((name, id(p["picks"]), id(p["params"])) for name, p in results.items()), id(details))
+        cache = self.__dict__.get("origami_review_cache")
+        if cache is None or cache[0] != key:
+            cache = (key, review_tables(results, details))
+            self.origami_review_cache = cache
+        return cache[1]
+
+    def _show_origami_full_review(self):
+        self.origami_plot_option.set("Why wasn’t this full?")
+        self._plot_origami_full_review()
+
+    def _plot_origami_full_review(self):
+        if self.origami_result is None or self.origami_selected_index is None:
+            messagebox.showinfo("Select an origami", "Click a gallery thumbnail first, then choose Why wasn't this full?.")
+            return
+        saved = saved_gallery_classification(self, self.origami_result, int(self.origami_selected_index))
+        if saved is None:
+            messagebox.showinfo("Saved measurements unavailable", "Rebuild the classification overlay before inspecting this candidate.")
+            return
+        try:
+            audit = self._get_origami_review()
+            first = next(iter(self.origami_multi_template_results.values()))
+            p = first["params"]
+            grid = origami_grid_points(int(p["rows"]), int(p["columns"]), float(p["spacing_x_nm"]), float(p["spacing_y_nm"]), p)
+            qc_reasons = []
+            for name, payload in self.origami_multi_template_results.items():
+                if not all(payload["params"]["logical_model"]["active_bits"]):
+                    continue
+                picks, params = payload["picks"], payload["params"]
+                i = saved[1]
+                reasons = origami_candidate_failure_reasons(
+                    point_count=int(picks.point_counts[i]), correlation=float(picks.rectangle_confidence[i]),
+                    supported_sites=int(picks.supported_site_count[i]), supported_rows=int(picks.supported_row_count[i]),
+                    supported_columns=int(picks.supported_column_count[i]), spacing_error_nm=float(picks.site_spacing_max_error_nm[i]), params=params)
+                if not required_corner_mask(picks, params, i)[0]:
+                    reasons.append("required corner support missing")
+                overlap = picks.footprint_overlap_fraction
+                if len(overlap) > i and overlap[i] > float(params.get("max_footprint_overlap_fraction", 0)):
+                    reasons.append(f"overlap {overlap[i]:.1%} exceeds threshold")
+                qc_reasons.append(f"{name} other QC: " + ("; ".join(reasons) or "no failed gates"))
+            plot_full_detail(self.origami_figure, self.origami_multi_template_results, audit, saved[1] + 1,
+                             grid_points=grid, qc_reasons=qc_reasons)
+        except (ValueError, IndexError, KeyError) as exc:
+            messagebox.showinfo("Candidate review unavailable", str(exc))
+            return
+        self.origami_canvas.draw_idle()
+        self.origami_toolbar.update()
+        self.origami_last_rendered_plot_option = "Why wasn’t this full?"
+        self.origami_detail_number.set(int(self.origami_selected_index) + 1)
+        self.origami_detail_label.set(f"Origami {int(self.origami_selected_index)+1:,}/{self.origami_result.origami_count:,}")
+        self._configure_origami_navigation_controls()
+        self.status.set("Original alignment and saved measurements; values are compared with the thresholds that produced classification.")
+
+    def _show_origami_sweep(self):
+        self.origami_plot_option.set("Threshold sensitivity")
+        self._plot_origami_audit("Threshold sensitivity")
+
+    def _plot_origami_audit(self, view: str) -> None:
+        try:
+            audit = self._get_origami_review()
+            if view == "180° orientation check":
+                key = self.origami_review_cache[0]
+                cache = self.__dict__.get("origami_orientation_cache")
+                if cache is None or cache[0] != key:
+                    results = dict(self.origami_multi_template_results)
+                    first = next(iter(results.values()))
+                    p = first["params"]
+                    grid = origami_grid_points(int(p["rows"]), int(p["columns"]), float(p["spacing_x_nm"]), float(p["spacing_y_nm"]), p)
+                    fiducials = alignment_template_overlay_points(np.empty((0, 2)), p)
+                    self.status.set("Comparing saved and 180° orientations at fixed thresholds…")
+                    self._run_worker(lambda: ("origami_orientation", {"key": key, "tables": compare_half_turn(results, audit, grid, fiducials)}))
+                    return
+                plot_half_turn(self.origami_figure, cache[1])
+            elif view == "ON-dropout model check":
+                cache = self.__dict__.get("origami_dropout_cache")
+                key = self.origami_review_cache[0]
+                if cache is None or cache[0] != key:
+                    results = dict(self.origami_multi_template_results)
+                    self.status.set("Fitting dropout models and checking held-out predictions…")
+                    self._run_worker(lambda: ("origami_dropout", {"key": key, "tables": fit_dropout_models(results, audit)}))
+                    return
+                plot_dropout_models(self.origami_figure, cache[1])
+            elif view == "Unclassified evidence distributions":
+                plot_evidence(self.origami_figure, audit)
+            elif view == "Threshold sensitivity":
+                parameter = self.origami_sweep_parameter.get()
+                text = self.origami_sweep_values.get().strip()
+                values = [float(v.strip()) for v in text.split(",")] if text else None
+                transitions, counts, baseline = threshold_sweep(self.origami_multi_template_results, parameter, values)
+                self.origami_latest_sweep = (self.origami_review_cache[0], transitions, counts)
+                plot_sweep(self.origami_figure, transitions, counts, baseline, parameter)
+            else:
+                plot_classification_audit(self.origami_figure, audit, view)
+        except ValueError as exc:
+            messagebox.showinfo("Classification audit unavailable", str(exc))
+            return
+        self.origami_canvas.draw_idle()
+        self.origami_toolbar.update()
+        self.origami_last_rendered_plot_option = view
+        self._configure_origami_navigation_controls()
+        self.notebook.select(ORIGAMI_TAB)
+        self.status.set("Read-only classification audit. Export Classification Audits for per-candidate gates, spatial coordinates, and all template distances.")
+
+    def _finish_origami_orientation(self, payload):
+        self._get_origami_review()
+        if payload["key"] != self.origami_review_cache[0]:
+            return
+        self.origami_orientation_cache = (payload["key"], payload["tables"])
+        if self.origami_plot_option.get() == "180° orientation check":
+            self._plot_origami_audit("180° orientation check")
+        else:
+            self.status.set("180° orientation check is ready in View and Export Classification Audits.")
+
+    def _finish_origami_dropout(self, payload):
+        self._get_origami_review()
+        if payload["key"] != self.origami_review_cache[0]:
+            return
+        self.origami_dropout_cache = (payload["key"], payload["tables"])
+        if self.origami_plot_option.get() == "ON-dropout model check":
+            self._plot_origami_audit("ON-dropout model check")
+        else:
+            self.status.set("Dropout model check is ready in View and Export Classification Audits.")
+
+    def export_origami_audits(self) -> None:
+        try:
+            audit = dict(self._get_origami_review())
+            orientation = self.__dict__.get("origami_orientation_cache")
+            if orientation is not None and orientation[0] == self.origami_review_cache[0]:
+                audit.update(orientation[1])
+                audit["metadata"] = dict(audit["metadata"], orientation_notes="0° and exact 180° about saved origin. No translation/refitting. Paired boundary correlation from cropped saved localizations differs from original search score. Non-orientation QC eligibility stays fixed; unknown eligibility is not a pass. Alternative matches are diagnostic only.")
+            dropout = self.__dict__.get("origami_dropout_cache")
+            if dropout is not None and dropout[0] == self.origami_review_cache[0]:
+                audit.update(dropout[1])
+                audit["metadata"] = dict(audit["metadata"], dropout_model_notes="Fixed mixture; conditionally independent binary calls; ON>=false-ON; three deterministic random folds (seed 1729); held-out error bars are approximate paired standard errors, not a formal test; candidate detection/background/correlated errors are not modeled. Full penalty applies to variable groups only. Exact-pattern counts are before QC rejection.")
+            sweep = self.__dict__.get("origami_latest_sweep")
+            if sweep is not None and sweep[0] == self.origami_review_cache[0]:
+                audit["threshold_transitions"] = sweep[1]
+                audit["threshold_counts"] = sweep[2]
+        except ValueError as exc:
+            messagebox.showinfo("Classification audit unavailable", str(exc))
+            return
+        path = filedialog.asksaveasfilename(
+            title="Export classification audits", defaultextension=".zip",
+            initialfile="classification_audits.zip", filetypes=[("CSV audit archive", "*.zip")],
+        )
+        if not path:
+            return
+        try:
+            export_classification_audits(audit, path)
+        except (OSError, ValueError) as exc:
+            messagebox.showerror("Audit export failed", str(exc))
+            return
+        self.status.set(f"Saved classification audit tables to {path}")
 
     def _plot_digital_group_bias_heatmap(self) -> None:
         """Show aggregate digital-group ON probabilities by assignment cohort."""
@@ -14827,14 +15176,12 @@ class PaintAnalysisApp(tk.Tk):
                 mean_probability[:, cohort_index] = np.nanmean(values, axis=0)
                 on_fraction[:, cohort_index] = np.nanmean(values >= 0.5, axis=0)
 
-        expected_on = np.asarray(
-            first_params.get("digital_group_expected_on_fractions", ()), dtype=float
-        )
+        expected_on = expected_group_fractions(self.origami_multi_template_results, group_ids)
         expected_on_counts = np.full(len(group_ids), np.nan)
         expected_column_index: int | None = None
         if expected_on.shape == (len(group_ids),):
             expected_on_counts = expected_on * group_evaluated_counts
-            cohort_names.insert(1, "Expected equal mix")
+            cohort_names.insert(1, "Expected mixture")
             mean_probability = np.insert(mean_probability, 1, expected_on, axis=1)
             on_fraction = np.insert(on_fraction, 1, expected_on, axis=1)
             sample_counts = np.insert(sample_counts, 1, 0)
@@ -14857,8 +15204,8 @@ class PaintAnalysisApp(tk.Tk):
             np.arange(len(cohort_names)),
             labels=[
                 (
-                    f"{name}\nprior"
-                    if name == "Expected equal mix"
+                    f"{name}\ncode3 ×2"
+                    if name == "Expected mixture"
                     else f"{name}\nn={sample_counts[index]:,}"
                 )
                 for index, name in enumerate(cohort_names)
@@ -14919,7 +15266,7 @@ class PaintAnalysisApp(tk.Tk):
                 largest = int(np.nanargmax(np.abs(differences)))
                 self.status.set(
                     f"Digital-group ON totals across {sample_counts[0]:,} candidates: "
-                    f"largest departure from the equal-template expectation is "
+                    f"largest departure from the mixture expectation (code3 ×2) is "
                     f"{group_ids[largest]} ({observed_on_counts[largest]:,} observed vs "
                     f"{expected_on_counts[largest]:.1f} expected; "
                     f"Δ {differences[largest]:+.1f})."
@@ -15529,8 +15876,20 @@ class PaintAnalysisApp(tk.Tk):
                 centers = np.vstack(centers)
                 axis.scatter(centers[:, 0], centers[:, 1], s=6, marker="x", color="#a3e635", alpha=0.4, zorder=6.2)
         if model is not None and enabled("site_diagnostics") and result.origami_count:
-            from types import SimpleNamespace
-            PaintAnalysisApp._measure_direct_digital_groups(SimpleNamespace(aligned_regions=result.aligned_points), params)
+            if params.get("classification_method"):
+                saved = saved_gallery_classification(self, result, 0)
+                if saved is None:
+                    axis.set_title(axis.get_title() + "\nSaved calls unavailable; rebuild overlay")
+                    return
+                selection = np.flatnonzero(active[0].accepted_mask)
+                ids = tuple(map(str, params["digital_pixel_ids"]))
+                order = [ids.index(str(bit)) for bit in model["bit_ids"]]
+                for key in ("digital_pixel_probabilities", "digital_group_localization_evidence", "digital_group_prominences"):
+                    params[key] = np.asarray(params[key])[selection][:, order]
+                axis.set_title(axis.get_title() + "\nON rates from saved classification calls")
+            else:
+                from types import SimpleNamespace
+                PaintAnalysisApp._measure_direct_digital_groups(SimpleNamespace(aligned_regions=result.aligned_points), params)
             probabilities = np.asarray(params["digital_pixel_probabilities"], dtype=float)
             # Count individual decisions, rather than treating the pooled
             # localization count as evidence for a single artificial origami.
@@ -15590,9 +15949,16 @@ class PaintAnalysisApp(tk.Tk):
                 centers = transform(centers)
                 axis.scatter(centers[:, 0], centers[:, 1], s=12, marker="x", color="#a3e635", linewidths=0.7, zorder=6.2)
         if model is not None and enabled("origami_show_site_diagnostics"):
-            # Measure the actual displayed pose, including any gallery refinement.
-            from types import SimpleNamespace
-            PaintAnalysisApp._measure_direct_digital_groups(SimpleNamespace(aligned_regions=[points]), params)
+            saved = saved_gallery_classification(self, result, index)
+            if saved is not None:
+                params = saved[0]
+            elif params.get("classification_method"):
+                axis.annotate("Saved calls unavailable; rebuild overlay", transform(np.mean(grid, axis=0)[None, :])[0],
+                              color="#f59e0b", fontsize=6)
+                return
+            else:
+                from types import SimpleNamespace
+                PaintAnalysisApp._measure_direct_digital_groups(SimpleNamespace(aligned_regions=[points]), params)
             PaintAnalysisApp._draw_digital_decision_blobs(self, axis, grid, params, 0, transform)
             if enabled("origami_show_text_statistics"):
                 for center, label, color in digital_group_decision_annotations(grid, params, 0, include_statistics=True) or []:
@@ -15670,10 +16036,17 @@ class PaintAnalysisApp(tk.Tk):
             self.origami_gallery_tile_hitboxes.append(
                 (float(x0), float(x0 + tile_width), float(y0), float(y0 + tile_height), int(result_index))
             )
+            saved = saved_gallery_classification(self, result, int(result_index))
+            decision_text = ("\n" + saved[2]) if saved is not None and self.origami_show_text_statistics.get() else ""
+            if saved is not None and (self.origami_identification_params or {}).get("_unclassified_display"):
+                row = self._get_origami_review()["candidates"].iloc[saved[1]]
+                short = (f"no match d={row.nearest_distance}" if row.status == "unmatched" else
+                         {"rejected_exact": "QC rejected", "ambiguous_exact": "ambiguous", "invalid": "invalid"}.get(row.status, row.status))
+                decision_text = f"\nC{saved[1]+1}: {short}" + decision_text
             label = axis.text(
                 x0 + 2,
                 y0 + 2,
-                (f"#{int(result_index) + 1}  n={result.source_point_counts[result_index]:,}" if self.origami_show_text_statistics.get() else f"#{int(result_index) + 1}"),
+                (f"#{int(result_index) + 1}  n={result.source_point_counts[result_index]:,}" if self.origami_show_text_statistics.get() else f"#{int(result_index) + 1}") + decision_text,
                 color="white",
                 fontsize=6,
                 va="top",
@@ -15709,7 +16082,7 @@ class PaintAnalysisApp(tk.Tk):
                 fontsize=6,
                 framealpha=0.75,
             )
-        axis.set_title(f"Individual aligned origami — {self.origami_gallery_page_label.get()}\nClick a tile for full detail")
+        axis.set_title(f"Individual aligned origami — {self.origami_gallery_page_label.get()}\nSaved classification calls; click a tile for decision and rejection details")
         axis.set_axis_off()
 
     def _origami_gallery_geometry(
@@ -16040,6 +16413,12 @@ class PaintAnalysisApp(tk.Tk):
             f"RMS {result.alignment_rms_nm[index]:.3g} nm; grid match {100.0 * result.grid_match_fraction[index]:.1f}%; "
             f"{result.clustering_method}"
         )
+        self._draw_gallery_display_overlays(axis, result, int(index), digital_grid, lambda points: points)
+        saved = saved_gallery_classification(self, result, int(index))
+        if saved is not None:
+            import textwrap
+            axis.set_title(axis.get_title() + "\n" + "\n".join(textwrap.wrap(
+                f"Saved candidate #{saved[1] + 1}: {saved[2]}", width=110)), fontsize=9)
         axis.set_xlabel("aligned x (nm)")
         axis.set_ylabel("aligned y (nm)")
         axis.legend(handles=[*axis.get_legend_handles_labels()[0], *group_handles], loc="upper right", fontsize=8)

@@ -1790,9 +1790,10 @@ def _fit_translation_and_sites(
     points_nm: np.ndarray,
     grid_points_nm: np.ndarray,
     site_radius_nm: float,
+    *, preserve_pose: bool = False,
 ) -> tuple[np.ndarray, np.ndarray, float]:
     shifted = points_nm.copy()
-    for _ in range(4):
+    for _ in range(0 if preserve_pose else 4):
         distances = np.linalg.norm(shifted[:, None, :] - grid_points_nm[None, :, :], axis=2)
         nearest = np.argmin(distances, axis=1)
         residuals = shifted - grid_points_nm[nearest]
@@ -4632,6 +4633,7 @@ def align_picked_origamis(
     g5m_max_rounds_without_best_bic: int = 3,
     rectangle_corners_nm: list[np.ndarray] | None = None,
     prealigned: bool = False,
+    preserve_pose: bool = False,
     source_centers_nm: np.ndarray | None = None,
     allow_mirror: bool = False,
     initially_rejected_count: int = 0,
@@ -4678,7 +4680,7 @@ def align_picked_origamis(
         choices: list[tuple[np.ndarray, np.ndarray, float]] = []
         if prealigned:
             aligned_candidates = [(region, region)]
-            if allow_mirror:
+            if allow_mirror and not preserve_pose:
                 mirrored = region * np.asarray([-1.0, 1.0])
                 aligned_candidates.append((mirrored, mirrored))
         elif use_g5m:
@@ -4701,7 +4703,7 @@ def align_picked_origamis(
                 aligned_candidates = _rectangle_aligned_candidates(region, region, rectangle_corners, allow_mirror)
         for candidate, candidate_alignment in aligned_candidates:
             refined = candidate if prealigned else _refine_rotation_to_grid(candidate, candidate_alignment, grid, site_radius_nm)
-            choices.append(_fit_translation_and_sites(refined, grid, site_radius_nm))
+            choices.append(_fit_translation_and_sites(refined, grid, site_radius_nm, preserve_pose=preserve_pose))
         match_fractions = [float(np.sum(item[1]) / len(item[0])) for item in choices]
         best_match = max(match_fractions)
         eligible = [

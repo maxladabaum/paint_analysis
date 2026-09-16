@@ -122,6 +122,13 @@ directions in the summed Fourier spectrum and removes narrow notches at the fund
 frequency and its harmonics before RCC. The default is 700 nm. Filtering affects only the
 temporary correlation images, not the localization coordinates. Set the pitch to `0` to use
 unfiltered Picasso RCC. AIM also uses `AIM intersect (nm)` and `AIM ROI (nm)`.
+For large localization files, AIM evaluates trial shifts sequentially to bound
+memory use, using the same Picasso intersection counts and search settings.
+No localizations are sampled or discarded. This can take longer than parallel
+execution. Drift estimation carries only coordinate/precision columns; the
+returned table retains all original acquisition columns. Session caches are
+written in approximately 16 MiB batches instead of duplicating the entire table.
+The raw and corrected datasets still need to fit in memory.
 
 Drift correction and rendering are separate actions. With dynamic zoom rendering
 disabled, changing `Render pixel`, `Render blur`, or `Min blur` and pressing
@@ -731,3 +738,170 @@ when that template has a unique, finite best score. Candidates with no matching
 template and tied/ambiguous candidates are counted separately above the plots;
 they do not enter template-specific rejection bars or pass rates. Older recorded
 no-match diagnoses are also excluded from the last template's rejection count.
+
+### Classification QC audits
+
+After Step 4, choose **Digital-group threshold audit** or **Unmatched-pattern
+audit** in the View menu. These use the saved shared-candidate measurements;
+changing controls alone does not change the audit. Rerun the relevant measurement
+and classification steps to audit new thresholds.
+
+- **Digital-group threshold audit** compares final ON fractions with the reference
+  for the sample mixture (code3 at twice the concentration of other templates). It counts support, ON-score, and
+  relative-prominence failures separately, including support-pass/prominence-fail
+  cases. Failures can overlap. Invalid candidates are excluded from denominators.
+- **Unmatched-pattern audit** shows the 20 most frequent unmatched bit patterns,
+  their distance in differing groups to the nearest templates, and all nearest
+  ties. The all-ON template comparison lists the groups whose absence would
+  produce each other template's pattern. This tests possible full-template
+  dropout; it does not establish the true origin of those candidates.
+- **Export Classification Audits** saves a ZIP of CSVs: candidates and their saved
+  assignments/QC measurements; per-candidate group evidence, thresholds and gate
+  decisions; group summaries by cohort; distances to every template with missing
+  and extra groups; all unmatched patterns; and all-ON dropout comparisons.
+  `metadata.json` records group order and thresholds. Candidate IDs are one-based
+  indices in the saved shared candidate list. Join tables by `candidate_id` for
+  spatial or count-dependent QC using the exported coordinates and fit metrics.
+
+Audits do not change assignments, infer truth from nearest patterns, or enforce
+equal prevalence. The mixture expectation is only a reference. They require
+consistent shared measurements across templates and cannot measure objects
+missed during coarse detection; detection bias still needs independent labeled
+or simulated controls. Support-only scores are diagnostic scores, not calibrated
+class probabilities.
+
+Choose **Unclassified** in the Classification selector to inspect candidates that
+were not assigned to any template, including QC rejections and unmatched patterns.
+The selection supports the footprint overview, individual galleries and details,
+aligned density, site summaries, and digital-pixel spatial heatmap. It uses the
+saved shared alignment and a separate display overlay; class assignments and counts
+are unchanged. Reference sites in these plots are not a winning template. Only
+unclassified footprints are shown, including when text statistics is enabled.
+
+Expected plots use relative template concentrations **1:1:1:2:1:1** for
+`align_fid`, `code1`, `code2`, `code3`, `code4`, and `full`. Template names
+are matched without regard to case, spaces, underscores, or hyphens. Weights
+are normalized over loaded templates. The group bias heatmap and threshold
+audit recompute expected ON fractions from the template patterns; template-count
+markers use the total assigned plus unclassified count as the denominator.
+Audit metadata records the normalized fractions. These references do not alter
+classification scores, gates, or assignments.
+
+Classification galleries and aligned-density ON rates use the saved Step 3/4
+measurements. They do not remeasure group calls on a separately adjusted gallery
+pose. Classification overlays preserve the saved translation and orientation,
+including during G5M site clustering. Individual detail views show the saved
+candidate ID and classification/rejection reason; gallery text statistics also
+show that reason. Missing or stale measurement mappings are labeled unavailable
+rather than replaced by newly measured calls. Restart the app and rebuild older
+classification overlays to remove their previous display-only translations.
+
+### Investigating unclassified origami
+
+After classification, choose **Unclassified** and open the individual gallery.
+The **Unclassified investigation** section provides a **Gallery rejection group**
+selector: exact-pattern QC rejections, correlation/overlap/point-limit subgroups,
+unmatched patterns grouped by number of differing groups, ambiguous matches,
+invalid measurements, and near-full candidates with one or two groups OFF.
+These filters only change the displayed subset. Thumbnail captions include the
+saved candidate ID and a short disposition; text statistics adds the full reason.
+
+Click a thumbnail, then **Why wasn't this full?** to see the original aligned
+localizations, site measurement regions, saved group calls, support/score/prominence
+values alongside their thresholds, groups missing from a full match, and other
+failed QC gates. It does not reinterpret a nearest template as the true type.
+
+Choose **Unclassified evidence distributions** from View to inspect continuous
+support and prominence distributions. Red lines mark the saved thresholds.
+Support uses a symmetric-log x axis to show small values and long tails together;
+the linear region includes the support threshold. These distributions include
+groups that are legitimately OFF, so below-threshold values alone do not prove
+signal dropout.
+
+For **Threshold sensitivity**, select support or prominence in the investigation
+section, optionally enter comma-separated threshold values, and click **Run
+threshold sweep**. Blank values produce nine automatic settings around the saved
+threshold; the saved setting is always included. Each run varies only one digital
+threshold, using the same measurements and fixed non-digital QC eligibility.
+The plots show predicted class counts, recoveries, lost assignments, and switches
+relative to the saved assignments. No settings or assignments are applied.
+
+A sweep must reproduce the saved classification at its baseline before it runs.
+If older results lack QC eligibility, rerun classification/whole-image analysis
+as prompted. This also avoids presenting guesses about missing gate records.
+**Export Classification Audits** includes review groups and, after a successful
+sweep, `threshold_transitions.csv` (every candidate at every tested threshold)
+and `threshold_counts.csv`. Join the transition table to `candidates.csv` by
+`candidate_id` to locate individual changed candidates. Recoveries are proposed
+assignments, not verified correct classifications; mixture ratios are not used
+to optimize the sweep.
+
+### Is full underrepresented because it needs more ON groups?
+
+Choose **ON-dropout model check** in View after digital classification. The model
+fits all valid saved ON/OFF patterns, including unclassified candidates, without
+using assigned class labels as truth. It uses the input mixture (code3 twice the
+weight of the other templates) and compares:
+
+1. One ON-detection rate and one false-ON rate shared across groups/templates.
+2. Group-specific ON-detection and false-ON rates shared across template types.
+3. The group model plus an additional loss of ON signal for variable groups in
+   the full template. The common alignment group is unaffected by this extra term.
+
+ON-detection probabilities are constrained to be at least false-ON probabilities.
+An always-ON group has no identifiable false-ON rate, so that estimate is omitted.
+The extra-full parameter retains a fraction of the difference between ON detection
+and false-ON, rather than measuring physical full-origami yield.
+
+The check compares model complexity using BIC (lower is better), and predictive
+log scores using three deterministic held-out folds (higher is better). Error
+bars on score differences are twice an approximate paired standard error, not a
+formal significance test. Inspect both comparisons and pattern residuals; an
+extra-full term improving in-sample fit alone is insufficient evidence for a
+full-specific effect. Small datasets, boundary fits, and correlated errors can
+make estimates uncertain.
+
+The count plot compares exact patterns **before final QC rejection**, not final
+assignments. The three largest pattern discrepancies under the group model are
+shown, and all pattern residuals are exported. Fitting runs in a worker and is
+cached for the current result set. After it finishes, **Export Classification
+Audits** includes model statistics, group error estimates, pattern counts,
+all binary-pattern residuals, and per-candidate held-out scores.
+
+This is an exploratory model comparison. It assumes independent group calls
+conditional on the unknown true template and that the known input mixture also
+describes the detected candidates. It does not model preferential detection,
+damaged/background objects, or correlated signal loss. Those processes could
+look like an extra full effect. Model rates are inferred, not independently
+measured error rates, and no assignments are changed. At least 30 valid candidates
+(and three per group), distinct template patterns, one all-ON template, and no
+more than 12 groups are required.
+
+### Checking a possible 180° alignment error
+
+Choose **180° orientation check** in View after classification. It compares the
+saved aligned localizations with an exact half-turn about the saved origin,
+without translating, recropping, refitting, or changing any assignment. Both
+orientations use the saved group thresholds. The original orientation must
+reproduce the saved calls before the comparison is accepted.
+
+The plot compares paired alignment-raster correlations, supported fiducial counts,
+ON-group gains, and alternative exact template matches. It lists saved candidate
+IDs worth inspecting. A new match is stronger evidence when both fiducial support
+and paired correlation improve; trying an extra orientation can otherwise create
+chance matches. Invalid saved candidates are excluded from summary counts.
+
+The paired correlations use **cropped saved localizations**, so they are not the
+original search scores (which had more context). The original score is exported
+separately. Original QC eligibility and duplicate/tile exclusions stay fixed;
+unknown QC eligibility is not a pass. A newly matching pattern still requires
+proper alignment/QC validation before it could be reassigned. Corner-support
+results for both orientations are exported independently of whether that gate
+was enabled.
+
+After the worker finishes, **Export Classification Audits** includes
+`orientation_candidates.csv`, `orientation_groups.csv`, and
+`orientation_fiducials.csv`, with original IDs, both patterns, gained/lost groups,
+paired scores, and support counts. The comparison requires the saved alignment
+raster and fiducial geometry. This is a test of an exact half-turn, not a search
+for a better translated or otherwise adjusted pose.

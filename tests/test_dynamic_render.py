@@ -1551,7 +1551,7 @@ class DynamicRenderTests(unittest.TestCase):
 
         PaintAnalysisApp._sync_origami_classification_selector_state(app)
 
-        combo.configure.assert_called_once_with(values=("All templates", "square", "LL"))
+        combo.configure.assert_called_once_with(values=("All templates", "square", "LL", "Unclassified"))
         combo.state.assert_called_once_with(["!disabled", "readonly"])
         self.assertEqual(selected.get(), "square")
 
@@ -1632,6 +1632,12 @@ class DynamicRenderTests(unittest.TestCase):
                 "Origami type counts",
                 "Classification diagnostics",
                 "Digital-group bias heatmap",
+                "Digital-group threshold audit",
+                "Unmatched-pattern audit",
+                "Unclassified evidence distributions",
+                "Threshold sensitivity",
+                "ON-dropout model check",
+                "180° orientation check",
                 "Digital-pixel spatial heatmap",
                 "Individual origami gallery",
             ),
@@ -1648,6 +1654,12 @@ class DynamicRenderTests(unittest.TestCase):
                 "Origami type counts",
                 "Classification diagnostics",
                 "Digital-group bias heatmap",
+                "Digital-group threshold audit",
+                "Unmatched-pattern audit",
+                "Unclassified evidence distributions",
+                "Threshold sensitivity",
+                "ON-dropout model check",
+                "180° orientation check",
                 "Digital-pixel spatial heatmap",
             )
         )
@@ -1661,7 +1673,11 @@ class DynamicRenderTests(unittest.TestCase):
             origami_template_result_view=SimpleNamespace(get=lambda: "full_align"),
             origami_result=None,
             origami_all_plot_options=("Coarse identification density", "Identified origami template matches",
-                "Origami type counts", "Classification diagnostics", "Digital-group bias heatmap",
+                "Origami type counts", "Classification diagnostics", "Digital-group bias heatmap", "Digital-group threshold audit", "Unmatched-pattern audit",
+                "Unclassified evidence distributions",
+                "Threshold sensitivity",
+                "ON-dropout model check",
+                "180° orientation check",
                 "Digital-pixel spatial heatmap", "Individual origami gallery", "Aligned density"),
             origami_plot_combo=combo,
         )
@@ -1830,6 +1846,12 @@ class DynamicRenderTests(unittest.TestCase):
                 "Origami type counts",
                 "Classification diagnostics",
                 "Digital-group bias heatmap",
+                "Digital-group threshold audit",
+                "Unmatched-pattern audit",
+                "Unclassified evidence distributions",
+                "Threshold sensitivity",
+                "ON-dropout model check",
+                "180° orientation check",
                 "Digital-pixel spatial heatmap",
                 "Individual origami gallery",
                 "Aligned density",
@@ -1848,6 +1870,12 @@ class DynamicRenderTests(unittest.TestCase):
                 "Origami type counts",
                 "Classification diagnostics",
                 "Digital-group bias heatmap",
+                "Digital-group threshold audit",
+                "Unmatched-pattern audit",
+                "Unclassified evidence distributions",
+                "Threshold sensitivity",
+                "ON-dropout model check",
+                "180° orientation check",
                 "Digital-pixel spatial heatmap",
                 "Individual origami gallery",
                 "Aligned density",
@@ -1868,6 +1896,7 @@ class DynamicRenderTests(unittest.TestCase):
                         "digital_pixel_model": model,
                         "digital_pixel_probabilities": probabilities,
                         "digital_group_expected_on_fractions": (0.5, 0.25),
+                        "logical_model": dict(bit_ids=("left", "right"), active_bits=(True, False)),
                     },
                 },
                 "type_b": {
@@ -1876,6 +1905,7 @@ class DynamicRenderTests(unittest.TestCase):
                     ),
                     "params": {
                         "digital_pixel_model": model,
+                        "logical_model": dict(bit_ids=("right", "left"), active_bits=(True, False)),
                         "digital_pixel_probabilities": probabilities,
                     },
                 },
@@ -1896,7 +1926,7 @@ class DynamicRenderTests(unittest.TestCase):
             np.asarray(
                 [
                     [(0.9 + 0.8 + 0.2) / 3.0, 0.5, 0.9, 0.8, 0.2],
-                    [(0.1 + 0.7 + 0.4) / 3.0, 0.25, 0.1, 0.7, 0.4],
+                    [(0.1 + 0.7 + 0.4) / 3.0, 0.5, 0.1, 0.7, 0.4],
                 ]
             ),
         )
