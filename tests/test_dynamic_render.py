@@ -944,6 +944,47 @@ class DynamicRenderTests(unittest.TestCase):
         self.assertEqual(float(loaded[-1, 1]), float(loaded[-1, 3]))
         self.assertGreater(float(loaded[-1, 1]), 0.0)
 
+    def test_template_mirror_flag_handles_legacy_and_pre_mirrored_exports(self):
+        metadata = {
+            "format": "paint-analysis-origami-template-v1",
+            "rows": 2, "columns": 3, "spacing_x_nm": 10,
+            "spacing_y_nm": 5, "margin_nm": 2,
+            "width_nm": 31, "height_nm": 9, "width_px": 32, "height_px": 10,
+            "column_offsets_nm": [0, 2, 7],
+            "logical_model": {
+                "format": "paint-analysis-logical-bits-v1",
+                "physical_rows": 2, "physical_columns": 3,
+                "column_offsets_nm": [0, 2, 7],
+                "alignment_groups": [],
+                "logical_bits": [{"id": "first", "physical_sites": [[1, 1]]}],
+                "active_logical_bits": ["first"],
+            },
+        }
+        canonical = np.zeros((10, 32), dtype=np.uint8)
+        canonical[2, 2] = 255
+        expected = np.flip(canonical, axis=(0, 1)) / 255.
+        with TemporaryDirectory() as directory:
+            for flag in (None, False, True):
+                for embedded in (False, True):
+                    with self.subTest(flag=flag, embedded=embedded):
+                        payload = dict(metadata)
+                        if flag is not None:
+                            payload["image_mirrored_x"] = flag
+                        path = Path(directory) / f"test_{flag}_{embedded}.png"
+                        info = PngImagePlugin.PngInfo()
+                        if embedded:
+                            info.add_text("paint_analysis_template", json.dumps(payload))
+                        else:
+                            path.with_suffix(".json").write_text(json.dumps(payload))
+                        raster = np.fliplr(canonical) if flag else canonical
+                        Image.fromarray(raster).save(path, pnginfo=info)
+                        np.testing.assert_allclose(load_custom_template_image(path), expected)
+                        loaded = load_custom_template_metadata(path)
+                        self.assertEqual(loaded["column_offsets_nm"], (-7., -2., 0.))
+                        model = logical_stroke_model_from_metadata(loaded)
+                        self.assertEqual(model["bit_cells"], ((5,),))
+                        self.assertEqual(model["column_offsets_nm"], (-7., -2., 0.))
+
     def test_custom_template_loader_reads_embedded_picklist_calibration(self) -> None:
         metadata = {
             "format": "paint-analysis-origami-template-v1",

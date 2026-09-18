@@ -905,3 +905,14 @@ After the worker finishes, **Export Classification Audits** includes
 paired scores, and support counts. The comparison requires the saved alignment
 raster and fiducial geometry. This is a test of an exact half-turn, not a search
 for a better translated or otherwise adjusted pose.
+
+### Picklist template image orientation
+
+New Picklist Generator exports display descending columns, matching PAINT R1.
+Both PNG embedded calibration and the JSON sidecar record `image_mirrored_x`:
+`true` means the horizontal reflection is already in the raster; `false` means
+analysis must reflect it. Calibrated legacy files without this flag retain the
+previous reflection behavior. Uncalibrated images are unchanged. Logical site
+IDs and column offsets remain canonical C1..Cn in exported metadata and are
+converted independently, so pre-mirroring the image does not move group labels
+to different physical sites.

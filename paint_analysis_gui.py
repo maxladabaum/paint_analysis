@@ -940,8 +940,10 @@ def load_custom_template_image(path: str | Path) -> np.ndarray:
     # Raster rows run downward; alignment coordinates use positive y upward.
     image = np.flipud(image)
     # Template columns c1..c12 correspond to PAINT R1 replacements 12..1.
-    # Reverse the column order (x -> -x) to use the experimental convention.
-    if metadata is not None:
+    # Legacy exports have canonical raster order. New exports explicitly record
+    # whether that reflection is already baked into the pixels. Logical sites
+    # remain canonical in both cases and are transformed independently.
+    if metadata is not None and not metadata.get("image_mirrored_x", False):
         image = np.fliplr(image)
     return np.asarray(image, dtype=float).copy()
 
@@ -999,6 +1001,10 @@ def load_custom_template_metadata(path: str | Path) -> dict[str, Any] | None:
         if not all(key in metadata for key in required):
             continue
         metadata = dict(metadata)
+        if "image_mirrored_x" in metadata and not isinstance(metadata["image_mirrored_x"], bool):
+            raise ValueError("Template image_mirrored_x must be a JSON boolean.")
+        if metadata.get("logical_site_column_order", "canonical-c1-to-cn") != "canonical-c1-to-cn":
+            raise ValueError("Unsupported template logical-site column order.")
         # Early Picklist Generator exports used a 120 x 40 nm active lattice.
         # Correct that recognizable 8 x 12 calibration to the measured
         # 120 x 35 nm geometry while leaving arbitrary/custom geometries alone.
@@ -1071,7 +1077,7 @@ def logical_bit_model_from_metadata(metadata: dict[str, Any]) -> dict[str, Any] 
             # Generator rows are top-to-bottom. Alignment coordinates and the
             # full physical lattice use y-up ordering. Reverse columns too
             # to map template c1..c12 to PAINT R1 replacements 12..1,
-            # matching the column reversal applied to generator rasters.
+            # regardless of whether the exported raster is already mirrored.
             physical_row = rows - 1 - source_row
             physical_column = columns - 1 - column
             cells.add(physical_row * columns + physical_column)
