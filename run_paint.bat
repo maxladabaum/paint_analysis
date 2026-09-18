@@ -39,7 +39,7 @@ if not exist "%VENV_DIR%\Scripts\python.exe" (
     "%PYTHON_CMD%" %PYTHON_ARGS% -m venv "%VENV_DIR%"
     if errorlevel 1 goto :venv_failed
 ) else (
-    "%VENV_DIR%\Scripts\python.exe" -c "import sys; raise SystemExit(0 if (3, 10) ^<= sys.version_info[:2] ^< (3, 15) else 1)" >nul 2>nul
+    "%VENV_DIR%\Scripts\python.exe" -c "import sys; raise SystemExit(0 if sys.version_info[:2] in ((3, 10), (3, 11), (3, 12), (3, 13), (3, 14)) else 1)" >nul 2>nul
     if errorlevel 1 (
         echo Rebuilding an incompatible application environment...
         rmdir /s /q "%VENV_DIR%"
@@ -82,13 +82,13 @@ if not errorlevel 1 (
     set "PYTHON_ARGS=-3.12"
     exit /b 0
 )
-py -3 -c "import ensurepip, tkinter, venv, sys; raise SystemExit(0 if (3, 10) ^<= sys.version_info[:2] ^< (3, 15) else 1)" >nul 2>nul
+py -3 -c "import ensurepip, tkinter, venv, sys; raise SystemExit(0 if sys.version_info[:2] in ((3, 10), (3, 11), (3, 12), (3, 13), (3, 14)) else 1)" >nul 2>nul
 if not errorlevel 1 (
     set "PYTHON_CMD=py"
     set "PYTHON_ARGS=-3"
     exit /b 0
 )
-python -c "import ensurepip, tkinter, venv, sys; raise SystemExit(0 if (3, 10) ^<= sys.version_info[:2] ^< (3, 15) else 1)" >nul 2>nul
+python -c "import ensurepip, tkinter, venv, sys; raise SystemExit(0 if sys.version_info[:2] in ((3, 10), (3, 11), (3, 12), (3, 13), (3, 14)) else 1)" >nul 2>nul
 if not errorlevel 1 (
     set "PYTHON_CMD=python"
     exit /b 0
@@ -101,7 +101,7 @@ exit /b 0
 :consider_python
 if defined PYTHON_CMD exit /b 0
 if not exist "%~1" exit /b 0
-"%~1" -c "import ensurepip, tkinter, venv, sys; raise SystemExit(0 if (3, 10) ^<= sys.version_info[:2] ^< (3, 15) else 1)" >nul 2>nul
+"%~1" -c "import ensurepip, tkinter, venv, sys; raise SystemExit(0 if sys.version_info[:2] in ((3, 10), (3, 11), (3, 12), (3, 13), (3, 14)) else 1)" >nul 2>nul
 if not errorlevel 1 set "PYTHON_CMD=%~1"
 exit /b 0
 
