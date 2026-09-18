@@ -300,6 +300,7 @@ def memory_bounded_aim(module: Any, progress_dialog_type: Any = None) -> Callabl
     Clone its Python functions into a private namespace so concurrent callers
     never change Picasso globals or its GUI progress-dialog class.
     """
+    from inspect import signature
     from types import FunctionType, SimpleNamespace
 
     count = getattr(module, "_count_intersections", None)
@@ -307,8 +308,15 @@ def memory_bounded_aim(module: Any, progress_dialog_type: Any = None) -> Callabl
         count = getattr(module, "count_intersections", None)
     if count is None:
         raise RuntimeError("This Picasso version does not expose AIM intersection counting.")
+    # Newer Picasso kernels accept all shifts and return one count per shift
+    # without allocating a coordinates-by-shifts array. Numba exposes the
+    # original Python function through py_func for signature inspection.
+    count_accepts_shifts = "shifts" in signature(getattr(count, "py_func", count)).parameters
 
     def intersections(l0_coords, l0_counts, l1_coords, l1_counts, shifts_xy, box):
+        if count_accepts_shifts:
+            values = count(l0_coords, l0_counts, l1_coords, l1_counts, shifts_xy)
+            return values if box == 1 else values.reshape(box, box)
         values = np.empty(len(shifts_xy), dtype=np.int64)
         shift_dtype = np.result_type(l1_coords.dtype, shifts_xy.dtype)
         for index, shift in enumerate(shifts_xy):

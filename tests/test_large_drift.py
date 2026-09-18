@@ -4,6 +4,7 @@ from unittest import mock
 import h5py
 import numpy as np
 import pandas as pd
+import numba
 
 from drift_analysis import memory_bounded_aim
 from paint_analysis_gui import _write_cached_dataframe, apply_drift_correction
@@ -37,6 +38,40 @@ def test_aim_processes_one_shift_at_a_time_without_changing_module():
     assert bounded.__globals__['lib'].ProgressDialog is str
     np.testing.assert_array_equal(b, np.arange(4, 14))
     assert len(calls) == 14
+
+
+def test_aim_supports_numba_kernel_with_explicit_shifts():
+    module = ModuleType('test_new_aim')
+
+    @numba.njit
+    def count(a, ac, b, bc, shifts):
+        values = np.zeros(len(shifts), dtype=np.int64)
+        for s in range(len(shifts)):
+            for j in range(len(b)):
+                index = np.searchsorted(a, b[j] + shifts[s])
+                if index < len(a) and a[index] == b[j] + shifts[s]:
+                    values[s] += min(ac[index], bc[j])
+        return values
+
+    module._count_intersections = count
+    exec('def _run_intersections(*args):\n    raise AssertionError("original dispatcher called")\n'
+         'def aim(*args):\n    return _run_intersections(*args)\n', module.__dict__)
+    original = module._run_intersections
+    bounded = memory_bounded_aim(module)
+    a = np.array([0, 2, 5, 8, 10])
+    ac = np.array([3, 1, 4, 2, 5])
+    b = np.array([1, 4, 7])
+    bc = np.array([2, 6, 3])
+    for box, shifts in ((3, np.arange(-4, 5)), (1, np.arange(-2, 3))):
+        expected = []
+        for shift in shifts:
+            _, ai, bi = np.intersect1d(a, b + shift, return_indices=True)
+            expected.append(np.minimum(ac[ai], bc[bi]).sum())
+        result = bounded(a, ac, b, bc, shifts, box)
+        np.testing.assert_array_equal(result.ravel(), expected)
+        assert result.shape == ((3, 3) if box == 3 else (5,))
+    assert module._run_intersections is original
+    np.testing.assert_array_equal(b, [1, 4, 7])
 
 
 def test_cache_writes_bounded_record_chunks_and_preserves_numeric_dtypes(tmp_path):
